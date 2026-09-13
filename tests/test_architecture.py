@@ -72,7 +72,14 @@ PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 # 两处都是 3 行内联守卫，拆出去会切断 _pause_activity 与 _closing 共享状态流
 # （更关键的是顺序语义：match_shutdown 必须**先**暂停再置 _closing，见
 # pet/window_optional_services.py）；拆分待办不变，预算仍只随实测校准。
-WINDOW_PY_LINE_BUDGET = 4429
+# 2026-09-13 再上调到 4478：肥鱼互撞卡顿修复批（window.py 净 +49，实测 4478）——
+# _warm_landing_idles 从 GUI 线程同步 ffmpeg 首帧解码改为 daemon 线程预热
+# （实测定案：碰撞风暴下每次撞飞堵 GUI ~100ms，看门狗连续抓 200ms+ 卡顿），
+# 起飞/落地 pin-unpin 保护落地首帧不在飞行窗口被预热浪涌逐出（8MB 预算不动，
+# 常驻内存零增长），增量行数几乎全是线程安全性/实机教训注释；这些守卫与
+# _enter_physics_mode/_stop_physics 共享窗口状态流，拆控制器反而切断调用链，
+# 按约定只校准预算。
+WINDOW_PY_LINE_BUDGET = 4478
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的
