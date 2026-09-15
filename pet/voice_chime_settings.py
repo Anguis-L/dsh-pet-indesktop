@@ -28,14 +28,18 @@ from .modern_settings_dialog import (
 )
 from .settings_widgets import ModernSelect
 from .voice_chime import (
+    COMMON_VOICES,
     DEFAULT_PITCH,
     DEFAULT_RATE,
     DEFAULT_VOLUME,
     DEFAULT_VOICE,
     SCHEDULE_KEYS,
     SCHEDULE_LABELS,
+    clean_pitch,
+    clean_rate,
     clean_schedule,
     clean_voice,
+    clean_volume,
 )
 
 
@@ -69,23 +73,29 @@ class VoiceChimeSettingsPage(QWidget):
         self.voice_edit = QLineEdit(self)
         self.voice_edit.setText(clean_voice(self.config.get("voice_chime_voice", DEFAULT_VOICE)))
         self.voice_edit.setPlaceholderText("edge-tts 音色名，如 " + DEFAULT_VOICE)
+        # 常见音色列表挂在 tooltip 上（COMMON_VOICES 是纯数据层给的清单，
+        # 提示文案承诺「可查看」就必须真能看到，不做无接线的装饰性文案）。
+        self.voice_edit.setToolTip(
+            "常见音色（可直接填名字）：\n" + "\n".join(f"· {v}" for v in COMMON_VOICES))
 
+        # 速率/音调/音量一律走纯逻辑层清洗：config.json 被手改成非法值时
+        # 回落默认值，绝不让设置页在构造期抛异常把用户挡在设置界面之外。
         self.rate_spin = BrowserSpinBox(self)
         self.rate_spin.setRange(-100, 100)
         self.rate_spin.setSuffix(" %")
-        self.rate_spin.setValue(int(self.config.get("voice_chime_rate", DEFAULT_RATE)))
+        self.rate_spin.setValue(clean_rate(self.config.get("voice_chime_rate", DEFAULT_RATE)))
         self.rate_spin.setToolTip("语速偏移：0 为正常，正数更快，负数更慢")
 
         self.pitch_spin = BrowserSpinBox(self)
         self.pitch_spin.setRange(-50, 50)
         self.pitch_spin.setSuffix(" Hz")
-        self.pitch_spin.setValue(int(self.config.get("voice_chime_pitch", DEFAULT_PITCH)))
+        self.pitch_spin.setValue(clean_pitch(self.config.get("voice_chime_pitch", DEFAULT_PITCH)))
         self.pitch_spin.setToolTip("音调偏移：0 为正常，正数更尖锐，负数更低沉")
 
         self.volume_spin = BrowserSpinBox(self)
         self.volume_spin.setRange(0, 100)
         self.volume_spin.setSuffix(" %")
-        self.volume_spin.setValue(int(self.config.get("voice_chime_volume", DEFAULT_VOLUME)))
+        self.volume_spin.setValue(clean_volume(self.config.get("voice_chime_volume", DEFAULT_VOLUME)))
 
         self.preview_btn = QPushButton("试听", self)
         self.preview_btn.setToolTip("按当前配置立即播报一句报时+台词")
@@ -110,7 +120,7 @@ class VoiceChimeSettingsPage(QWidget):
 
         root.addWidget(SettingsSection("语音", [
             SettingRow("voice_chime_voice", "音色",
-                        "edge-tts 在线音色名（免费、无需 API Key）。点击输入框查看常见音色提示。",
+                        "edge-tts 在线音色名（免费、无需 API Key）；鼠标悬停输入框可看常见音色列表。",
                         self.voice_edit),
             SettingRow("voice_chime_rate", "语速",
                         "语速偏移百分比：0 为正常，正数更快，负数更慢。",
@@ -161,9 +171,9 @@ class VoiceChimeSettingsPage(QWidget):
         self.schedule_select.setCurrentData(clean_schedule(self.config.get("voice_chime_schedule", "hourly")))
         self.custom_edit.setText(str(self.config.get("voice_chime_custom_times", "") or ""))
         self.voice_edit.setText(clean_voice(self.config.get("voice_chime_voice", DEFAULT_VOICE)))
-        self.rate_spin.setValue(int(self.config.get("voice_chime_rate", DEFAULT_RATE)))
-        self.pitch_spin.setValue(int(self.config.get("voice_chime_pitch", DEFAULT_PITCH)))
-        self.volume_spin.setValue(int(self.config.get("voice_chime_volume", DEFAULT_VOLUME)))
+        self.rate_spin.setValue(clean_rate(self.config.get("voice_chime_rate", DEFAULT_RATE)))
+        self.pitch_spin.setValue(clean_pitch(self.config.get("voice_chime_pitch", DEFAULT_PITCH)))
+        self.volume_spin.setValue(clean_volume(self.config.get("voice_chime_volume", DEFAULT_VOLUME)))
         self._refresh_custom_enabled()
 
 
