@@ -147,9 +147,14 @@ def test_service_cfg_matches_contract_shape_at_construction(tmp_path, monkeypatc
     apply_config 的路径都会读到 None 并被当成"未启用"静默吞掉。
     """
     service, _app, _cfg = _service(tmp_path, monkeypatch)
-    assert set(service._cfg) == {
+    # 契约键（服务内部读写的最小集）必须全部在场；气泡/台词开关与自定义台词
+    # 库是本分支新增的扩展键，同样在构造期即成形。
+    assert {
         "enabled", "schedule", "custom_times", "voice", "rate", "pitch", "volume",
-    }
+    } <= set(service._cfg)
+    assert {
+        "show_bubble", "show_quote", "custom_quotes_zh", "custom_quotes_en",
+    } <= set(service._cfg)
     assert service._cfg["voice"] == DEFAULT_VOICE
     assert service._cfg["enabled"] is True
 
@@ -262,7 +267,7 @@ def test_settings_page_round_trips_seven_keys_through_save_reload(tmp_path):
     page.enabled_check.setChecked(True)
     page.schedule_select.setCurrentData("custom")
     page.custom_edit.setText("08:30, 12:00")
-    page.voice_edit.setText("zh-CN-YunxiNeural")
+    page.voice_select.setCurrentData("zh-CN-YunxiNeural")
     page.rate_spin.setValue(15)
     page.pitch_spin.setValue(-10)
     page.volume_spin.setValue(65)
@@ -298,15 +303,17 @@ def test_settings_page_preview_writes_config_and_requests_preview(tmp_path):
 
 
 def test_settings_page_hint_matches_wired_voice_helper(tmp_path):
-    """音色提示必须是真接线（文案承诺「查看常见音色」就得能看到列表）。"""
-    from pet.voice_chime import COMMON_VOICES
+    """音色提示必须是真接线：文案承诺「内置 20+ 款音色」，下拉里就得真能选到。"""
+    from pet.voice_chime import VOICE_OPTIONS
     from pet.voice_chime_settings import VoiceChimeSettingsPage
 
     _qapp()
     page = VoiceChimeSettingsPage(Config(base=tmp_path))
-    tip = page.voice_edit.toolTip()
-    for voice in COMMON_VOICES:
-        assert voice in tip, f"常见音色 {voice.split()[0]} 未出现在音色输入框提示里"
+    data = {page.voice_select.itemData(i) for i in range(page.voice_select.count())}
+    labels = {page.voice_select.itemText(i) for i in range(page.voice_select.count())}
+    for value, label in VOICE_OPTIONS:
+        assert value in data, f"音色 {value} 未出现在音色下拉列表中"
+        assert label in labels, f"音色标签 {label} 未出现在音色下拉列表中"
 
 
 # ------------------------------------------------------------ AppShell 接线
