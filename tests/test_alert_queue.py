@@ -99,10 +99,14 @@ class FakeBubble(QObject):
         self.dismiss_calls = 0
 
     def show_text(self, text, anchor, duration_ms, *, pet_scale=None,
-                  subtitle="", sticky=False, buttons=None):
+                  subtitle="", sticky=False, buttons=None,
+                  title_first=False, width_locked=False):
         self.shown.append({
             "text": str(text), "sticky": bool(sticky),
             "duration_ms": int(duration_ms), "buttons": buttons,
+            "subtitle": str(subtitle or ""),
+            "title_first": bool(title_first),
+            "width_locked": bool(width_locked),
         })
 
     def reposition(self, anchor_rect):

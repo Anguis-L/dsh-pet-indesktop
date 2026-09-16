@@ -23,6 +23,11 @@ from PySide6.QtWidgets import (
 from . import autostart as autostart_mod
 from . import catalog
 from .agent_link import AgentLinkManager
+from .music_lyric_controller import (
+    LEAD_MAX_SECONDS,
+    LEAD_MIN_SECONDS,
+    LYRIC_LEAD_SECONDS,
+)
 from .config import (
     DEFAULT_CONTEXT_MENU_APPEARANCE,
     DEFAULT_MENU_EASTER_EGG,
@@ -198,6 +203,18 @@ def build_pet_controls(host) -> None:
     host.click_self_talk_check.setChecked(bool(host.config.get("click_show_self_talk", False)))
     host.music_sing_check = ToggleSwitch(host)
     host.music_sing_check.setChecked(bool(host.config.get("music_sing_enabled", False)))
+    host.music_lyric_check = ToggleSwitch(host)
+    host.music_lyric_check.setChecked(bool(host.config.get("music_lyric_enabled", False)))
+    host.agent_cost_check = ToggleSwitch(host)
+    host.agent_cost_check.setChecked(bool(host.config.get("agent_cost_enabled", False)))
+    host.music_lyric_lead_spin = BrowserDoubleSpinBox(host)
+    host.music_lyric_lead_spin.setRange(LEAD_MIN_SECONDS, LEAD_MAX_SECONDS)
+    host.music_lyric_lead_spin.setSingleStep(0.1)
+    host.music_lyric_lead_spin.setDecimals(1)
+    host.music_lyric_lead_spin.setSuffix(" 秒")
+    host.music_lyric_lead_spin.setValue(
+        float(host.config.get("music_lyric_lead_seconds", LYRIC_LEAD_SECONDS))
+    )
     host.golden_spin_click_check = ToggleSwitch(host)
     host.golden_spin_click_check.setChecked(bool(host.config.get("golden_spin_on_click", False)))
     host.golden_spin_direct_check = ToggleSwitch(host)

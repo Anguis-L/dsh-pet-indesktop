@@ -20,6 +20,7 @@ def test_modern_default_v1_has_compact_root_and_safety_actions():
         "character",
         "playback_speed",
         "size",
+        "music",
         "default.separator-playback",
         "pet_controls",
         "quick_launch",
@@ -315,6 +316,13 @@ def test_missing_user_layout_resolves_versioned_default():
         "hide_pet",
         "spawn_pet",
         "clear_spawned_pets",
+        "agent_cost",
+        "music",
+        "music_pause",
+        "music_next",
+        "music_quit",
+        "music_open_netease",
+        "music_open_qqmusic",
         "golden_spin",
         "edge_probe",
         "quick_launch",
@@ -351,6 +359,7 @@ def test_missing_user_layout_resolves_versioned_default():
         "character",
         "playback_speed",
         "size",
+        "music",
         "pet_controls",
         "quick_launch",
         "tools_help",
@@ -420,6 +429,7 @@ def test_default_layout_populates_real_qmenu_hierarchy(monkeypatch):
             "character": "shenshen",
             "on_top": True,
             "agent_link": {},
+            "music_lyric_enabled": True,
         }
 
         def get(self, key, default=None):
@@ -468,6 +478,7 @@ def test_default_layout_populates_real_qmenu_hierarchy(monkeypatch):
         "切换角色",
         "播放速率",
         "大小",
+        "音乐",
         "桌宠控制",
         "快捷启动",
         "工具与帮助",
@@ -493,7 +504,7 @@ def test_default_layout_populates_real_qmenu_hierarchy(monkeypatch):
     expected_rendered = [
         "厉害了我的鲸", "|",
         "AI 对话", "看看屏幕", "|",
-        "播放动画", "切换角色", "播放速率", "大小", "|",
+        "播放动画", "切换角色", "播放速率", "大小", "音乐", "|",
         "桌宠控制", "快捷启动", "|",
         "工具与帮助", "Agent 联动", "|",
         "桌宠设置", "退出",
@@ -519,6 +530,7 @@ def test_default_layout_populates_real_qmenu_hierarchy(monkeypatch):
         "隐藏桌宠",
         "生小肥鱼",
         "退出子肥鱼",
+        "显示本轮消费",
         "黄金回旋",
         "边缘探头",
     ]

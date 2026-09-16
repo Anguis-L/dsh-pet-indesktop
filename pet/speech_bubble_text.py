@@ -97,18 +97,31 @@ def list_self_talk_images(directory: str | Path) -> list[Path]:
         return []
 
 
-def normalize_bubble_text(text: str) -> str:
-    """Convert model-flavoured Markdown into compact plain bubble text."""
+def normalize_bubble_text(text: str, *, keep_breaks: bool = False) -> str:
+    """Convert model-flavoured Markdown into compact plain bubble text.
+
+    ``keep_breaks=True`` 时保留调用方自己写好的换行（只压掉行内多余空白），
+    用于"标题一行 + 内容一行"这类需要固定分行的文案；默认仍是把所有空白
+    （含换行）折叠成空格，即原有行为。
+    """
     value = str(text or "").replace("```", " ")
     value = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", value)
     value = re.sub(r"(?m)^\s*[-*+]\s+", "", value)
     value = re.sub(r"[*_`]+", "", value)
+    if keep_breaks:
+        # 逐行压空白，但保留 \n —— 少了这一步，标题和内容会被折行拼到一起。
+        lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in value.split("\n")]
+        return "\n".join(line for line in lines if line)
     return re.sub(r"\s+", " ", value).strip()
 
 
-def bubble_max_lines(text: str) -> int:
+def bubble_max_lines(text: str, *, keep_breaks: bool = False) -> int:
     """Return the max allowed lines for bubble text: 3 for short text, 6 for long."""
-    return 3 if len(normalize_bubble_text(text)) <= 40 else 6
+    return (
+        3
+        if len(normalize_bubble_text(text, keep_breaks=keep_breaks)) <= 40
+        else 6
+    )
 
 
 # 避头尾（kinsoku）行首禁则字符：闭标点不允许出现在行首。逐字换行时若
@@ -122,12 +135,20 @@ LINE_START_FORBIDDEN = frozenset(
 
 
 def _wrap_bubble_lines(
-    metrics: QFontMetrics, value: str, width: int
+    metrics: QFontMetrics, value: str, width: int, *, keep_breaks: bool = False
 ) -> list[str]:
-    """Wrap ``value`` char-by-char into lines within ``width`` px (kinsoku-aware)."""
+    """Wrap ``value`` char-by-char into lines within ``width`` px (kinsoku-aware).
+
+    ``keep_breaks=True`` 时把 ``\\n`` 当作强制换行：调用方已经排好版
+    （如"标题一行 + 内容一行"），不应再被折行逻辑重新拼接。
+    """
     lines: list[str] = []
     current = ""
     for char in value:
+        if keep_breaks and char == "\n":
+            lines.append(current)
+            current = ""
+            continue
         candidate = current + char
         if current and metrics.horizontalAdvance(candidate) > width:
             if char in LINE_START_FORBIDDEN and len(current) > 1:
@@ -141,6 +162,9 @@ def _wrap_bubble_lines(
             current = candidate
     if current:
         lines.append(current)
+    if keep_breaks:
+        # 去掉强制换行产生的空行，但保留内容行的相对顺序。
+        lines = [line for line in lines if line.strip()]
     return lines
 
 
@@ -149,12 +173,14 @@ def elide_bubble_text(
     text: str,
     width: int,
     max_lines: int = 3,
+    *,
+    keep_breaks: bool = False,
 ) -> str:
     """Wrap text into a bounded number of lines and elide the remainder."""
-    value = normalize_bubble_text(text)
+    value = normalize_bubble_text(text, keep_breaks=keep_breaks)
     if not value:
         return ""
-    lines = _wrap_bubble_lines(metrics, value, width)
+    lines = _wrap_bubble_lines(metrics, value, width, keep_breaks=keep_breaks)
     if len(lines) > max_lines:
         remainder = "".join(lines[max_lines:])
         lines = lines[:max_lines]
@@ -211,6 +237,8 @@ def paginate_bubble_text(
     text: str,
     width: int,
     max_lines: int = 3,
+    *,
+    keep_breaks: bool = False,
 ) -> list[str]:
     """Wrap text into pages of at most ``max_lines`` lines each — no elision.
 
@@ -222,10 +250,10 @@ def paginate_bubble_text(
     lines, one line is borrowed from the page before it (3+2 -> 2+3) so the
     tail never looks cut off.
     """
-    value = normalize_bubble_text(text)
+    value = normalize_bubble_text(text, keep_breaks=keep_breaks)
     if not value:
         return []
-    lines = _wrap_bubble_lines(metrics, value, width)
+    lines = _wrap_bubble_lines(metrics, value, width, keep_breaks=keep_breaks)
     if len(lines) <= max_lines:
         return ["\n".join(lines)]
     pages = [

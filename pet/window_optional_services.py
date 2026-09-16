@@ -29,6 +29,7 @@ class WindowFeatureGateMixin:
     _golden_spin: Any = None
     _edge_probe: Any = None
     _throw_egg: Any = None
+    _music_lyric: Any = None
 
     # ------------------------------------------------------------ 判定
     def _proactive_wanted(self) -> bool:
@@ -80,6 +81,39 @@ class WindowFeatureGateMixin:
             from .throw_egg import ThrowEggController
             self._throw_egg = ThrowEggController(self)
         return self
+
+    # ------------------------------------------------------------ 歌词显示
+    def install_music_lyric(self):
+        """安装歌词显示控制器（幂等）。"""
+        if self._music_lyric is None:
+            from .music_lyric_controller import MusicLyricController
+            self._music_lyric = MusicLyricController(self)
+        return self._music_lyric
+
+    def set_instrumental_playing(self, on: bool) -> None:
+        """标记"当前放的是纯音乐"，让音乐自动唱歌不再触发。
+
+        纯音乐没有可唱的句子。这里只置标志，真正的判定在
+        ``window_alerts.check_music_sing``——在那里拦一道，比让歌词控制器
+        每拍去"停止唱歌"要干净：否则两边一个关一个开，会持续打架。
+        """
+        self._instrumental_playing = bool(on)
+        if on:
+            self._music_sing_active = False
+
+    def sync_music_lyric(self) -> None:
+        """按配置启停歌词显示。
+
+        不在这里判断窗口可见性：隐藏/显示是随时发生的，而控制器每次轮询都会
+        自行检查可见性并空转。放在这里判断反而会漏掉"配置写入时窗口恰好隐藏"
+        的情况，导致功能再也起不来。
+        """
+        enabled = bool(self.cfg.get("music_lyric_enabled", False))
+        if not enabled and self._music_lyric is None:
+            return  # 从未启用过：不为一个关着的功能白养一个定时器
+        controller = self.install_music_lyric()
+        controller.apply_lead()  # 提前量可能刚在设置里改过，先同步再启停
+        controller.sync_enabled(enabled)
 
     def trigger_golden_spin(self) -> None:
         """右键菜单入口：立即开始黄金回旋（边缘探头激活时不叠加）。"""
@@ -257,6 +291,7 @@ class WindowFeatureGateMixin:
             self.agent_link_manager.apply_config()
         self._install_effect_services()
         self._edge_probe.set_enabled(bool(self.cfg.get("edge_probe_enabled", False)))
+        self.sync_music_lyric()
 
     def set_broker_facade(self, broker_facade: Any) -> None:
         """替换窗口持有的 broker facade（app 层经公开 seam 注入，不碰私有面）。"""

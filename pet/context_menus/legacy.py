@@ -17,7 +17,14 @@ from .shared import (
     add_drag_physics,
     add_deepseek_web,
     add_edge_probe,
+    add_agent_cost,
+    add_submenu,
     add_golden_spin,
+    add_music_next,
+    add_music_open_netease,
+    add_music_open_qqmusic,
+    add_music_pause,
+    add_music_quit,
     add_harness,
     add_mouse_through,
     add_no_move,
@@ -60,6 +67,15 @@ def build_legacy_menu(menu: QMenu, pet, template: dict) -> None:
     add_spawn_pet(menu, pet)
     add_clear_spawned_pets(menu, pet, icons=False)
     add_golden_spin(menu, pet, icons=False)
+    add_agent_cost(menu, pet, icons=False)
+    # legacy 布局约定无图标（测试 test_legacy_config_value_dispatches_legacy_layout 守着）
+    music_menu = add_submenu(menu, "音乐")
+    add_music_pause(music_menu, pet, icons=False)
+    add_music_next(music_menu, pet, icons=False)
+    add_music_quit(music_menu, pet, icons=False)
+    music_menu.addSeparator()
+    add_music_open_netease(music_menu, pet, icons=False)
+    add_music_open_qqmusic(music_menu, pet, icons=False)
     add_edge_probe(menu, pet, icons=False)
     build_size_menu(menu, pet, icons=False)
 

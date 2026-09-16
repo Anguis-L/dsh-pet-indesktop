@@ -29,6 +29,12 @@ from .shared import (
     add_harness,
     add_hide_pet,
     add_look_screen,
+    add_agent_cost,
+    add_music_next,
+    add_music_open_netease,
+    add_music_open_qqmusic,
+    add_music_pause,
+    add_music_quit,
     add_mouse_through,
     add_no_move,
     add_on_top,
@@ -52,6 +58,10 @@ ACTION_LABELS = {
     "return_corner": "回到右下角", "hide_pet": "隐藏桌宠",
     "spawn_pet": "生小肥鱼", "clear_spawned_pets": "退出子肥鱼",
     "golden_spin": "黄金回旋", "edge_probe": "边缘探头",
+    "music": "音乐", "music_pause": "暂停 / 播放", "music_next": "切歌",
+    "music_quit": "退出音乐模式", "music_open_netease": "打开网易云并播放",
+    "music_open_qqmusic": "打开QQ音乐并播放",
+    "agent_cost": "显示本轮消费",
     "quick_launch": "快捷启动", "balance": "DeepSeek 余额",
     "harness": "启动 DeepSeek Harness", "deepseek_web": "打开网页版 DeepSeek",
     "check_update": "检查更新", "github_project": "GitHub 项目页",
@@ -74,6 +84,9 @@ ACTION_ICONS = {
     "return_corner": "corner", "hide_pet": "hide",
     "spawn_pet": "spawn", "clear_spawned_pets": "clear",
     "golden_spin": "play", "edge_probe": "corner",
+    "music_next": "play", "music_quit": "stop", "agent_cost": "balance",
+    "music": "play", "music_pause": "pause", "music_open_netease": "play",
+    "music_open_qqmusic": "play",
     "quick_launch": "application", "balance": "balance", "harness": "harness",
     "deepseek_web": "web", "check_update": "update", "github_project": "web",
     "quark_download": "download", "agent_link": "automation",
@@ -104,6 +117,15 @@ class MenuActionSpec:
 
 def _callback_available(name: str) -> Availability:
     return lambda pet: callable(getattr(pet, name, None))
+
+
+def _music_lyric_configured(pet) -> bool:
+    """音乐相关菜单项是否出现：只看设置里有没有开启歌词功能。
+
+    刻意**不**依赖实时播放状态——否则菜单结构会随"此刻有没有在放歌"变来变去
+    （测试也会因此依赖机器状态）。没在播时改为置灰（见 enabled）。
+    """
+    return bool(pet.cfg.get("music_lyric_enabled", False))
 
 
 def _build_chat(menu, pet):
@@ -202,6 +224,13 @@ class MenuActionRegistry:
                 add_clear_spawned_pets,
                 _callback_available("on_clear_spawned_pets"),
             ),
+            # 始终可用：消费统计与歌词无关，不该被歌词开关卡住。
+            "agent_cost": MenuActionSpec(add_agent_cost),
+            "music_pause": MenuActionSpec(add_music_pause, _music_lyric_configured),
+            "music_next": MenuActionSpec(add_music_next, _music_lyric_configured),
+            "music_quit": MenuActionSpec(add_music_quit, _music_lyric_configured),
+            "music_open_netease": MenuActionSpec(add_music_open_netease),
+            "music_open_qqmusic": MenuActionSpec(add_music_open_qqmusic),
             "golden_spin": MenuActionSpec(
                 add_golden_spin,
                 _callback_available("trigger_golden_spin"),

@@ -99,6 +99,11 @@ __all__ = [
 
 _MAC = sys.platform == "darwin"
 
+# 标题优先气泡（歌词）在"同一次显示"期间把宽度锁在整栏宽。
+# 原因：气泡定位是按当前尺寸居中算的，歌词每句长短不同 → 宽度变 →
+# 左边跟着跳（实测 200px 与 264px 相差 32px）。锁宽后位置不再抖。
+TITLE_FIRST_COLUMN = BUBBLE_TEXT_COLUMN
+
 # 交互按钮行里除 ``(label, callback)`` 按钮外的结构化行标记：
 # - (SECTION_HEADER_LABEL, text) —— 分支/小节标题（独占一行、加粗）
 # - (SECTION_HINT_LABEL, text)  —— 灰色提示行（独占一行）
@@ -342,6 +347,13 @@ class PetSpeechBubble(QFrame):
         )
         self._content_kind = "text"
         self._raw_text = ""
+        # 多行模式：保留调用方写好的换行（如"标题一行 + 内容一行"）。
+        # 由 show_text 的 subtitle 是否有内容推导，避免为它增加公开参数。
+        self._multi_line = False
+        # 标题优先模式：标题放在最上方且与正文同字号（歌词气泡用）。
+        self._title_first = False
+        # 本次显示是否已经锁过宽度（同一首歌的后续刷新沿用同一宽度）。
+        self._width_locked = False
         self._source_pixmap = QPixmap()
         self._pet_scale: float | None = None
         self._image_scale: float = 1.0
@@ -442,7 +454,8 @@ class PetSpeechBubble(QFrame):
                 QFontMetrics(self.label.font()),
                 self._raw_text,
                 label_width,
-                bubble_max_lines(self._raw_text),
+                bubble_max_lines(self._raw_text, keep_breaks=self._multi_line),
+                keep_breaks=self._multi_line,
             ))
 
     def _breath_size_for_content(self, base_size: QSize) -> QSize:
@@ -527,8 +540,12 @@ class PetSpeechBubble(QFrame):
         subtitle: str = "",
         sticky: bool = False,
         buttons: list[tuple[str, object]] | None = None,
+        title_first: bool = False,
+        width_locked: bool = False,
     ) -> None:
         """显示文本气泡。
+        ``title_first`` 会把 ``subtitle`` 放到正文上方并使用正文字号——
+        用于"歌名 + 歌词"这类以标题为主的场景；默认仍是副标题样式。
 
         ``sticky=True`` 时不启动自动隐藏定时器，气泡一直停留直到上层调用
         :meth:`dismiss`（用于「审批一直挂着直到审批结束」这类需要主动关闭的气泡）。
@@ -550,6 +567,11 @@ class PetSpeechBubble(QFrame):
             return
         self._content_kind = "text"
         self._raw_text = text
+        # 带 subtitle 的气泡是"标题 + 内容"结构，正文里可能自带换行，
+        # 必须保留（否则标题与首行会被折行拼接）。
+        self._multi_line = bool(str(subtitle or "").strip())
+        self._title_first = bool(title_first)
+        self._width_locked = bool(width_locked) and self._title_first
         self._source_pixmap = QPixmap()
         self._pet_scale = pet_scale
         self._reset_paging()
@@ -557,6 +579,31 @@ class PetSpeechBubble(QFrame):
         if subtitle:
             self._subtitle_label.setText(subtitle)
             self._subtitle_label.show()
+            if self._title_first:
+                # 标题态：标题在上、字号 11px（比歌词略小，但仍是一行主角）。
+                self.label.setStyleSheet(
+                    "QLabel#pet-speech-label { background: transparent; border: none; "
+                    f"padding: 0; color: {self._preset['foreground']}; font-size: 13px; }}"
+                )
+                self._subtitle_label.setStyleSheet(
+                    "QLabel#pet-speech-subtitle { background: transparent; border: none; "
+                    f"padding: 0; color: {self._preset['foreground']}; font-size: 11px; }}"
+                )
+                # 短标题不换行：气泡宽度会被歌词带窄，若标题跟着折行就会断成
+                # 两行、很难看。先按实际字体量宽度——放得下就关掉换行（宁可让
+                # 气泡为标题让出宽度），真的超长才允许折行。
+                self._subtitle_label.ensurePolished()
+                title_metrics = QFontMetrics(self._subtitle_label.font())
+                width = title_metrics.horizontalAdvance(subtitle)
+                # 留出左右内边距（13px×2）的余量再判断。
+                self._subtitle_label.setWordWrap(
+                    width > bubble_wrap_width() - 26
+                )
+                self._layout.removeWidget(self._subtitle_label)
+                self._layout.insertWidget(0, self._subtitle_label)
+            else:
+                self._layout.removeWidget(self._subtitle_label)
+                self._layout.addWidget(self._subtitle_label)
         else:
             self._subtitle_label.setText("")
             self._subtitle_label.hide()
@@ -588,7 +635,11 @@ class PetSpeechBubble(QFrame):
             # 底部显示圆点页码（● ○ ○）。每页停留按该页字数自适应（首页 ×2、
             # 末页多压一拍回首页停顿），总时长相应扩展。
             pages = paginate_bubble_text(
-                metrics, text, bubble_wrap_width(column), bubble_max_lines(text)
+                metrics,
+                text,
+                bubble_wrap_width(column),
+                bubble_max_lines(text, keep_breaks=self._multi_line),
+                keep_breaks=self._multi_line,
             )
             display_text = pages[0] if pages else ""
             if len(pages) > 1 and not sticky and not interactive:
@@ -607,7 +658,16 @@ class PetSpeechBubble(QFrame):
             self.label.setText(display_text)
             # 固定尺寸按真正会绘制的行计算（所有页里最长的一行 + 行数最多的一页），
             # 翻页后 wordWrap=False 也不会裁字；详见 bubble_label_size 的说明。
-            self.label.setFixedSize(bubble_label_size(metrics, pages, column))
+            if self._title_first and self._width_locked:
+                # 锁宽：按整栏宽排版，避免逐句改宽导致气泡左右跳。
+                self.label.setFixedSize(
+                    bubble_label_size(
+                        metrics, pages, max(column, TITLE_FIRST_COLUMN),
+                        min_width=TITLE_FIRST_COLUMN,
+                    )
+                )
+            else:
+                self.label.setFixedSize(bubble_label_size(metrics, pages, column))
         self.adjustSize()
         self._place(anchor_rect)
         self.show()
@@ -952,13 +1012,53 @@ class PetSpeechBubble(QFrame):
             )
             self._tail_tip = QPointF(local.right() - 4, tip_y)
         else:
-            self._surface_rect = local.adjusted(4, 10, -4, -4)
-            tip_x = min(max(anchor_center.x(), 20), local.width() - 20)
-            self._tail_base = (
-                QPointF(tip_x - 6, self._surface_rect.top() + 2),
-                QPointF(tip_x + 6, self._surface_rect.top() + 2),
-            )
-            self._tail_tip = QPointF(tip_x, 4)
+            # 重叠兜底：capture 子模式（stream_capture_mode）下气泡只能落在主窗
+            # 矩形内，空间不足时会压在桌宠身上，此时上面四个"完全不重叠"的分支
+            # 全部失效、一律走这里。改用中心判定，保证三角指向桌宠所在的一侧，
+            # 而不是无条件朝上（实机表现为「三角指向了桌宠的反方向」）。
+            # 这里 anchor_center 与 local 都是本窗口局部坐标，不存在坐标系混用。
+            # 按**主导方向**选边：只看 y 会把"桌宠在侧边"误判成上下
+            # （实测：桌宠贴屏幕顶且气泡被挤到它右侧时，anchor 中心 y 偏下，
+            # 旧逻辑判成"朝下"，而桌宠其实在右边）。横向差更大就走左右。
+            dx = anchor_center.x() - local.center().x()
+            dy = anchor_center.y() - local.center().y()
+            if abs(dx) > abs(dy):
+                # 主导方向是横向
+                tip_y = min(max(anchor_center.y(), 18), local.height() - 18)
+                if dx > 0:
+                    # 桌宠在气泡**右侧**：尾巴从右边探出朝右
+                    self._surface_rect = local.adjusted(4, 3, -10, -4)
+                    self._tail_base = (
+                        QPointF(self._surface_rect.right() - 2, tip_y - 6),
+                        QPointF(self._surface_rect.right() - 2, tip_y + 6),
+                    )
+                    self._tail_tip = QPointF(local.right() - 4, tip_y)
+                else:
+                    # 桌宠在气泡**左侧**：尾巴从左边探出朝左
+                    self._surface_rect = local.adjusted(10, 3, -4, -4)
+                    self._tail_base = (
+                        QPointF(self._surface_rect.left() + 2, tip_y - 6),
+                        QPointF(self._surface_rect.left() + 2, tip_y + 6),
+                    )
+                    self._tail_tip = QPointF(4, tip_y)
+            elif dy >= 0:
+                # 桌宠中心在气泡下方：尾巴从底边朝下伸向桌宠
+                self._surface_rect = local.adjusted(4, 3, -4, -10)
+                tip_x = min(max(anchor_center.x(), 20), local.width() - 20)
+                self._tail_base = (
+                    QPointF(tip_x - 6, self._surface_rect.bottom() - 2),
+                    QPointF(tip_x + 6, self._surface_rect.bottom() - 2),
+                )
+                self._tail_tip = QPointF(tip_x, local.bottom() - 4)
+            else:
+                # 桌宠中心在气泡上方：尾巴从顶边朝上伸向桌宠
+                self._surface_rect = local.adjusted(4, 10, -4, -4)
+                tip_x = min(max(anchor_center.x(), 20), local.width() - 20)
+                self._tail_base = (
+                    QPointF(tip_x - 6, self._surface_rect.top() + 2),
+                    QPointF(tip_x + 6, self._surface_rect.top() + 2),
+                )
+                self._tail_tip = QPointF(tip_x, 4)
         rounded = QPainterPath()
         radius = float(self._preset["radius"])
         rounded.addRoundedRect(QRectF(self._surface_rect), radius, radius)

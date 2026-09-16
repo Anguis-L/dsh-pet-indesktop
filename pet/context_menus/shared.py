@@ -2,12 +2,16 @@
 """Stable leaf-menu primitives shared by the two independent layouts."""
 from __future__ import annotations
 
+import os
 import sys
+import threading
+import time
 
 import shiboken6
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QActionGroup, QDesktopServices, QIcon, QPixmap
+from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QMenu
 
 from .. import autostart as autostart_mod
@@ -515,6 +519,169 @@ def add_edge_probe(menu: QMenu, pet, *, icons: bool = True):
 
 def add_harness(menu: QMenu, pet, *, icons: bool = True):
     return add_action(menu, "启动 DeepSeek Harness", "harness" if icons else None, lambda: launch_harness_gui(pet), close_on_trigger=True)
+
+
+def _music_controller(pet):
+    """取歌词控制器。**不**在这里创建——仅打开菜单不该装一套定时器。
+
+    必须校验类型而不是只判断 None：宿主可能用 ``__getattr__`` 兜底返回任意
+    对象（测试替身就这么干），那样会把一个无关对象当成控制器。
+    """
+    from ..music_lyric_controller import MusicLyricController
+
+    controller = getattr(pet, "_music_lyric", None)
+    return controller if isinstance(controller, MusicLyricController) else None
+
+
+def _skip_track(pet, direction: str) -> bool:
+    controller = _music_controller(pet)
+    if controller is None:
+        return False
+    return controller.skip_track(direction)
+
+
+def music_mode_active(pet) -> bool:
+    """音乐模式是否在跑（含"临时退出"状态），供菜单勾选态与可用性判断。"""
+    controller = _music_controller(pet)
+    if controller is not None:
+        return controller.music_mode_active()
+    return bool(pet.cfg.get("music_lyric_enabled", False))
+
+
+def set_music_mode(pet, on: bool) -> None:
+    """临时进入/退出音乐模式（仅本次运行，不写设置）。"""
+    controller = _music_controller(pet)
+    if controller is None:
+        installer = getattr(pet, "install_music_lyric", None)
+        if callable(installer):
+            controller = installer()
+    enable = getattr(controller, "set_music_mode_enabled", None)
+    if callable(enable):
+        enable(on)
+
+
+def _launch_player_and_play(player_key: str, pet) -> None:
+    """打开指定播放器并尽量让它开始播放。
+
+    "自动播放"是**尽力而为**：已经在跑的播放器可以直接发播放指令；刚启动的
+    需要等它初始化并出现在 SMTC 里（可能几秒），所以起一个后台线程轮询，
+    等到了就发播放。等不到也不报错——播放器自己是否自动续播由它决定，
+    这不是我们能控制的。
+    """
+    from .. import music_players, now_playing
+
+    manual = ""
+    paths_cfg = pet.cfg.get("music_player_paths", {})
+    if isinstance(paths_cfg, dict):
+        manual = str(paths_cfg.get(player_key, "") or "")
+    exe = music_players.find_player(player_key, manual)
+    if not exe:
+        return
+    exe_name = os.path.basename(exe)
+
+    def worker() -> None:
+        # 先给已经在跑的会话发播放指令：这条路径是确定的。
+        if now_playing.play_session_for(exe_name):
+            return
+        # 没在跑：启动它，然后轮询等它出现在 SMTC 里。
+        try:
+            if sys.platform == "win32":
+                os.startfile(exe)  # noqa: S606 - 路径来自受控的播放器搜索
+            else:
+                QProcess.startDetached(exe, [])
+        except Exception:
+            return
+        for _ in range(10):          # 最多等 10 秒
+            time.sleep(1.0)
+            if now_playing.play_session_for(exe_name):
+                return
+
+    threading.Thread(target=worker, name="music-launch", daemon=True).start()
+
+
+def add_music_pause(menu: QMenu, pet, *, icons: bool = True):
+    """音乐子菜单：暂停 / 播放。"""
+    from .. import now_playing
+
+    return add_action(
+        menu, "让人家歇一会儿嘛（暂停 / 播放）", "pause" if icons else None,
+        lambda: now_playing.toggle_play_pause(), close_on_trigger=True,
+    )
+
+
+def add_music_next(menu: QMenu, pet, *, icons: bool = True):
+    """音乐子菜单：切歌。"""
+    return add_action(
+        menu, "给主人换一首（切歌）", "play" if icons else None,
+        lambda: _skip_track(pet, "next"), close_on_trigger=True,
+    )
+
+
+def add_music_quit(menu: QMenu, pet, *, icons: bool = True):
+    """音乐子菜单开关：临时退出音乐模式（勾选=已退出）。"""
+    action = add_action(menu, "人家今天不唱了（退出音乐模式）", "stop" if icons else None)
+    action.setCheckable(True)
+    action.setChecked(not music_mode_active(pet))
+    action.toggled.connect(lambda off: set_music_mode(pet, not off))
+    return action
+
+
+def _music_player_builder(player_key: str):
+    """生成"打开某播放器并播放"的 builder（两个播放器共用一套逻辑）。"""
+
+    def build(menu: QMenu, pet, *, icons: bool = True):
+        from .. import music_players
+
+        label = music_players.player_label(player_key)
+        manual = ""
+        paths_cfg = pet.cfg.get("music_player_paths", {})
+        if isinstance(paths_cfg, dict):
+            manual = str(paths_cfg.get(player_key, "") or "")
+        found = music_players.find_player(player_key, manual)
+        action = add_action(
+            menu, f"打开{label}给主人放歌", None,
+            (lambda: _launch_player_and_play(player_key, pet)) if found else None,
+            close_on_trigger=True,
+        )
+        if not found:
+            action.setEnabled(False)
+            action.setToolTip(f"找不到{label}，可在设置中手动指定路径")
+        return action
+
+    return build
+
+
+def add_music_open_netease(menu: QMenu, pet, *, icons: bool = True):
+    return _music_player_builder("netease")(menu, pet, icons=icons)
+
+
+def add_music_open_qqmusic(menu: QMenu, pet, *, icons: bool = True):
+    return _music_player_builder("qqmusic")(menu, pet, icons=icons)
+
+
+def add_agent_cost(menu: QMenu, pet, *, icons: bool = True):
+    """右键菜单开关：本轮结束时显示消费金额。
+
+    与设置页开关同一份配置（``agent_cost_enabled``），两边实时联动。
+    """
+    action = add_action(menu, "显示本轮消费", "balance" if icons else None)
+    action.setCheckable(True)
+    action.setChecked(bool(pet.cfg.get("agent_cost_enabled", False)))
+
+    def _on_toggled(on: bool) -> None:
+        pet.cfg.set("agent_cost_enabled", bool(on))
+        pet.cfg.save()
+        # 让窗口按新配置同步控制器（与设置页走同一条刷新路径）。
+        for name in ("refresh_pet_settings", "sync_optional_services"):
+            fn = getattr(pet, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+    action.toggled.connect(_on_toggled)
+    return action
 
 
 def open_deepseek_web() -> bool:

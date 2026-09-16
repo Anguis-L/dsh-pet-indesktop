@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from collections import deque
 
 from PySide6.QtCore import QTimer
 
 from . import catalog
+
+# 确认"音乐真的停了"所需的持续静音时长（秒）。歌曲的前奏/间奏/轻声段会让
+# 音频峰值瞬时跌到阈值下，太小会导致唱歌状态反复退出。
+MUSIC_SING_GRACE_SECONDS = 6.0
 
 def alert_survives_suppression(alert_type: str, *, sticky: bool, buttons, priority: int) -> bool:
     """Settings only suppress ordinary presentation; stateful events survive."""
@@ -382,21 +387,59 @@ def check_music_sing(host) -> None:
 
     音乐播放期间唱歌动画会持续循环；音乐停止或开关关闭后恢复普通动画链。
     不打断正在播放的一次性动作/点击/拖拽。
+
+    退出唱歌要经过一段宽限期，而不是一检测到静音就退：``is_music_playing``
+    看的是音频峰值，歌曲的前奏/间奏/轻声段会让峰值瞬时跌到阈值以下，立刻退出
+    会表现为"唱着唱着主动退出、然后静默不唱"。
     """
     from .window import SING_ANIM
     if not host.isVisible():
         return
     if not host._music_sing_enabled:
         host._music_sing_active = False
+        host._music_sing_silent_since = None
+        return
+    # 当前是纯音乐（配乐/OST/演奏曲）：没有可唱的句子，不唱歌。
+    # 标志由歌词控制器维护；没启用歌词功能时该标志恒为 False，不受影响。
+    if getattr(host, "_instrumental_playing", False):
+        host._music_sing_active = False
+        host._music_sing_silent_since = None
         return
     from . import music_detect
     playing = music_detect.is_music_playing()
     if host._music_sing_active:
-        if not playing:
+        # 静音起点用 getattr 兜底读取：window.py 的行数预算已满，不新增字段。
+        silent_since = getattr(host, "_music_sing_silent_since", None)
+        if playing:
+            # 还有声音：刷新静音计时，保持唱歌。
+            host._music_sing_silent_since = None
+        elif silent_since is None:
+            # 刚转为静音：起算宽限期，先不退出。
+            host._music_sing_silent_since = time.monotonic()
+        elif (
+            time.monotonic() - silent_since >= music_sing_grace_seconds(host)
+        ):
             host._music_sing_active = False
+            host._music_sing_silent_since = None
+        # 宽限期内：保持 _music_sing_active，动画继续循环。
         return
     if host._dragging or host._is_one_shot_playing():
         return
     if playing:
         host._music_sing_active = True
+        host._music_sing_silent_since = None
         host._switch(SING_ANIM)
+
+
+def music_sing_grace_seconds(host) -> float:
+    """确认"音乐真的停了"所需的持续静音时长（秒）。"""
+    raw = getattr(getattr(host, "cfg", None), "get", None)
+    value = None
+    if callable(raw):
+        value = raw("music_sing_grace_seconds", None)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = MUSIC_SING_GRACE_SECONDS
+    # 下限 1 秒：低于这个值就退化回"瞬时静音即退出"的老问题。
+    return max(1.0, seconds)

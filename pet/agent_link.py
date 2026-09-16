@@ -38,6 +38,7 @@ from urllib.parse import unquote
 from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
+from . import agent_cost as agent_cost_mod
 from .click_sound import play_sound, resolve_builtin_sound
 from .report_gates import should_report, should_report_event
 from .agent_event_protocol import parse_agent_event
@@ -2330,6 +2331,9 @@ class AgentLinkManager(QObject):
         self.cfg = config
         self.config_dir = config.dir
         self._shutdown = False
+        # Agent 本轮消费统计：用余额差值估算，网络查询走后台线程。
+        self._cost = agent_cost_mod.AgentCostTracker(clock=clock)
+        self._cost_balance_ready.connect(self._on_cost_balance)
         self._respond_threads: set[threading.Thread] = set()
         self._respond_threads_lock = threading.Lock()
         # 后台回写/控制 worker 的取消信号：shutdown 时置位，让 30s 阻塞轮询的
@@ -2844,6 +2848,7 @@ class AgentLinkManager(QObject):
         self._last_raw[agent_key] = state
         if state in self._BUSY_STATES and prev_raw not in self._BUSY_STATES:
             self._emit_sound("start", agent_key)
+            self._cost_note_start(agent_key)
         elif state == "error" and prev_raw != "error":
             self._emit_sound("error", agent_key)
         if state in self._BUSY_STATES:
@@ -3822,7 +3827,11 @@ class AgentLinkManager(QObject):
         """800ms 稳定确认到期：期间回忙则不算完成；配置/冷却在弹出前再查。"""
         self._done_pending.pop(agent_key, None)
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
-            return  # 隐藏中不弹不切（pause 已取消计时器，这里是兜底）
+            # 隐藏中不弹不切（pause 已取消计时器，这里是兜底）。
+            # 消费统计的状态必须一并丢弃：否则 _busy 里会永远留着这个 agent，
+            # 下次开始干活时被误判成"并发"，金额后面永久挂「（含其他会话）」。
+            self._cost.abort(agent_key)
+            return
         if self._last_raw.get(agent_key) in self._BUSY_STATES:
             return
         if agent_key not in self._saw_error:
@@ -3853,6 +3862,112 @@ class AgentLinkManager(QObject):
                 self.win.switch_clip(self.win.idles[0])
             self._last_applied[agent_key] = ("idle", now)
         self._show_link_bubble(text, important=True)
+        self._cost_finish(agent_key)
+
+    # ------------------------------------------------------------ 本轮消费
+
+    # 余额查询结果回到主线程：(agent_key, 用途, 余额或 None)
+    # 用途为 "baseline"（开始）或 "done"（结束）。
+    _cost_balance_ready = Signal(str, str, object)
+
+    def _cost_enabled(self) -> bool:
+        """消费统计是否启用：开关打开 + 当前 provider 是 DeepSeek。
+
+        只有 DeepSeek 有余额接口；别的 provider 查不到，直接不启用，
+        避免留下"开关开着却永远没数字"的困惑。
+        """
+        if not bool(self.cfg.get("agent_cost_enabled", False)):
+            return False
+        return self._deepseek_provider() is not None
+
+    def _deepseek_provider(self):
+        """取当前激活且支持余额查询的 provider（仅 DeepSeek）。"""
+        try:
+            settings = self.cfg.chat_settings()
+            provider = settings.active_config
+        except Exception:
+            return None
+        base = str(getattr(provider, "base_url", "") or "")
+        if "deepseek.com" not in base:
+            return None
+        return provider
+
+    def _query_cost_balance(self, agent_key: str, purpose: str) -> None:
+        """后台线程查一次余额，结果经信号回主线程。
+
+        **必须绕过余额缓存**：现成的查询入口有 30 秒缓存，而一轮对话常在
+        30 秒内结束，读缓存会让差值恒为 0。这里直接调底层 ``fetch_balance``。
+        """
+        provider = self._deepseek_provider()
+        if provider is None:
+            return
+        try:
+            api_key = self.cfg.resolve_api_key(provider)
+        except Exception:
+            api_key = ""
+        if not api_key:
+            return
+
+        def worker() -> None:
+            total = None
+            try:
+                from .balance import fetch_balance
+
+                data = fetch_balance(
+                    provider.base_url, api_key,
+                    verify_ssl=bool(getattr(provider, "verify_ssl", True)),
+                )
+                total = float(str(data.get("total") or 0) or 0)
+            except Exception:
+                log.debug("消费统计：余额查询失败", exc_info=True)
+            try:
+                self._cost_balance_ready.emit(agent_key, purpose, total)
+            except RuntimeError:
+                pass  # 对象已销毁
+
+        threading.Thread(
+            target=worker, name="agent-cost-balance", daemon=True,
+        ).start()
+
+    def _on_cost_balance(self, agent_key: str, purpose: str, total) -> None:
+        """余额查询回到主线程：按用途写入基线或结算本轮消费。"""
+        if total is None:
+            self._cost.abort(agent_key)
+            return
+        if purpose == "baseline":
+            self._cost.set_baseline(agent_key, float(total))
+            return
+        self._settle_cost(agent_key, float(total))
+
+    def _settle_cost(self, agent_key: str, total: float) -> None:
+        """结束时的余额回来了：算差值并补一条气泡。"""
+        text = self._cost.finish(agent_key, total)
+        if not text:
+            return  # 拿不到基线 / 功能未启用：静默跳过，不显示错的
+        if not hasattr(self.win, "show_bubble"):
+            return
+        try:
+            self.win.show_bubble(text, duration_ms=3600)
+        except Exception:
+            log.debug("消费统计：气泡显示失败", exc_info=True)
+
+    def _cost_note_start(self, agent_key: str) -> None:
+        """Agent 开始干活：记下余额快照。"""
+        if not self._cost_enabled():
+            return
+        self._cost.begin(agent_key)
+        self._query_cost_balance(agent_key, "baseline")
+
+    def _cost_finish(self, agent_key: str) -> None:
+        """Agent 本轮结束：异步查一次余额，回来后算差值补气泡。
+
+        不走同步等待——余额查询要 0.2s 网络往返，阻塞主线程会卡住界面。
+        """
+        if not self._cost_enabled():
+            return
+        if not self._cost.is_tracking(agent_key):
+            return
+        self._query_cost_balance(agent_key, "done")
 
     def _emit_sound(self, event_name: str, agent_key: str) -> None:
         """播放 Agent 生命周期音效；所有 Agent 共用一组全局冷却。"""

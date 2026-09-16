@@ -660,6 +660,11 @@ class Config:
             "balance_tier_label_idle": "",  # 自定义“空闲”文本（custom 模式）
             "balance_tier_color_enabled": True,  # 峰谷提示颜色：高峰红/低谷绿
             "music_sing_enabled": False,  # 检测到后台播放音乐时自动播放唱歌动画
+            "music_sing_grace_seconds": 6.0,  # 持续静音多久才判定音乐停止（避开间奏）
+            "music_lyric_enabled": False,  # 在气泡里显示当前播放歌曲的歌词（Windows SMTC）
+            "music_lyric_lead_seconds": 1.0,  # 歌词提前量（秒）：正值=歌词抢先于音频
+            "music_lyric_cache_limit": 2000,  # 歌词缓存条数上限，超出按最旧淘汰
+            "agent_cost_enabled": False,  # Agent 本轮结束时显示消费金额（用余额差值估算）
             "golden_spin_on_click": False,  # 点击回应动画结束后自动接一段黄金回旋
             "golden_spin_direct": False,  # 点击触发黄金回旋时跳过点击动画，直接回旋并逐圈加速
             "edge_probe_enabled": False,  # 拖到屏幕左右边缘后自动进入探头姿态
@@ -905,6 +910,11 @@ class Config:
             "stream_capture_mode",
             "pnpm_bin",
             "music_sing_enabled",
+            "music_sing_grace_seconds",
+            "music_lyric_enabled",
+            "music_lyric_cache_limit",
+            "music_lyric_lead_seconds",
+            "agent_cost_enabled",
             "golden_spin_on_click",
             "golden_spin_direct",
             "edge_probe_enabled",

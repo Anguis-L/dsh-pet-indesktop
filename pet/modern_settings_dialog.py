@@ -539,7 +539,17 @@ class ModernSettingsDialog(QDialog):
                     ),
                     SettingRow("no_move", "不移动", "暂停桌宠在桌面上的自动移动。", self.no_move_check),
                     SettingRow("mouse_through", "鼠标穿透", "开启后桌宠不接收鼠标事件，点击穿透到下层窗口。", self.mouse_through_check),
+                ],
+                behavior_content,
+            )
+        )
+        behavior_layout.addWidget(
+            SettingsSection(
+                "音乐关联",
+                [
                     SettingRow("music_sing", "音乐自动唱歌", "检测到后台播放音乐时，自动播放唱歌动画。", self.music_sing_check),
+                    SettingRow("music_lyric", "显示歌词", "在气泡里显示当前播放歌曲的歌词。仅 Windows 可用；需要播放器支持系统媒体控制（SMTC），酷狗等需在播放器设置里手动开启。", self.music_lyric_check),
+                    SettingRow("music_lyric_lead", "歌词提前量", "歌词相对音频的时间偏移。正值让歌词抢先显示，负值让它延后；唱得比音乐早一点通常更自然。", self.music_lyric_lead_spin),
                 ],
                 behavior_content,
             )
@@ -1651,7 +1661,8 @@ class ModernSettingsDialog(QDialog):
         pet = page_content(
             [
                 ("显示", claim("scale", "pet_opacity")),
-                ("动画与移动", claim("playback_speed", "animation_gap", "idle_low_fps", "no_move", "music_sing")),
+                ("动画与移动", claim("playback_speed", "animation_gap", "idle_low_fps", "no_move")),
+                ("音乐关联", claim("music_sing", "music_lyric", "music_lyric_lead")),
                 ("拖拽与弹射", claim("drag_physics", "throw_strength", "slingshot_enabled", "lock_position", "shift_drag")),
                 ("边缘探头", claim("edge_probe")),
                 ("生小肥鱼", claim("spawn_inherit_size", "spawn_scale", "spawn_inherit_dynamic_island", "clear_spawned_pets")),
@@ -1793,7 +1804,6 @@ class ModernSettingsDialog(QDialog):
         gate_rows = claim_prefix("report_gate_")
         automation = page_content(
             [
-                ("Agent 提示音", claim_prefix("agent_sound_")),
                 ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
                 ("语音报时", voice_chime_rows),
                 ("节日提醒", festival_rows),
@@ -1828,6 +1838,21 @@ class ModernSettingsDialog(QDialog):
         self.report_gates_box = gates_box
         self.dialogue_phrases_box = phrases_box
         automation_layout = automation.layout()
+        # 「Agent 联动」＝两级结构：折叠框下按用途分子组（消费统计 / 提示音效）。
+        # 用现成的 CollapsibleGroup.add_group，不需要新造控件。
+        agent_box = CollapsibleGroup("Agent 联动", automation)
+        agent_cost_rows = [
+            SettingRow("agent_cost", "显示本轮消费",
+                       "Agent 每轮结束时查询一次余额，与开始时的余额相减得出本轮消费。"
+                       "仅 DeepSeek 提供余额接口；余额精度为分，不足 ¥0.01 的消耗测不出。",
+                       self.agent_cost_check),
+        ]
+        agent_box.add_group("提示音效", claim_prefix("agent_sound_"))
+        agent_box.set_expanded(True)
+        self.agent_link_box = agent_box
+        # 这些行已被上面的折叠框认领，必须登记，否则会再落进「待分类」。
+        claimed.update(agent_cost_rows)
+        claimed.update(claim_prefix("agent_sound_"))
         # dialogue_* 里有一类行**不属于任何事件门**（表达风格、专属文案对象、弹窗文案
         # 模板 JSON）：它们不是某个事件的气泡文案，而是文案风格的全局控件，因此
         # gate_for_event 返回 None、只会落到上面那个空串桶里。这些行已被
@@ -1847,6 +1872,12 @@ class ModernSettingsDialog(QDialog):
         automation_layout.insertWidget(insert_at, gates_box)
         insert_at += 1
         automation_layout.insertWidget(insert_at, phrases_box)
+        # 顶层顺序：消费统计 → Agent 联动 → 文案风格 → 触发概率 → 自定义台词 → 各类检测。
+        # 「消费统计」独立成一级分组且排最前（直接可见，不藏在折叠框里）。
+        # 必须在上面的插入全部做完之后再插，否则会被后来的 insertWidget(0, ...) 挤下去。
+        cost_section = SettingsSection("消费统计", agent_cost_rows, automation)
+        automation_layout.insertWidget(0, cost_section)
+        automation_layout.insertWidget(1, agent_box)
 
         # Preserve any newly added row until it receives an explicit domain decision.
         leftovers = [row for row in all_rows if row not in claimed and (self.ai_page is None or not self.ai_page.isAncestorOf(row))]
@@ -2069,6 +2100,14 @@ class ModernSettingsDialog(QDialog):
             self.config.set("click_show_balance", self.click_balance_check.isChecked())
         self.config.set("click_show_self_talk", self.click_self_talk_check.isChecked())
         self.config.set("music_sing_enabled", self.music_sing_check.isChecked())
+        if getattr(self, "music_lyric_check", None) is not None:
+            self.config.set("music_lyric_enabled", self.music_lyric_check.isChecked())
+        if getattr(self, "agent_cost_check", None) is not None:
+            self.config.set("agent_cost_enabled", self.agent_cost_check.isChecked())
+        if getattr(self, "music_lyric_lead_spin", None) is not None:
+            self.config.set(
+                "music_lyric_lead_seconds", float(self.music_lyric_lead_spin.value())
+            )
         self.config.set("golden_spin_on_click", self.golden_spin_click_check.isChecked())
         self.config.set("golden_spin_direct", self.golden_spin_direct_check.isChecked())
         self.config.set("edge_probe_enabled", self.edge_probe_check.isChecked())
