@@ -86,18 +86,19 @@ PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 # 一个带完整实机取证说明的委托方法：它必须留在 PetWindow 上（showEvent 是唯一
 # 可靠的"原生窗口已就绪/可能被重建"注入点，拆到独立模块反而会产生跨模块的
 # 窗口生命周期耦合）。按约定只校准预算，不为达标压行。
-# 2026-09-17 上调到 4575：Linux 贴边绘制补偿（issue #103）——GNOME/mutter 不允许
-# 窗口移出工作区，新增统一位置出口与身体框语义；换算实现已拆到
-# window_placement.py（move_window_towards/throw_bounds/stable_body_local_rect/
-# virtual_pos），window.py 只留薄委托 + 各移动路径接线（拖拽/抛掷/弹弓/漫游/
-# 缩放/碰撞夹取），实测 4564。
-WINDOW_PY_LINE_BUDGET = 4575
+# 2026-09-18 合并 #140 时按实测校准到 4605：#140 的碰撞稳定边界缓存（字段/切换复原/
+# 素材替换作废/缩放清空）与 main 已含的 #137 Linux 贴边绘制补偿（虚拟位置 + 稳定
+# 身体框）**叠加**后实测 4605——两边各自的预算都低于合并结果，是「红线是组合性质」
+# 的又一实例（docs/PR-MERGE-LESSONS-2026-09-12.md 教训 2）。按文件约定只随实测校准，
+# 不为达标压行/合并语句。
+WINDOW_PY_LINE_BUDGET = 4605
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的
 # re-export 留守本文件；控件库 / 菜单布局编辑器 / AI 设置页 / 主题 QSS 已分别拆至
 # settings_widgets / settings_menu_layout_editor / chat/ai_settings_page /
-# settings_theme_qss。预算 = 实测 + 50 行余量；再往上帝类里塞新页面时只许降不涨。
+# settings_theme_qss。预算随实测校准（早期口径为「实测 + 50 行余量」，2026-09-17
+# 起按实测值锁定，见下方逐次记录）；再往上帝类里塞新页面时只许降不涨。
 # 2026-09-05 建立（perf/memory-footprint 拆分批）。
 # 2026-09-06 上调到 1992：合入上游 main（PR73）带来动画预热开关等 +85 行
 # （实测 1942），预算随实测校准。
@@ -122,7 +123,21 @@ WINDOW_PY_LINE_BUDGET = 4575
 # 这正是「红线是组合性质」：两个 PR 各自合并时 CI 都绿，合到一起才越线
 # （见 docs/PR-MERGE-LESSONS-2026-09-12.md 教训 2）。按文件约定只随实测校准，
 # 不为达标压缩行宽/合并语句；拆分仍是待办。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2311
+# 2026-09-17 上调到 2327：新增「语音」总域，并按主人定稿口径只收鱼开口说话
+# （TTS）类设置——语音报时整组 12 行 + 节日提醒 12 行（原「自动化与联动」域，带
+# speak/TTS 播报能力）；音效类回各自功能分组：点击音效 4 行回「互动 · 点击反馈」
+# （click_ 前缀整组认领，与 HEAD 行为一致）、碰撞音效 2 行回「桌宠」碰撞组，Agent 提示音效
+# （agent_sound_*）留在 Agent 联动折叠框内。实测 2327；按文件约定只随实测校准，
+# 不为达标压缩行宽/合并语句；拆分仍是待办。
+# 2026-09-17 上调到 2341：灵动岛图标下拉框新增「鱼本体头像（推荐）」项，原 10 个
+# emoji 选项标签改中文（data 仍是 emoji）——设置页自己渲染 emoji 也会付同一笔
+# DirectWrite 彩色字体栈税额（约 33MB）；标签逐项成对写，实测 2341。
+# 2026-09-17 上调到 2371：设置页进程隔离（standalone）——__init__ 的 standalone
+# 形参/属性、末尾接线 install_standalone_hooks、move_away_from_pet 的 runtime
+# 避让分支、_on_voice_chime_preview 的本地试听分支、_write_config 注释共 +30；
+# 试听/避让/节日演示的实现全在 pet/settings_standalone.py，本文件仍只做接线；
+# 按文件约定预算只随实测校准，不为达标压缩行宽/合并语句；拆分仍是待办。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2371
 
 
 
