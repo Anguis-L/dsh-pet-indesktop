@@ -137,7 +137,10 @@ WINDOW_PY_LINE_BUDGET = 4605
 # 避让分支、_on_voice_chime_preview 的本地试听分支、_write_config 注释共 +30；
 # 试听/避让/节日演示的实现全在 pet/settings_standalone.py，本文件仍只做接线；
 # 按文件约定预算只随实测校准，不为达标压缩行宽/合并语句；拆分仍是待办。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2371
+# 2026-09-19 上调到 2380：灵动岛新增「隐藏时对话气泡」开关（控件创建 +2、
+# SettingRow +6、_write_config 回写 +1，实测 2380）；按文件约定预算只随实测
+# 校准，不为达标压缩行宽/合并语句；拆分仍是待办。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2380
 
 
 
