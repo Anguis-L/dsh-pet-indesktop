@@ -1,0 +1,72 @@
+name: AV Repro (Windows crash forensics)
+
+# 取证专用（不上游）：在真实崩溃环境（windows runner + Python 3.11 + offscreen）
+# 循环主套件复现 access violation，WER LocalDumps 留原生 dump 供解析肇事模块。
+# 不改变任何测试内容；只跑 CI 同款命令与忽略清单。
+
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: 'main suite loop count'
+        default: '3'
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      QT_QPA_PLATFORM: offscreen
+      PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Enable WER LocalDumps for python.exe
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\python.exe'
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name DumpFolder -Value 'D:\a\_temp\avdumps' -Type ExpandString
+          Set-ItemProperty -Path $key -Name DumpType -Value 1 -Type DWord
+          New-Item -Path 'D:\a\_temp\avdumps' -ItemType Directory -Force | Out-Null
+          Get-ItemProperty $key | Format-List
+
+      - name: Loop main suite (CI-identical command)
+        shell: pwsh
+        run: |
+          $loops = [int]'${{ github.event.inputs.loops }}'
+          for ($i = 1; $i -le $loops; $i++) {
+            Write-Host "=== LOOP $i / $loops ==="
+            python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py
+            $code = $LASTEXITCODE
+            Write-Host "exit code: $code"
+            if ($code -eq 0) { continue }
+            if ($code -eq 1) { continue }   # 普通用例失败：继续循环取证
+            exit $code                       # 非 0/1 = 崩溃/中断：停，留 dump
+          }
+
+      - name: List dump files
+        if: always()
+        shell: pwsh
+        run: Get-ChildItem 'D:\a\_temp\avdumps' -ErrorAction SilentlyContinue | Format-List Name,Length
+
+      - name: Upload crash dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: av-dumps
+          path: D:\a\_temp\avdumps\
+          if-no-files-found: ignore
