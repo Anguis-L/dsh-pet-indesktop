@@ -293,7 +293,6 @@ def test_confirm_dialog_text_names_pid_and_port(tmp_path, monkeypatch):
     real_exec = QMessageBox.exec
 
     def fake_exec(self):
-        captured["title"] = self.windowTitle()
         captured["text"] = self.text()
         captured["informative"] = self.informativeText()
         captured["buttons"] = [button.text() for button in self.buttons()]
@@ -305,11 +304,14 @@ def test_confirm_dialog_text_names_pid_and_port(tmp_path, monkeypatch):
     finally:
         monkeypatch.setattr(QMessageBox, "exec", real_exec)
     assert result is False  # 没有点「确认停止」按钮
+    # 断言的是「用户能不能看懂要终止谁」，不赌平台窗口标题：
+    # macOS 的 QMessageBox 是系统原生对话框，windowTitle() 在那边为空
+    # （CI 实测 macos-latest 红、Windows/Linux 绿），标题不是语义承载点。
+    assert "确认停止" in captured["text"]
     assert "3080" in captured["informative"]
     assert "13320" in captured["informative"]
     assert "确认停止" in captured["buttons"]
     assert "取消" in captured["buttons"]
-    assert captured["title"] == "停止 DeepSeek Harness"
     del app, tmp_path
 
 
