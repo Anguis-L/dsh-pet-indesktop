@@ -460,6 +460,8 @@ class PetInstance:
         # 桌宠隐藏时的气泡改道面（DSH 联动等非交互反馈气泡 → 灵动岛，见
         # window_alerts.redirect_hidden_bubble）；岛对话不可用时注入方返回 False。
         win.hidden_bubble_redirect = self.shell._island_feedback_bubble
+        # 反馈面可用性探针：隐藏期联动监视器是否跳过低功耗暂停（mixin 消费）。
+        win.island_feedback_available = self.shell._island_feedback_available
         win.on_spawn_pet = self._slot_wrap(self.shell.spawn_pet)
         # 「退出子肥鱼」只挂给主肥鱼（instance_id 为空）：子肥鱼进程里该入口的
         # pid==os.getpid() 自我保护会跳过子鱼自己、把主鱼当子鱼 taskkill 掉
@@ -2110,6 +2112,13 @@ class AppShell:
         inst = getattr(self, "instance", None)
         if inst is not None and callable(getattr(inst, "open_chat", None)):
             inst.open_chat()
+
+    def _island_feedback_available(self) -> bool:
+        """桌宠隐藏期间灵动岛反馈面是否可用（window 的联动暂停决策探针）。
+
+        可用时隐藏不暂停联动监视器：DSH 事件继续驱动岛反馈气泡；
+        不可用（无聊天模块 / 岛未启用 / hidden_chat 关）时照旧暂停省电。"""
+        return self._island_chat_available()
 
     def _island_feedback_bubble(self, text: str, subtitle: str = "",
                                 duration_ms: int = 3200) -> bool:

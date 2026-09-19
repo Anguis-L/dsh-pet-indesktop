@@ -413,3 +413,62 @@ def test_island_feedback_disabled_when_hidden_chat_off(tmp_path):
         assert shell.island_chat is None
     finally:
         _teardown_shell(shell)
+
+
+# ------------------------------------------------------ 隐藏期联动暂停决策
+
+
+def test_pause_agent_link_for_hide_decision(tmp_path):
+    """隐藏期联动暂停决策：反馈面可用 → 不暂停；不可用/未注入/探针炸 → 照旧暂停。"""
+    _qapp()
+    from PySide6.QtWidgets import QWidget
+
+    from pet.window_optional_services import WindowFeatureGateMixin
+
+    class _Win(QWidget, WindowFeatureGateMixin):
+        pass
+
+    win = _Win()
+    pauses = []
+
+    class _Mgr:
+        def pause(self):
+            pauses.append("pause")
+
+    win.agent_link_manager = _Mgr()
+
+    # 未注入探针（no-chat / 旧接线）：照旧暂停（原省电行为）
+    win.pause_agent_link_for_hide()
+    assert pauses == ["pause"]
+
+    # 反馈面可用：跳过暂停——隐藏期间岛继续收 DSH 事件驱动反馈气泡
+    win.island_feedback_available = lambda: True
+    win.pause_agent_link_for_hide()
+    assert pauses == ["pause"]
+
+    # 反馈面不可用 / 探针异常：照旧暂停
+    win.island_feedback_available = lambda: False
+    win.pause_agent_link_for_hide()
+    assert pauses == ["pause", "pause"]
+
+    def _boom():
+        raise RuntimeError("probe boom")
+
+    win.island_feedback_available = _boom
+    win.pause_agent_link_for_hide()
+    assert pauses == ["pause", "pause", "pause"]
+
+
+def test_appshell_island_feedback_available(tmp_path):
+    """注入探针透传 _island_chat_available（enable_chat / 岛在 / hidden_chat 门）。"""
+    _qapp()
+    shell = _make_shell(tmp_path, hidden_chat=True)
+    try:
+        assert shell._island_feedback_available() is False  # 岛未建
+        shell.island = _island(tmp_path)
+        shell.enable_chat = True
+        assert shell._island_feedback_available() is True
+        shell.enable_chat = False
+        assert shell._island_feedback_available() is False
+    finally:
+        _teardown_shell(shell)
