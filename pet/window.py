@@ -1250,7 +1250,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         if hasattr(self, 'proactive_watcher') and self.proactive_watcher is not None:
             self.proactive_watcher.pause()
         if hasattr(self, 'agent_link_manager') and self.agent_link_manager is not None:
-            self.agent_link_manager.pause()
+            self.pause_agent_link_for_hide()
         if hasattr(self, 'lib') and self.lib is not None and hasattr(self.lib, 'pause_warm'):
             self.lib.pause_warm()
         # 交互让路闸门随隐藏对称释放（库侧 pause_warm 已换代清零时 end 是
