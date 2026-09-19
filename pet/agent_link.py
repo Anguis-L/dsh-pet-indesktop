@@ -4009,6 +4009,15 @@ class AgentLinkManager(QObject):
         （约 10s 窗口），仍被占才放弃——主动识屏长答复可能占位 15-20s。"""
         if not hasattr(self.win, "show_bubble"):
             return
+        # 桌宠隐藏时 show_bubble/show_alert 会静默丢弃：改道灵动岛反馈面
+        # （AppShell 经 hidden_bubble_redirect 注入；无注入/岛不可用维持丢弃）。
+        # 审批/问题等交互气泡不经本函数，仍需桌宠可见。
+        is_visible = getattr(self.win, "isVisible", None)
+        if callable(is_visible) and not is_visible():
+            from . import window_alerts as _window_alerts
+
+            if _window_alerts.redirect_hidden_bubble(self.win, text, duration_ms=duration_ms):
+                return
         # 提醒消息队列激活：任何其他弹窗（含重要气泡）都不覆盖提醒
         if getattr(self.win, "_alert_current", None) is not None or \
                 getattr(self.win, "_alert_queue", None):

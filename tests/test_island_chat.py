@@ -354,3 +354,62 @@ def test_shell_no_auto_pop_when_full_chat_window_open(tmp_path):
         assert shell.island_chat is None
     finally:
         _teardown_shell(shell)
+
+
+# ------------------------------------------------------ 隐藏期 DSH 反馈改道
+
+
+def test_island_chat_feedback_preview(tmp_path):
+    """反馈气泡：预览式弹出（不抢焦点）、文案/字幕就位、按注入时长收回。"""
+    _qapp()
+    island = _island(tmp_path)
+    bubble = IslandChatBubble(Config(base=tmp_path))
+    try:
+        bubble.show_feedback(island, "DSH 正在认真想办法……", subtitle="DSH", duration_ms=1234)
+
+        assert bubble.isVisible()
+        assert QApplication.activeWindow() is not bubble, "预览式弹出不抢焦点"
+        assert bubble._auto_collapse.isActive()
+        assert bubble._auto_collapse.interval() == 1234
+        assert "认真想办法" in bubble.output.text()
+        assert bubble.hint_label.text() == "DSH"
+    finally:
+        bubble.close()
+        bubble.deleteLater()
+        _teardown_island(island)
+
+
+def test_island_feedback_bubble_redirect_gates(tmp_path):
+    """AppShell 注入面：桌宠隐藏 + 岛可用 → 反馈弹到岛气泡；桌宠可见 → 拒绝。"""
+    _qapp()
+    shell = _make_shell(tmp_path, hidden_chat=True)
+    try:
+        island = _island(tmp_path)
+        shell.island = island
+        shell.enable_chat = True
+
+        assert shell._island_feedback_bubble(
+            "DSH 开始干活啦～", subtitle="DSH", duration_ms=4500) is True
+        bubble = shell.island_chat
+        assert bubble is not None and bubble.isVisible()
+        assert "开始干活啦" in bubble.output.text()
+
+        # 桌宠可见时拒绝改道（返回 False，调用方走原路径）
+        shell._aggregate_pet_visible = lambda: True
+        assert shell._island_feedback_bubble("第二条") is False
+    finally:
+        _teardown_shell(shell)
+
+
+def test_island_feedback_disabled_when_hidden_chat_off(tmp_path):
+    """hidden_chat 关：注入面返回 False，维持原丢弃行为（用户显式关闭）。"""
+    _qapp()
+    shell = _make_shell(tmp_path, hidden_chat=False)
+    try:
+        shell.island = _island(tmp_path, hidden_chat=False)
+        shell.enable_chat = True
+
+        assert shell._island_feedback_bubble("DSH 开始干活啦～") is False
+        assert shell.island_chat is None
+    finally:
+        _teardown_shell(shell)

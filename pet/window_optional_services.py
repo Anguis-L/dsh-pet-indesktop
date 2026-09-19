@@ -26,6 +26,9 @@ class WindowFeatureGateMixin:
     agent_link_manager: Any = None
     _file_eater: Any = None
     _file_interpret: Any = None
+    # 桌宠隐藏时的气泡改道面（AppShell 注入 → 灵动岛反馈气泡），见
+    # window_alerts.redirect_hidden_bubble；None = 维持原丢弃行为。
+    hidden_bubble_redirect: Any = None
     _broker_facade: Any = None
     _golden_spin: Any = None
     _edge_probe: Any = None

@@ -1350,6 +1350,45 @@ class TestAgentLinkBubbles:
         assert any("已完成" in b for b in bubbles), f"应弹完成气泡: {bubbles}"
 
 
+    def test_hidden_pet_redirects_feedback_bubble_to_island(self, tmp_path):
+        """桌宠隐藏时联动反馈气泡改道灵动岛反馈面（不再静默丢弃）。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        redirected = []
+
+        def fake_redirect(text, subtitle="", duration_ms=3200):
+            redirected.append((text, duration_ms))
+            return True
+
+        win.isVisible = lambda: False
+        win.hidden_bubble_redirect = fake_redirect
+
+        mgr._show_link_bubble("DSH 开始干活啦～", important=True, duration_ms=4500)
+
+        assert redirected == [("DSH 开始干活啦～", 4500)]
+        assert bubbles == []
+
+    def test_visible_pet_keeps_normal_bubble_path(self, tmp_path):
+        """桌宠可见时不改道（正常气泡路径不受注入影响）。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        redirected = []
+        win.hidden_bubble_redirect = lambda *a, **k: redirected.append(a) or True
+
+        mgr._show_link_bubble("普通消息", important=False, duration_ms=2600)
+
+        assert redirected == []
+        assert "普通消息" in bubbles
+
+    def test_hidden_pet_without_injection_falls_through(self, tmp_path):
+        """无注入（无岛 / no-chat 变体）时不改道，走原 show_bubble 路径
+        （真窗上等价于隐藏丢弃——由 show_bubble 自身的可见性守卫负责）。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        win.isVisible = lambda: False
+
+        mgr._show_link_bubble("普通消息", important=True, duration_ms=4500)
+
+        assert bubbles == ["普通消息"]
+
+
 class TestAgentLinkSounds:
     def _make(self, tmp_path, monkeypatch, **sound_cfg):
         class Win:
