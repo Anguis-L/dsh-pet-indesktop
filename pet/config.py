@@ -371,6 +371,23 @@ def _merge_agent_link_data(raw: Any) -> dict:
     return _clean_agent_link_data(raw)
 
 
+def _default_file_interpret_data() -> dict:
+    """拖文件解读（file_interpret）默认值；消费方 pet/file_interpret.py。"""
+    return {
+        # 拖文件后提供「解读」确认气泡；关闭则拖放只有吃动画，不询问
+        "enabled": True,
+        # 进度汇报间隔（秒），产品区间 [5,120]；PR3 增加 progress_mode（heartbeat/chunked）
+        "progress_interval_seconds": 15.0,
+    }
+
+
+def _merge_file_interpret_data(raw: Any) -> dict:
+    result = _default_file_interpret_data()
+    if isinstance(raw, dict):
+        result.update(raw)
+    return result
+
+
 def _default_chat_data():
     return {
         "enabled": True,
@@ -522,6 +539,7 @@ def _default_dynamic_island_data() -> dict:
         # 图片；其余字符串=文字/emoji（用户主动选择，愿意付首次绘制的一次性税额）
         "icon": "auto",
         "click_action": "expand",  # expand（展开卡片）/ toggle_pet（切换显隐，旧行为）
+        "hidden_chat": True,  # 桌宠隐藏时：单击岛弹对话气泡；AI 回复到达时岛上弹预览
         "event_effects": True,  # 事件动效：AI 回复/余额刷新/峰谷切换弹跳
         "edge_dock": True,  # 拖到屏幕边缘收成细条，鼠标靠近滑出
         "dock_edge": "none",  # none / top / bottom / left / right（拖拽落点写入）
@@ -567,7 +585,7 @@ def _clean_dynamic_island_data(value) -> dict:
     result["click_action"] = click_action if click_action in {"expand", "toggle_pet"} else "expand"
     # 布尔键必须用 _bool_or_default：bool("false") is True，字符串/None
     # 会被误翻（同文件既有规则）；int 0/1 是旧配置的合法布尔编码，先归一
-    for _key in ("event_effects", "edge_dock", "collision_enabled"):
+    for _key in ("event_effects", "edge_dock", "collision_enabled", "hidden_chat"):
         _v = result[_key]
         if isinstance(_v, int) and not isinstance(_v, bool):
             _v = bool(_v)
@@ -725,6 +743,7 @@ class Config:
             "dynamic_island": _default_dynamic_island_data(),
             "proactive_screen": _default_proactive_screen_data(),
             "agent_link": _default_agent_link_data(),
+            "file_interpret": _default_file_interpret_data(),
             "chat_ui_style": "modern",  # modern / classic（仅聊天窗口保留双实现）
             "chat_follow_pet": False,  # 聊天窗口是否跟随桌宠移动
             "system_notifications_enabled": True,  # 对话完成/失败/需要授权时弹桌面系统通知
@@ -1023,6 +1042,8 @@ class Config:
             self.data["proactive_screen"] = _merge_proactive_screen_data(raw["proactive_screen"])
         if "agent_link" in raw:
             self.data["agent_link"] = _merge_agent_link_data(raw["agent_link"])
+        if "file_interpret" in raw:
+            self.data["file_interpret"] = _merge_file_interpret_data(raw["file_interpret"])
         self._migrate_click_sound_config(raw)
         self._migrate_decode_broker_config(raw)
         self.data["version"] = 4
@@ -1324,6 +1345,14 @@ class Config:
         self.data["experimental_shared_decode"] = _bool_or_default(self.data.get("experimental_shared_decode"), True)
         # 设置页进程隔离：同规防字符串布尔误开；默认开（关掉 = 回退进程内设置页）。
         self.data["settings_process_isolation"] = _bool_or_default(self.data.get("settings_process_isolation"), True)
+        # 拖文件解读（file_interpret）：嵌套键归一化（布尔/秒数钳制），
+        # 未认识的键随 _merge_file_interpret_data 保留（对齐 agent_link 宽容策略）
+        fi = self.data.get("file_interpret")
+        if isinstance(fi, dict):
+            fi["enabled"] = _bool_or_default(fi.get("enabled", True), True)
+            fi["progress_interval_seconds"] = _float_or_default(
+                fi.get("progress_interval_seconds"), 15.0, 5.0, 120.0
+            )
         self.data.update(_clean_collision_data(self.data))
 
     def get(self, key, default=None):
@@ -1417,6 +1446,7 @@ class Config:
             "slingshot_enabled",
             "throw_strength",
             "agent_link",
+            "file_interpret",
             "idle_low_fps_enabled",
             "idle_low_fps_threshold",
             "media_prewarm",

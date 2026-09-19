@@ -155,7 +155,8 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset(
 )
 
 # 默认值 dict 里不走普通白名单、由 reload() 专门路径处理的键（现状文档化）。
-SPECIAL_CASED_KEYS = frozenset({"version", "proactive_screen", "agent_link", "chat"})
+# 2026-09-19 加入 file_interpret（拖文件解读，嵌套 dict 走 _merge_ 专门路径）。
+SPECIAL_CASED_KEYS = frozenset({"version", "proactive_screen", "agent_link", "chat", "file_interpret"})
 
 # 默认值 dict 键集合现状快照 = 白名单 ∪ 特例键。
 # 2026-09-17 加入 music_player_paths（交付前审查 P1-3 登记）后实测：

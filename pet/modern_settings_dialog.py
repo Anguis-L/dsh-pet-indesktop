@@ -148,6 +148,7 @@ from .persona_template import (
     CONDITIONAL_PARAMETERS,
     PARAMETERS,
 )
+from . import settings_file_interpret
 from . import settings_pet_controls
 from .report_gates import REPORT_GATE_KEYS, REPORT_GATE_LABELS, gate_for_event
 
@@ -308,6 +309,8 @@ class ModernSettingsDialog(QDialog):
         root.addLayout(body, 1)
 
         self._build_pet_controls()
+        # 「文件识别」域控件在本模块构建（行数预算原因），见 settings_file_interpret。
+        self._build_file_interpret_controls()
         # 「随桌宠启动 dsh 服务」开关（origin/main #80 合入带回）：构建留在
         # 对话框本体（upstream 代码所在宿主），供下方 launch_rows 引用。
         self.harness_autostart_check = ToggleSwitch(self)
@@ -395,6 +398,8 @@ class ModernSettingsDialog(QDialog):
         self.island_click_action_select.setCurrentData(str(island_cfg.get("click_action") or "expand"))
         self.island_event_effects_check = ToggleSwitch(self)
         self.island_event_effects_check.setChecked(bool(island_cfg.get("event_effects", True)))
+        self.island_hidden_chat_check = ToggleSwitch(self)
+        self.island_hidden_chat_check.setChecked(bool(island_cfg.get("hidden_chat", True)))
         self.island_edge_dock_check = ToggleSwitch(self)
         self.island_edge_dock_check.setChecked(bool(island_cfg.get("edge_dock", True)))
         self.island_collision_check = ToggleSwitch(self)
@@ -514,6 +519,12 @@ class ModernSettingsDialog(QDialog):
                         "单击行为",
                         "单击胶囊：展开快捷卡片（余额/最近消息/快捷按钮）或直接切换桌宠显隐。",
                         self.island_click_action_select,
+                    ),
+                    SettingRow(
+                        "dynamic_island_hidden_chat",
+                        "隐藏时对话气泡",
+                        "桌宠隐藏后岛变成对话入口：单击灵动岛弹出对话气泡，AI 回复到达时也会在岛上弹出预览（不抢焦点，超时自动收回）。",
+                        self.island_hidden_chat_check,
                     ),
                     SettingRow(
                         "dynamic_island_event_effects",
@@ -1025,6 +1036,10 @@ class ModernSettingsDialog(QDialog):
     def _build_pet_controls(self) -> None:
         """Compatibility delegation (settings_pet_controls.build_pet_controls)."""
         settings_pet_controls.build_pet_controls(self)
+
+    def _build_file_interpret_controls(self) -> None:
+        """「文件识别」域控件（settings_file_interpret 构建，行数预算原因不在本文件展开）。"""
+        settings_file_interpret.create_file_interpret_controls(self)
 
     def _build_proactive_controls(self) -> None:
         """主动识屏页控件（仅 Windows + 有聊天能力时挂载）。"""
@@ -1929,6 +1944,10 @@ class ModernSettingsDialog(QDialog):
             ]
         )
 
+        # 「文件识别」域（2026-09-19 新增）：拖文件解读的设置集中在此独立页。
+        # 行在本模块构建（settings_file_interpret，行数预算原因），不走 claim。
+        file_interpret = settings_file_interpret.build_file_interpret_page(self)
+
         # Preserve any newly added row until it receives an explicit domain decision.
         leftovers = [row for row in all_rows if row not in claimed and (self.ai_page is None or not self.ai_page.isAncestorOf(row))]
         if leftovers:
@@ -1947,6 +1966,7 @@ class ModernSettingsDialog(QDialog):
             "AI 与对话": ai_sections,
             "自动化与联动": automation,
             "语音": voice,
+            "文件识别": file_interpret,
         }
         for label, icon in SETTINGS_DOMAIN_NAV:
             content = domain_content.get(label)
@@ -2140,6 +2160,7 @@ class ModernSettingsDialog(QDialog):
                 "accent": str(self.island_accent_select.currentData() or "blue"),
                 "icon": str(self.island_icon_select.currentData() or "auto"),
                 "click_action": str(self.island_click_action_select.currentData() or "expand"),
+                "hidden_chat": self.island_hidden_chat_check.isChecked(),
                 "event_effects": self.island_event_effects_check.isChecked(),
                 "edge_dock": self.island_edge_dock_check.isChecked(),
                 "collision_enabled": self.island_collision_check.isChecked(),
@@ -2280,6 +2301,7 @@ class ModernSettingsDialog(QDialog):
         self.config.set("quick_launch_apps", self.quick_launch_editor.apps())
         if self.ai_page is not None:
             self.ai_page.save()
+        settings_file_interpret.save_file_interpret_settings(self)
         if sys.platform == "win32" and self.include_ai and hasattr(self, "pro_enabled_check"):
             from .proactive import PRESET_DEFAULTS
 

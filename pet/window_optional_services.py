@@ -25,6 +25,7 @@ class WindowFeatureGateMixin:
     proactive_watcher: Any = None
     agent_link_manager: Any = None
     _file_eater: Any = None
+    _file_interpret: Any = None
     _broker_facade: Any = None
     _golden_spin: Any = None
     _edge_probe: Any = None
@@ -67,6 +68,19 @@ class WindowFeatureGateMixin:
             from .file_eater import FileEaterDropHandler
             self._file_eater = FileEaterDropHandler(self)
         return self._file_eater
+
+    # ------------------------------------------------------------ 文件解读
+    def install_file_interpreter(self):
+        """挂载拖文件解读控制器（幂等）并与投喂处理器互相接线。
+
+        启用与否不再走 sync：offer() 每次实时读 file_interpret.enabled，
+        设置页改动即时生效且无需同步钩子。
+        """
+        if self._file_interpret is None:
+            from .file_interpret import FileInterpretController
+            self._file_interpret = FileInterpretController(self)
+        self.install_file_eater().interpret_offer = self._file_interpret.offer
+        return self._file_interpret
 
     # ------------------------------------------------------------ 黄金回旋/边缘探头
     def _install_effect_services(self):
