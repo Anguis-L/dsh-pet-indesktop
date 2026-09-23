@@ -14,6 +14,9 @@ Phase 3a：右键菜单最小集（contextMenuEvent → sprite_menu.build_sprite
 Phase 3b：sprite 位置监听（add_position_listener）——sprite 不产生 moveEvent，
 气泡/聊天窗等外围小窗的跟随源平移为 tick 后 rect 变化 fanout（spec「Phase 3
 设计」3b 节）。
+Phase 4 D2/HiDPI：DPR 由 overlay 统一按所在屏喂给**全部** sprite
+（add_sprite/showEvent/屏事件），屏幕 DPR 变化（显示缩放、跨屏、几何变化）
+即重喂并按新 DPR 重建——对齐旧路径 window.py:2129-2218 的信号驱动语义。
 """
 
 from __future__ import annotations
@@ -75,6 +78,11 @@ class OverlayWindow(QWidget):
         self._governor = TickGovernor()
         self._applied_tier = TIER_ACTIVE
         self._last_frame_notify: float | None = None
+        # D2/P1：Qt 信号驱动 DPR 变化（QWindow.screenChanged + 所在屏
+        # logical/physicalDotsPerInchChanged；Qt 6.11 无 devicePixelRatioChanged），
+        # 与 geometryChanged 一起重喂 sprite。showEvent 接线，closeEvent 摘线。
+        self._dpr_watch_window = None
+        self._dpr_watch_screen = None
 
         self._elapsed = QElapsedTimer()
         self._tick_count = 0
@@ -155,6 +163,7 @@ class OverlayWindow(QWidget):
         super().showEvent(event)
         self._refresh_tick_interval()  # V-6：显示时重读刷新率（电池 DRR）
         self._feed_dpr()               # V-11：DPR 由 overlay 统一喂
+        self._arm_dpr_change_watch()   # D2/P1：屏 DPR 变化 → 重喂 + 重建
         self._note_kinetic()           # M-1：可见即回 T0（从 T3 唤醒）
         if sys.platform == "win32" and self._input_controller is None:
             # 逐像素穿透：未命中任何 sprite 的屏幕区域点击直达下层应用——
@@ -165,6 +174,7 @@ class OverlayWindow(QWidget):
 
     def closeEvent(self, event) -> None:
         self._timer.stop()  # V-12：关窗即停 tick，不再 170Hz 空转
+        self._disarm_dpr_change_watch()  # D2/P1：摘线，与 showEvent arm 对称
         if self._input_controller is not None:
             self._input_controller.stop()
             self._input_controller = None
@@ -202,13 +212,138 @@ class OverlayWindow(QWidget):
         if self.isVisible():
             self.update(QRegion(sprite.rect()))
 
+    # ---------------------------------------------------------------- DPR 归一化（D2）
     def _feed_dpr(self) -> None:
-        """把所在屏 DPR 喂给全部 sprite（showEvent/屏变化时调用）。"""
+        """把所在屏 DPR 喂给全部 sprite（add_sprite/showEvent/屏事件）。
+
+        覆盖所有 sprite（不只主宠）：4.2b 生成的子 sprite 同样必须按屏 DPR
+        渲染，否则 125%/150% 下只有主宠清晰。只在 DPR 真正变化时补一次
+        全窗重绘（同值零开销——屏幕信号会重复上报）；变化时 sprite 内部已
+        按新 DPR 重建 pixmap 与命中图（PetSprite.set_dpr → _invalidate_frames）。
+        """
         dpr = float(self._screen.devicePixelRatio())
+        changed = False
         for sprite in self.sprites:
             set_dpr = getattr(sprite, "set_dpr", None)
-            if callable(set_dpr):
-                set_dpr(dpr)
+            if not callable(set_dpr):
+                continue
+            before = getattr(sprite, "dpr", None)
+            set_dpr(dpr)
+            if getattr(sprite, "dpr", None) != before:
+                changed = True
+        if changed:
+            self.update()
+
+    @staticmethod
+    def _connect_screen_signal(screen, name: str, slot) -> None:
+        """按名连接屏信号；假屏缺该信号/已销毁时静默跳过（测试假屏无 DPI 信号）。"""
+        sig = getattr(screen, name, None)
+        if sig is None:
+            return
+        try:
+            sig.connect(slot)
+        except (TypeError, RuntimeError):
+            pass
+
+    @staticmethod
+    def _disconnect_screen_signal(screen, name: str, slot) -> None:
+        """按名断开屏信号；未连接过/屏已销毁时静默跳过。"""
+        sig = getattr(screen, name, None)
+        if sig is None:
+            return
+        try:
+            sig.disconnect(slot)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _wire_screen_dpi_signals(self, screen) -> None:
+        """把所在屏的 DPR/几何变化信号挂到重喂；跨屏时换挂新屏。
+
+        Qt 6.11 的 QScreen 没有 devicePixelRatioChanged：显示缩放变化由
+        logical/physicalDotsPerInchChanged 上报；geometryChanged 覆盖分辨率/
+        模式切换（可能连带 DPR 变化）。名字与 PetWindow 同族方法一致，
+        能力断言按 sprite 侧等价物对照（tests/test_sprite_dpr.py）。
+        """
+        if screen is None:
+            return
+        old = self._dpr_watch_screen
+        if old is screen:
+            return
+        if old is not None:
+            self._disconnect_screen_signals(old)
+        self._dpr_watch_screen = screen
+        for name in ("logicalDotsPerInchChanged", "physicalDotsPerInchChanged"):
+            self._connect_screen_signal(screen, name, self._on_screen_dpi_changed)
+        for name in ("geometryChanged", "availableGeometryChanged"):
+            self._connect_screen_signal(screen, name, self._on_screen_geometry_changed)
+
+    def _disconnect_screen_signals(self, screen) -> None:
+        for name in ("logicalDotsPerInchChanged", "physicalDotsPerInchChanged"):
+            self._disconnect_screen_signal(screen, name, self._on_screen_dpi_changed)
+        for name in ("geometryChanged", "availableGeometryChanged"):
+            self._disconnect_screen_signal(screen, name, self._on_screen_geometry_changed)
+
+    def _arm_dpr_change_watch(self) -> None:
+        """接线屏 DPR 变化信号（showEvent 调用；幂等，QWindow 重建时重挂）。
+
+        QWindow 不存在（壳层构建期/未 realize 的测试直调 showEvent）时只挂
+        所在屏的 DPI/几何信号——窗口句柄拿到后再补挂 screenChanged。
+        """
+        win = self.windowHandle()
+        old = self._dpr_watch_window
+        if win is not None and win is not old:
+            if old is not None:
+                self._disconnect_screen_signal(old, "screenChanged",
+                                               self._on_window_screen_changed)
+            self._connect_screen_signal(win, "screenChanged",
+                                        self._on_window_screen_changed)
+            self._dpr_watch_window = win
+        self._wire_screen_dpi_signals(self._screen)
+
+    def _disarm_dpr_change_watch(self) -> None:
+        """关闭窗口时摘除信号接线（与 showEvent 的 arm 对称）。"""
+        old = self._dpr_watch_window
+        if old is not None:
+            self._disconnect_screen_signal(old, "screenChanged",
+                                           self._on_window_screen_changed)
+            self._dpr_watch_window = None
+        old = self._dpr_watch_screen
+        if old is not None:
+            self._disconnect_screen_signals(old)
+            self._dpr_watch_screen = None
+
+    def _on_window_screen_changed(self, screen) -> None:
+        """QWindow.screenChanged：跨屏 → 换挂新屏信号并按新 DPR 重喂。
+
+        窗口不动时跨屏（副屏 DPI 配置不同）也走这条：新屏从此成为 DPR 与
+        几何的取数源，sprite 立即按新 DPR 重建，不等 tick/重绘。
+        """
+        if screen is not None:
+            self._screen = screen
+            self._wire_screen_dpi_signals(screen)
+            self._refresh_tick_interval()
+        self._feed_dpr()
+        self.update()
+
+    def _on_screen_dpi_changed(self, *_args) -> None:
+        """系统显示缩放变化（窗口未移动）→ 按新 DPR 重喂 + 重绘。"""
+        self._feed_dpr()
+        self.update()
+
+    def _on_screen_geometry_changed(self, *_args) -> None:
+        """所在屏几何/可用区变化：overlay 跟随屏几何 + 重读刷新率 + 重喂 DPR。
+
+        分辨率/模式切换常连带 DPR 与刷新率变化；几何同步对未接壳层的裸
+        overlay 必需（壳层路径另有 _sync_geometry，重复设置同值是 no-op）。
+        """
+        screen = self._screen
+        if screen is not None:
+            geo = screen.geometry()
+            if self.geometry() != geo:
+                self.setGeometry(geo)
+        self._refresh_tick_interval()
+        self._feed_dpr()
+        self.update()
 
     def remove_sprite(self, sprite, *, release_clip: bool = True) -> None:
         """移除并按其矩形局部刷新（露出下层内容）。

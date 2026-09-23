@@ -127,8 +127,7 @@ class PetSprite(QObject):
             return
         old_rect = self.rect()
         self._scale = value
-        self._frame_sig = None    # 签名含 scale，显式作废（防御）
-        self._frame_dirty = True
+        self._invalidate_frames()  # 签名含 scale：立即按新尺寸重建（D2）
         self.set_pos(self.pos)    # 尺寸变化后按新身体框补钳（内部判变）
         self._notify_dirty(old_rect, self.rect())
 
@@ -146,6 +145,21 @@ class PetSprite(QObject):
             max(1, int(round(catalog.CANVAS_W * self.scale * dpr))),
             max(1, int(round(catalog.CANVAS_H * self.scale * dpr))),
         )
+
+    def _invalidate_frames(self) -> None:
+        """作废帧缓存并按当前 (scale, dpr) 立即重建（D2 唯一作废入口）。
+
+        scale / dpr 任一变化都必须走这里：签名残留会让快路径跳过重建、
+        旧成品继续显示（125%/150% 下变糊）；命中图残留更糟——它是物理
+        像素图，新 dpr 索引旧图会越界/错位误判穿透。语义对齐旧路径
+        window.py:2129-2150（_refresh_frame_for_screen_dpr 强制 _rebuild_frame
+        + update）：这里同步重建，首帧未就绪时 _rebuild_pixmap 保持旧成品
+        不破坏显示（失败不记账，见 _rebuild_pixmap 的签名写入时机）。
+        """
+        self._frame_sig = None
+        self._hit_image = None
+        self._frame_dirty = True
+        self._rebuild_pixmap()
 
     def rect(self) -> QRect:
         """sprite 在 overlay 局部逻辑坐标系下的外接矩形（整数化后的绘制矩形）。
@@ -185,8 +199,11 @@ class PetSprite(QObject):
     def set_dpr(self, dpr: float) -> None:
         """设置渲染 DPR（overlay 按所在屏 devicePixelRatio 写入）。
 
-        只影响渲染像素：pixmap 物理尺寸与命中图随 dpr 重建（帧签名含 dpr，
-        下次 _rebuild_pixmap 自然走全链）；rect/pos/velocity 等逻辑几何不变。
+        只影响渲染像素：pixmap 物理尺寸与命中图随 dpr 立即重建（旧成品与
+        旧命中图绝不留在缓存里），并报脏要求重绘——屏 DPR 变化时宠物静止
+        也要立刻换清晰成品，不等下一个 tick/重绘（旧路径
+        window.py:2137-2142 同语义：_rebuild_frame + update）。rect/pos/
+        velocity 等逻辑几何不变。
         """
         dpr = float(dpr)
         if dpr <= 0:
@@ -194,10 +211,9 @@ class PetSprite(QObject):
         if dpr == self._dpr:
             return
         self._dpr = dpr
-        self._frame_sig = None   # 命中图是物理像素，必须随 dpr 重建
-        self._hit_image = None   # 同步清命中图：重建窗口期内 alpha_at 按
-                                 # 新 dpr 索引旧（更小）图会越界误判穿透
-        self._frame_dirty = True
+        self._invalidate_frames()
+        rect = self.rect()
+        self._notify_dirty(rect, rect)  # 立即重绘（不等 tick）
 
     # ---------------------------------------------------------------- 钳制（D3）
     @property
@@ -467,13 +483,17 @@ class PetSprite(QObject):
     def alpha_at(self, local: QPoint | QPointF) -> int:
         """sprite 局部**逻辑**坐标处的 alpha（0-255）。镜像已烘焙进缓存帧，无需再翻转。
 
-        命中图是物理像素（CANVAS*scale*dpr），输入逻辑坐标需 ×dpr 换算（D2）。
+        命中图是物理像素（CANVAS*scale*dpr），输入逻辑坐标按「命中图物理
+        尺寸 ÷ 逻辑尺寸」的实际比例换算（D2）——不用裸 dpr：物理尺寸是
+        四舍五入取整，逻辑末列 ×dpr 可能越界误判穿透；按图实际比例换算
+        则整幅逻辑矩形恰好覆盖整幅命中图。负数坐标 floor 到图外返回 0。
         """
         img = self._hit_image
         if img is None:
             return 0
-        dpr = self._dpr
-        x, y = int(local.x() * dpr), int(local.y() * dpr)
+        lw, lh = self._logical_size()
+        x = math.floor(local.x() * img.width() / lw)
+        y = math.floor(local.y() * img.height() / lh)
         if 0 <= x < img.width() and 0 <= y < img.height():
             return (img.pixel(x, y) >> 24) & 0xFF
         return 0
