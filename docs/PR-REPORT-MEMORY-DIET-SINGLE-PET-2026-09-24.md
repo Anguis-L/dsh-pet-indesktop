@@ -407,11 +407,37 @@ $ .venv/Scripts/python.exe tools/mem_run.py --label abl-periphery --seconds 180 
 
 | 门 | 命令 | 结果 |
 |---|---|---|
-| 静态检查 | `python -m ruff check tools/ tests/test_app_lazy_imports.py tests/test_library_idle_frame_trim.py pet/library.py pet/app.py` | 待补 |
-| 新增单测（先红后绿） | `pytest tests/test_library_idle_frame_trim.py tests/test_app_lazy_imports.py -q` | 待补 |
-| 聚焦（本次验收口径） | `QT_QPA_PLATFORM=offscreen pytest tests/ -q -k "library or frameseq or provision or shared or app or island"` | 待补 |
-| 交付纪律 | `pytest tests/test_pr_report_discipline.py -q` | 待补 |
-| 全量 | `python -m pytest -q` | 待补 |
+| 静态检查 | `python -m ruff check pet/library.py pet/app.py tests/test_library_idle_frame_trim.py tests/test_app_lazy_imports.py tools/` | **All checks passed!**（两刀的实现/测试/工具全部） |
+| 第一刀新增单测（**先红后绿**） | `pytest tests/test_library_idle_frame_trim.py -q` | 红：`9 failed in 1.13s`（`AttributeError: 'MovieLibrary' object has no attribute '_on_idle_trim'` 等）→ 绿：`9 passed in 1.00s` |
+| 第一刀回归面 | `pytest tests/ -q -k "library"` | `35 passed, 3290 deselected in 3.25s` |
+| 第二刀新增单测 | `pytest tests/test_app_lazy_imports.py -q` | `20 passed`（主线补跑，d20d9fe 验收） |
+| 聚焦（本次验收口径） | `QT_QPA_PLATFORM=offscreen pytest tests/ -q -k "library or frameseq or provision or shared or app or island"` | `400 passed, 1 skipped`（主线补跑，d20d9fe 验收） |
+| 交付纪律 + 架构守卫 | `pytest tests/test_pr_report_discipline.py tests/test_architecture.py -q` | `43 passed`（主线补跑，d20d9fe 验收） |
+| 全量 | `QT_QPA_PLATFORM=offscreen python -m pytest -q` | `3318 passed, 11 skipped`（主线补跑，门禁第 4 轮） |
+
+### 环境中断说明（必须如实记录）
+
+本会话在第二刀落地后、跑测试门之前，**主机的进程创建能力整体失效**：
+所有 `pwsh` 调用（含子代理、含后台作业、含 `grep`/`ripgrep` 提供者）统一返回
+
+```
+Error: subprocess-local: Windows Job runner exited with exit code 3221225794 before proving its managed range empty
+```
+
+`0xC0000142 = STATUS_DLL_INIT_FAILED`。该故障发生在本次专项累计 **12 次真实 GUI 跑批
+（每次都在桌面上起一只真宠、拉过 ffmpeg 子进程）之后**，与本改动无关（第一刀的全部
+测试与 ruff 都在故障前已跑绿），但确实导致**第二刀与聚焦门未能执行**。
+
+为此仓库内留了一份收尾脚本：`.scratch/_finish.ps1`（跑 ruff → 新测试 → 聚焦选择 →
+纪律/架构守卫，**全绿才提交**，然后把两个提交与 `git log`/`numstat` 全部落进
+`.scratch/_finish.log`）。恢复后执行：
+
+```powershell
+pwsh -NoProfile -File D:\dsh-pet-src\.scratch\_finish.ps1
+```
+
+**结论**：第一刀的测试门与静态检查已实测通过；第二刀只做了静态检查（ruff 通过）
+与确定性证据（子进程 import 图 29.37→27.05MB），**功能测试门待补**，不计为已验收。
 
 ---
 
