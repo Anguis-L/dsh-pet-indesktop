@@ -39,7 +39,8 @@
 | [`STABLE_BUILDS.md`](STABLE_BUILDS.md) | 稳定版构建冻结记录：受保护文件名、构建隔离规则、防止误覆盖稳定版产物。 | **改发布/构建工作流时必读**（AGENTS.md 口径）。注意其冻结对象是 onefile 时代的 `dist/*.exe`，现行发布形态已是 onedir（见文末过时清单）。 |
 | [`BUILD-CI-FAILURE-NOTES-2026-08.md`](BUILD-CI-FAILURE-NOTES-2026-08.md) | 三平台打包/CI 反复踩坑与最终解法汇总（持续更新）：脚本统一入口、资源漏收集、依赖只在叶子模块导入导致整族用例红等。 | CI 连续两轮红、或遇到"本机红 CI 绿"的依赖类假红时；动手重试之前先查这里是否已有同类记录。 |
 | [`ACCEPTANCE_TESTS.md`](ACCEPTANCE_TESTS.md) | 验收测试文件清单：设置窗口、DSH Bridge、Qt 生命周期/全量三条验收路径的精确命令与当前实测基线。 | 提 PR 前跑验收、或需要确认"这个改动该跑哪几个测试文件"时；改动测试边界后必须同步更新本文基线数字。 |
-| [`RELEASE-v4.2.0.md`](RELEASE-v4.2.0.md) | v4.1.0 → v4.2.0 的完整功能与修复汇总（含全部合入 PR 与各平台产物清单）。 | 写发布说明、回答"这个功能从哪个版本开始有"、或判断某行为是哪个 PR 引入时。 |
+| [`RELEASE-v4.2.0.md`](RELEASE-v4.2.0.md) | v4.1.0 → v4.2.0 的完整功能与修复汇总（含全部合入 PR 与各平台产物清单）。 | 写发布说明、回答"这个功能从哪个版本开始有"、或判断某行为是哪个 PR 引入时；**v4.2.0 之后的变更改看 [`RELEASE-v4.2.1.md`](RELEASE-v4.2.1.md)**。 |
+| [`RELEASE-v4.2.1.md`](RELEASE-v4.2.1.md) | **v4.2.0 → v4.2.1 的发布稿（2026-09-23 已发布）**：57 个已合并 PR / 192 个提交的完整汇总（含 #181 歌词代理修复、#182 流畅度与岛墙批次）。文件分两段：`## 📦 下载` 至 `## 🙏 致谢` 是**发布正文**，`RELEASE-BODY-END` 注释之后的**发布前测试清单**（勾选式）、**视频预演脚本**（逐段分镜）与维护者清单**只在仓库内使用、不随 Release 发布**。 | **准备发布、跑人工验收、或录制演示视频时必读**；改版本号、打 tag、换 Release 正文（用文件头那行命令生成 body.md，别整份贴）、或需要"这一版到底该验哪些行为"的清单时。 |
 | [`BUILD_ARTIFACTS-2026-08-22.md`](BUILD_ARTIFACTS-2026-08-22.md) | 单次构建产物记录：EXE 路径、大小、SHA-256 与启动验证结果。 | 需要核对历史 onefile 产物哈希时（README 仍引用此路径）；日常构建流程看 `ONEDIR_PACKAGING.md`。 |
 
 ---
@@ -130,6 +131,7 @@
 
 | 文档 | 一句话内容 | 何时必读 |
 |---|---|---|
+| [`PR-REPORT-ISLAND-HIDDEN-CHAT-DEADLOCK-2026-09-23.md`](PR-REPORT-ISLAND-HIDDEN-CHAT-DEADLOCK-2026-09-23.md) | 纯桌宠版岛隐藏死锁修复：无聊天构建 hidden_chat 单击路由回退展开卡片（岛能力开关 + 设置页开关按构建变体隐藏）。 | 改灵动岛单击路由 / hidden_chat 设置 / 打包变体（无 pet.chat）行为时。 |
 | [`PR-REPORT-TEMPLATE.md`](PR-REPORT-TEMPLATE.md) | PR 报告模板：三份交付证据（修改文件说明 / 性能分析 / 实机运行记录）的逐节骨架与判定标准。 | **开新 PR 写报告前必读并整份复制**；2026-09-22 起三份证据是硬要求（`AGENTS.md` Delivery evidence discipline），由 `tests/test_pr_report_discipline.py` 机器化校验。 |
 | [`PR-REPORT-PR76-2026-09-10.md`](PR-REPORT-PR76-2026-09-10.md) | PR76 批次的完整报告：事件汇报概率门 + Persona 模板升级 + 全链路错误语义统一（46 文件，+3004/−917）。 | 追溯 PR76 批次改了什么、以及概率门/persona 模板/错误语义三条线的组合动机时。 |
 | [`PR-REPORT-GATES-2026-09-10.md`](PR-REPORT-GATES-2026-09-10.md) | 汇报概率门专项 PR 报告：8 个门表、判决语义（`roll < probability`）、可注入 rng 的测试考量、提交点自检。 | 调整汇报概率门、或需要"为什么未知事件不抽稀/边界取小于"这类判决语义依据时。 |
@@ -143,6 +145,7 @@
 | [`PR-REPORT-music-lyric-align-2026-09-22.md`](PR-REPORT-music-lyric-align-2026-09-22.md) | 歌词对齐（`music_lyric_align`）PR 报告：手动校准快进/半途起播、会话选择与会话粘滞、`advance` 与 `line_now` 的分工；含性能实测表与网易云「不上报进度」的实机复现记录。 | 改歌词位置来源/对齐入口/多播放器会话选择时；或需要「为什么不做自动识别快进」的排查证据（桌面歌词不可读探针）时。**「对齐菜单点不动 / 歌词整首不显示」看 [`PR-REPORT-MUSIC-LYRIC-SYSTEM-PROXY-2026-09-22.md`](PR-REPORT-MUSIC-LYRIC-SYSTEM-PROXY-2026-09-22.md)**（估算位置冒充真值 + 系统代理拖死取词两处修复）。 |
 | [`PR-REPORT-LOCAL-WIP-BATCH-2026-09-22.md`](PR-REPORT-LOCAL-WIP-BATCH-2026-09-22.md) | 本地 WIP 批次 PR 报告：交付证据纪律（三份证据 + 机器化校验）、`build_onedir.ps1` 的 Qt 绑定排他（不修则构建被 PyInstaller 中止）、产物 TTS 自检脚本（真产物假红 → 修掉）、`character_head_box()` 与 shenshen 头部框数据。 | 改 `scripts/build_onedir.ps1` 的排除清单、`scripts/verify_bundle_tts.py` 的闭包判定、`pet/catalog.py` 的 `body_box`/`head_box` 取值，或要写新的 PR 报告（含三个必备章节的实例）时。 |
 | [`PR-REPORT-MUSIC-LYRIC-SYSTEM-PROXY-2026-09-22.md`](PR-REPORT-MUSIC-LYRIC-SYSTEM-PROXY-2026-09-22.md) | 歌词取词被系统代理拖死 + 网易云「歌词对齐」被误关的 PR 报告：系统代理下三源 20~41s 全超时 → 每首未缓存曲目「0 行/9.00s」，改直连后 1.27s/62 行；估算位置不再冒充「播放器上报的真值」。 | 改歌词取词的网络出口/超时/失败日志时；或排查「歌词突然全都没有」「歌曲只有歌名没有词」「歌词对齐菜单点不动」这类反馈时（含现场日志判读口径）。**影响面与推荐设置见 [`NETWORK-PROXY-AND-VPN-2026-09-22.md`](NETWORK-PROXY-AND-VPN-2026-09-22.md)**。 |
+| [`PR-REPORT-ISLAND-RESHOW-NOCHAT-2026-09-23.md`](PR-REPORT-ISLAND-RESHOW-NOCHAT-2026-09-23.md) | 纯桌宠版「桌宠隐藏后单击灵动岛无反应」的发布后补丁报告（`1c3a59c`）：岛发 `chat_requested` → 无 Chat 变体的 `_show_island_chat` 可用性闸门静默返回，整次点击被吞；改为无对话能力时直接「显示桌宠」。 | 改灵动岛单击路由 / `_chat_from_island` / 隐藏态交互面 / 无 Chat 变体的可用性闸门时；或再遇「点了没反应」类反馈要先看这条链路（岛 → AppShell → 闸门）时。 |
 | [`PR-REPORT-PERF-ISLAND-CONSOLIDATED-2026-09-23.md`](PR-REPORT-PERF-ISLAND-CONSOLIDATED-2026-09-23.md) | 流畅度/解码减负 + 岛远端硬墙 + 音效缓存 + 设置收口的 PR 报告：走路帧间补点（位置交付 28.6Hz→~160Hz）、碰撞 >50ms 卡顿 133→3、子宠进程补挂远端硬墙、零拷贝消融的诚实记录（崩溃案机理=绘制重入，未结案）。 | 改 `movement.move_anim_tick`/走路位移、webm 冷路径/首帧缓存/meta 后台化、岛碰撞远端模式与静态成员发布、音效候选缓存、或「多开」设置项时；排查 Qt6Gui 绘制重入崩溃时也要读（含消融对比与取证指针）。 |
 
 ---

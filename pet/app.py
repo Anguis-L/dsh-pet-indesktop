@@ -2120,6 +2120,10 @@ class AppShell:
             from .dynamic_island import DynamicIsland
 
             self.island = DynamicIsland(self.config)
+            # 纯桌宠版（无聊天模块）：hidden_chat 的岛单击路由回退为展开卡片，
+            # 防"桌宠隐藏 → 岛点了没反应 → 无法恢复"的死锁。getattr 兼容
+            # __new__ 测试桩（property 内 AttributeError 时取默认 True）
+            self.island.set_chat_available(bool(getattr(self, "enable_chat", True)))
             # 岛图标默认取鱼本体头像（图片路径不碰 emoji 字体栈，见 dynamic_island
             # 的 _icon_pixmap 注释）；帧未就绪时岛侧只画底圈并稍后重试
             self.island.set_icon_provider(self._island_icon_pixmap)
@@ -2251,7 +2255,16 @@ class AppShell:
         bubble.show_for_island(self.island, activate=activate, reply_text=reply_text)
 
     def _chat_from_island(self) -> None:
-        """桌宠隐藏时单击岛：气泡已开则收起，否则弹出（交互式）。"""
+        """桌宠隐藏时单击岛：气泡已开则收起，否则弹出（交互式）。
+
+        **没有对话能力的变体（纯桌宠版，打包时排除 `pet.chat`）**走不到气泡：
+        岛是桌宠隐藏后唯一的常驻交互面，此时单击直接**把桌宠叫回来**。
+        旧行为是发完 `chat_requested` 后被 `_show_island_chat` 的可用性闸门
+        静默挡掉，用户点了完全没反应（2026-09-23 修复）。
+        """
+        if not self._island_chat_available():
+            self._show_pets_from_island_chat()
+            return
         bubble = getattr(self, "island_chat", None)
         if bubble is not None and shiboken6.isValid(bubble) and bubble.isVisible():
             bubble.close()
