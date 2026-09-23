@@ -58,6 +58,9 @@ class TickDriver(QObject):
         self.behavior = None
         self.collision = None
         self.physics = None
+        # 附加仿真控制器（如边缘探头）：tick_sim 尾段、三主控制器之后运行
+        # ——姿态类控制器是最终写入口，不能被后续控制器覆盖
+        self._extras: list = []
         # M-1 闲置降档：governor 决策 + 最近帧到达时间（"动画在播"判定）
         self._governor = TickGovernor(clock)
         self._applied_tier = TIER_ACTIVE
@@ -87,6 +90,12 @@ class TickDriver(QObject):
     def overlays(self) -> list:
         """已挂载 overlay 的快照（只读；成员生灭经 attach/detach）。"""
         return list(self._overlays)
+
+    def add_extra_controller(self, controller) -> None:
+        """挂载附加仿真控制器（如边缘探头世界）：``tick_sim`` 尾段、
+        三主控制器之后运行（姿态最终写入口）。幂等。"""
+        if controller not in self._extras:
+            self._extras.append(controller)
 
     @property
     def sprites(self) -> list:
@@ -276,6 +285,8 @@ class TickDriver(QObject):
             self.collision.tick(sprites, dt)
         if self.physics is not None:
             self.physics.tick(sprites, dt)
+        for ctrl in self._extras:
+            ctrl.tick(sprites, dt)
 
     def advance_overlays(self, dt: float) -> None:
         """推进+重绘段：逐 overlay 走 advance/脏矩形/位置 fanout/update。"""

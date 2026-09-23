@@ -75,11 +75,14 @@ class ShellOverlayWindow(OverlayWindow):
         super().__init__(screen=screen, driver=driver)
         self._press_pos = None
         self.behavior = None  # OverlayShell 挂载；contextMenuEvent 查表读它
+        self.edge_probe = None  # OverlayShell 挂载；拖拽/点击事件接线
         self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         self._press_pos = event.position()
         super().mousePressEvent(event)
+        if self._mouse_grab is not None and self.edge_probe is not None:
+            self.edge_probe.on_sprite_drag_started(self._mouse_grab)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         grab = self._mouse_grab
@@ -89,6 +92,10 @@ class ShellOverlayWindow(OverlayWindow):
             return
         threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
         if (event.position() - press).manhattanLength() < threshold:
+            # 边缘探头消费点击（PEEKING 拉直/STRAIGHTENED 重置倒计时）时，
+            # 抑制点击反应与点击音效——拉直本身就是反馈
+            if self.edge_probe is not None and self.edge_probe.on_sprite_clicked(grab):
+                return
             self.behavior.on_sprite_clicked(grab)
             squash = getattr(grab, "squash", None)
             if callable(squash):
@@ -96,6 +103,9 @@ class ShellOverlayWindow(OverlayWindow):
             cb = getattr(self, "click_feedback", None)
             if callable(cb):
                 cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
+        elif self.edge_probe is not None:
+            # 真拖拽释放（非单击）：通知探头按 tick 静止判定重新评估进入
+            self.edge_probe.on_sprite_drag_released(grab)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         feeding = getattr(self, "_feeding", None)
@@ -178,8 +188,16 @@ class OverlayShell(QObject):
         # 只做 advance+paint；屏迁移重建 overlay 时复用同一驱动器（成员替换）。
         self.driver = TickDriver(self)
         self.driver.set_controllers(self.behavior, self.collision, self.physics)
+        # 边缘探头（edge_probe 移植）：第四控制器挂 tick 尾段（姿态最终写
+        # 入口）；config 键 edge_probe_enabled（默认 False）世界内每次进入
+        # 判定前热读，设置页开关即切即生效
+        from .sprite_edge_probe import create_edge_probe_world
+        self._probe = create_edge_probe_world(self._config, QRect(self._bounds))
+        self.driver.add_extra_controller(self._probe)
+        self.collision.add_collision_listener(self._on_collision_probe)
         self.overlay = ShellOverlayWindow(self._screen, driver=self.driver)
         self.overlay.behavior = self.behavior
+        self.overlay.edge_probe = self._probe
         self.overlay.click_feedback = self._sound.on_click
         # 4.1c 全量右键菜单（facade 适配旧 context_menus 建造器）
         from .sprite_menu_facade import build_sprite_full_menu
@@ -195,6 +213,7 @@ class OverlayShell(QObject):
         self.overlay.add_sprite(self.sprite)
         # 4.2b：sprite 移除时注销行为状态（spawn/退出子肥鱼的清理链）
         self.overlay.add_sprite_removed_listener(self.behavior.forget)
+        self.overlay.add_sprite_removed_listener(self._probe.forget)
         # 4.2a：按 rx/ry 比例恢复上次位置（无记录 → 默认右下角）
         self._restore_position()
         # 4.1c 投喂（拖文件喂 sprite，命中判定与穿透同口径）
@@ -522,8 +541,14 @@ class OverlayShell(QObject):
         """显隐切换（app.py toggle_visible 等价）+ 岛状态同步。"""
         if visible:
             self.overlay.show()
+            probe = getattr(self, "_probe", None)
+            if probe is not None:
+                probe.resume()
         else:
             self.overlay.hide()
+            probe = getattr(self, "_probe", None)
+            if probe is not None:
+                probe.pause()
             if getattr(self, "_bubble_follower", None) is not None:
                 bub = getattr(self._bubble_follower, "bubble", None)
                 if bub is not None:
@@ -552,6 +577,18 @@ class OverlayShell(QObject):
                 squash = getattr(sprite, "squash", None)
                 if callable(squash):
                     squash()
+
+    def _on_collision_probe(self, event) -> None:
+        """碰撞真撞击 → 边缘探头取消会话（旧机 collision_client 取消链语义）。"""
+        if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
+            return
+        probe = getattr(self, "_probe", None)
+        if probe is None:
+            return
+        from .sprite_collision import SpriteCollisionWorld
+        for sprite in self.overlay.sprites:
+            if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
+                probe.on_sprite_collision_hit(sprite)
 
     def _say_feeding_bubble(self, files: int, folders: int,
                             total_bytes: int, stats: dict) -> None:
@@ -658,6 +695,9 @@ class OverlayShell(QObject):
         self.behavior.bounds = QRect(new_bounds)
         self.physics.set_bounds(new_bounds)
         self.sprite.set_bounds(QRect(new_bounds))
+        probe = getattr(self, "_probe", None)
+        if probe is not None:
+            probe.set_bounds(QRect(new_bounds))
 
     def _migrate_sprite_position(self, old_bounds: QRect, new_bounds: QRect) -> None:
         """rx/ry 语义迁移：sprite 中心相对可用区的比例在几何变化前后不变
@@ -685,16 +725,32 @@ class OverlayShell(QObject):
         new_bounds = self._local_bounds(new_screen)
         self.overlay = ShellOverlayWindow(new_screen, driver=self.driver)
         self.overlay.behavior = self.behavior
+        self.overlay.edge_probe = getattr(self, "_probe", None)
+        # 迁移后接线恢复（原 _build 挂在 overlay 上的能力一并重挂，否则
+        # 屏迁移后点击音效/全量菜单/投喂/穿透回调/拖拽收尾全部静默丢失）
+        self.overlay.click_feedback = self._sound.on_click
+        from .sprite_menu_facade import build_sprite_full_menu
+        self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
+        self.overlay._through_changed = self._on_user_through_changed
+        self.overlay._grab_finished_cb = self._on_grab_finished
+        self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)
         old_overlay.remove_sprite(self.sprite, release_clip=False)  # 迁移保留 clip
         self.overlay.add_sprite(self.sprite)
         self.sprite.home_screen = new_screen
         self.sprite.set_dpr(float(new_screen.devicePixelRatio()))
         self._migrate_sprite_position(old_bounds, new_bounds)
         self._apply_bounds(new_bounds)
+        self._apply_window_capabilities()  # on_top/穿透复合/监视器门重挂
         self._connect_screen(new_screen)
         was_started = self._started
         # M-2：驱动器为进程级共享（新 overlay 已在构造时挂上）——不再停旧表
         # 再起新表（那会在多 overlay 下停掉整组 tick）；旧 overlay 关闭即摘除。
+        if getattr(self, "_feeding", None) is not None:
+            from .sprite_feeding import SpriteFeedingController
+            self._feeding = SpriteFeedingController(
+                self.overlay, self.sprite, self._config, self.behavior)
+            self._feeding._bubble_cb = self._say_feeding_bubble
+            self.overlay._feeding = self._feeding
         if getattr(self, "_bubble_follower", None) is not None:
             self._bubble_follower.close()
             from .sprite_bubble import SpriteBubbleFollower

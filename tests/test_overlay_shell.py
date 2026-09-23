@@ -459,3 +459,23 @@ def test_legacy_topology_gate_unchanged_when_spawn_flag_off(tmp_path, monkeypatc
     shell = AppShell(app, cfg)
     assert shell._decode_hub.enabled is False
     assert shell._shared is None
+
+
+# ---------------------------------------------------------------- 边缘探头壳层接线
+def test_shell_wires_edge_probe_world():
+    """edge_probe 接线：世界挂 driver extras（tick 尾段）+ overlay 事件钩子 +
+    碰撞真撞击监听 + sprite 移除注销 + 几何变化 bounds 同步。"""
+    shell, screen, _ = _make_shell()
+    probe = shell._probe
+    assert probe is not None
+    assert probe in shell.driver._extras
+    assert shell.overlay.edge_probe is probe
+    # 碰撞监听已挂（真撞击链里有 probe 处理器）
+    assert shell._on_collision_probe in shell.collision._listeners
+    # 几何变化 → probe bounds 同步
+    from PySide6.QtCore import QRect
+    new_bounds = QRect(0, 0, 1280, 720)
+    shell._apply_bounds(new_bounds)
+    assert probe.bounds == new_bounds
+    # sprite 移除监听已挂 probe.forget
+    assert shell._probe.forget in shell.overlay._sprite_removed_listeners
