@@ -237,9 +237,6 @@ class ShellOverlayWindow(OverlayWindow):
         self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
-        import logging
-        logging.info("overlay: mousePress button=%s pos=%s",
-                     event.button(), event.position())  # 实机右键归因（临诊）
         self._press_pos = event.position()
         super().mousePressEvent(event)
         if (self._mouse_grab is not None and self.edge_probe is not None
@@ -298,10 +295,6 @@ class ShellOverlayWindow(OverlayWindow):
         config 身份打开（否则右击子肥鱼的「桌宠设置」会静默打开主宠配置）。
         """
         builder = getattr(self, "_full_menu_builder", None)
-        import logging
-        logging.info("overlay: contextMenu pos=%s builder=%s target=%s",
-                     event.pos(), builder is not None,
-                     self.sprite_at(event.pos()) is not None)  # 实机右键不出菜单归因（临诊）
         if builder is None:
             super().contextMenuEvent(event)
             return
@@ -1722,7 +1715,7 @@ class OverlayShell(QObject):
         self.set_pet_visible(not self.overlay.isVisible())
 
     def _on_collision_squash(self, event) -> None:
-        """碰撞 Q 弹（collision_client._start_squash 语义）：真撞击量级时
+        """碰撞 Q 弹（旧权威冲量路径的 squash 语义）：真撞击量级时
         双方 sprite 各压一次。runtime_id 反查 sprite（成员少，线性即可）。"""
         if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
             return
