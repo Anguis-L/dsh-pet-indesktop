@@ -49,7 +49,10 @@ FLAG_STATIC: int = 1 << 11              # 2048: 静态布景（无限质量但�
 ISLAND_MEMBER_ID: str = "island"
 
 # 静态布景（灵动岛果冻墙）专用恢复系数：>1 表示撞岛被"加速弹开"——
-# 撞到岛像撞到弹床，比撞墙更活泼；只作用于 FLAG_STATIC 参与的碰撞，
+# 撞到岛像撞到弹床，比撞墙更活泼；**只作用于"动态方尚未抛掷"的入场那一次**
+# （见 solve_collision_impulse 的 FLAG_STATIC 分支）：静态布景参与的碰撞里，
+# 动态方一旦带 FLAG_THROWN，恢复系数必须回到 ≤1 的普通值，否则每次触岛都
+# 按 >1 放大法向速度 = 能量泵（thrown 越弹越高、永不落地的根因）。
 # 鱼撞鱼/撞拖拽鱼仍走 collision_restitution 配置。
 STATIC_RESTITUTION: float = 1.3
 
@@ -159,6 +162,36 @@ def circles_from_rect(left: float, top: float, width: float, height: float) -> l
                 [left + width - radius, cy, radius]]
     return [[cx, top + radius, radius], [cx, cy, radius],
             [cx, top + height - radius, radius]]
+
+
+def circle_chain_min_gap(
+    circles1: Sequence[Sequence[float]],
+    circles2: Sequence[Sequence[float]],
+    limit: float = math.inf,
+) -> float:
+    """两圆链的最小间距（负值 = 重叠深度）。
+
+    与 check_collision_circles 的"最深重叠"口径互补：本函数要的是**最近距离**
+    （贴合判定），且带早退上限——间距一旦 <=0（已接触/互穿）立即返回，调用方
+    在"离得远"时是 O(1)。只服务近邻判定（静态成员支撑落定），不参与冲量求解。
+    """
+    best = float(limit)
+    for raw1 in circles1 or ():
+        if len(raw1) < 3:
+            continue
+        x1, y1 = float(raw1[0]), float(raw1[1])
+        r1 = max(1e-4, float(raw1[2]))
+        for raw2 in circles2 or ():
+            if len(raw2) < 3:
+                continue
+            x2, y2 = float(raw2[0]), float(raw2[1])
+            r2 = max(1e-4, float(raw2[2]))
+            gap = math.hypot(x2 - x1, y2 - y1) - (r1 + r2)
+            if gap < best:
+                best = gap
+                if best <= 0.0:
+                    return best
+    return best
 
 
 def check_collision_circles(
@@ -393,13 +426,29 @@ def solve_collision_impulse(
     if state_a.is_infinite_mass or state_b.is_infinite_mass:
         # 无限质量体（拖拽/锁定中的肥鱼）吸能 e=0：被握着的一方不动，
         # 撞来的也贴停不弹飞。但 FLAG_STATIC 静态布景（灵动岛果冻墙）
-        # 用 STATIC_RESTITUTION 加速弹开——撞岛像撞弹床，吸停会显得岛"不存在"。
+        # 例外：撞岛像撞弹床，吸停会显得岛"不存在"。
         static_involved = (
             (state_a.is_infinite_mass and state_a.flags & FLAG_STATIC)
             or (state_b.is_infinite_mass and state_b.flags & FLAG_STATIC)
         )
+        # 弹床系数是**入场用的一次性系数**：只有动态方还没被抛掷时才是
+        # "撞岛进抛掷"的那一下（对齐 legacy island_collision._clamp_body：
+        # 非 throw 分支给 dv=-(1+STATIC_RESTITUTION)*vn 并把桌宠切进抛掷物理）。
+        # 动态方一旦带 FLAG_THROWN，岛就必须退化成普通反弹面，用调用方传入
+        # 的恢复系数（已在上面 clamp 到 ≤1）——legacy 的 throw 分支反射速度
+        # 用的就是 physics.RESTITUTION(0.78<1)。若这里仍按 1.3 放大，thrown
+        # 每次触岛净吸能：反弹越来越高 → 落不了地 → is_at_rest 永不成立 →
+        # 行为机永不重绑（实机"碰撞后画面卡住不动"的根因）。
+        # 无限质量方（拖拽/锁定/静态）不可能是"被抛掷的动态方"。
+        dynamic_thrown = (
+            (not state_a.is_infinite_mass and bool(state_a.flags & FLAG_THROWN))
+            or (not state_b.is_infinite_mass and bool(state_b.flags & FLAG_THROWN))
+        )
         if static_involved:
-            e = STATIC_RESTITUTION
+            if not dynamic_thrown:
+                # 入场那一次：弹床系数（静态布景的"果冻墙"手感）
+                e = STATIC_RESTITUTION
+            # 已在抛掷中：保持上面 clamp 到 ≤1 的调用方恢复系数
         else:
             e = 0.0
     if vn >= -IMPULSE_MIN_APPROACH_SPEED:

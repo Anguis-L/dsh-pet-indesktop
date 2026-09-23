@@ -40,10 +40,12 @@ class ThrowPhysicsController:
         *,
         max_sub_dt: float = 0.008,
         gravity: float = physics_mod.GRAVITY,
+        bounce_stop_vy: float = physics_mod.GROUND_BOUNCE_STOP_VY,
     ) -> None:
         self._bounds = QRectF(bounds)
         self._max_sub_dt = float(max_sub_dt)
         self._gravity = float(gravity)
+        self._bounce_stop_vy = float(bounce_stop_vy)
 
     @property
     def bounds(self) -> QRectF:
@@ -99,7 +101,7 @@ class ThrowPhysicsController:
             step_dt = min(self._max_sub_dt, remaining)
             px, py, vx, vy, bounced = physics_mod.throw_step(
                 px, py, vx, vy, step_dt, left, top, right, bottom,
-                gravity=self._gravity)
+                gravity=self._gravity, bounce_stop_vy=self._bounce_stop_vy)
             bounced_any = bounced_any or bounced
             remaining -= step_dt
             speed = math.hypot(vx, vy)

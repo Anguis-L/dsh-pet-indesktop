@@ -81,6 +81,15 @@ CONTACT_DV_FLOOR = 50.0     # 已 thrown 成员继续吸收冲量的下限 (px/s
 # 纯位置分离去抖窗口（对齐旧协调者 tick 的 15 tick 去抖）
 SEPARATION_DEBOUNCE_TICKS = 15
 
+# 静态成员支撑落定（"落在岛上"= 落地）：抛掷物理的 is_at_rest 只认屏幕地板
+# （pet/physics.is_at_rest 的 bottom 判据），被岛托住的 thrown 永远满足不了
+# 它——速度被接触冲量抹平但状态挂着，行为机不重绑、clip 停在最后一帧。
+# 判据：thrown + 圆链贴住某个静态成员（间距 <= PROXIMITY）+ 低速，
+# 连续 SUPPORT_SETTLE_TICKS 个 tick 才收尾（贴面掠过不算）。
+SUPPORT_PROXIMITY = 2.5         # px：圆链间距不超过它算"贴住静态成员"
+SUPPORT_SETTLE_SPEED = 90.0     # px/s：支撑接触期的速度上限
+SUPPORT_SETTLE_TICKS = 6        # 连续支撑 tick 数达到它 → 收尾回 normal
+
 
 @dataclass(frozen=True)
 class CollisionEvent:
@@ -116,6 +125,9 @@ class SpriteCollisionWorld:
         speed_cap: float = physics.MAX_THROW_SPEED,
         separation_debounce_ticks: int = SEPARATION_DEBOUNCE_TICKS,
         max_separation_iterations: int = 4,
+        support_proximity: float = SUPPORT_PROXIMITY,
+        support_settle_speed: float = SUPPORT_SETTLE_SPEED,
+        support_settle_ticks: int = SUPPORT_SETTLE_TICKS,
     ) -> None:
         self.restitution = float(restitution)
         self.friction = float(friction)
@@ -127,6 +139,9 @@ class SpriteCollisionWorld:
         self.speed_cap = float(speed_cap)
         self.separation_debounce_ticks = int(separation_debounce_ticks)
         self.max_separation_iterations = int(max_separation_iterations)
+        self.support_proximity = float(support_proximity)
+        self.support_settle_speed = float(support_settle_speed)
+        self.support_settle_ticks = int(support_settle_ticks)
 
         self._tick = 0
         self._overlap_history: Dict[str, int] = {}
@@ -134,6 +149,8 @@ class SpriteCollisionWorld:
         self._prev_circles: Dict[str, Sequence[Sequence[float]]] = {}
         # 纯位置分离去抖：pair -> 最近一次实际应用分离的 tick
         self._position_only_ticks: Dict[str, int] = {}
+        # 静态成员支撑落定：member_id -> 连续被静态成员托住的 tick 数
+        self._support_streak: Dict[str, int] = {}
         # 静态成员（灵动岛预留）：member_id -> (left, top, width, height)
         self._static_members: Dict[str, Tuple[float, float, float, float]] = {}
         self._listeners: List[Callable[[CollisionEvent], None]] = []
@@ -194,11 +211,13 @@ class SpriteCollisionWorld:
         if (sig == self._last_motion_sig
                 and not self._static_dirty
                 and not self._overlap_history
-                and not self._position_only_ticks):
+                and not self._position_only_ticks
+                and not self._support_streak):
             # 静止豁免（P1/③-1）：无任何成员运动（位置/速度/交互态/缩放/
             # 成员集合全未变）、无静态成员变更、无未结清的重叠/分离去抖——
             # 求解结果可证与上 tick 相同，整 tick 跳过。静止期间岛（静态
-            # 成员）变更经 _static_dirty 唤醒；外部 set_pos 经签名唤醒
+            # 成员）变更经 _static_dirty 唤醒；外部 set_pos 经签名唤醒。
+            # 支撑落定进行中（_support_streak 非空）不可跳过：它按 tick 计数
             return []
         self._tick += 1
         members: List[collision.MemberState] = []
@@ -224,6 +243,9 @@ class SpriteCollisionWorld:
                 swept_collisions=swept,
             )
             self._apply_results(results, sprite_by_id)
+        # 静态成员支撑落定（"落在岛上"= 落地）：不依赖 dt，只看这一 tick 的
+        # 贴合与速度（成员集合里已含静态成员；无静态成员时 O(1) 早退）
+        self._settle_supported(members, sprite_by_id)
         # 帧末快照：下一 tick 扫掠的 prev（存的是本 tick 结算前的真实位置，
         # 与 coordinator 比较连续客户端快照的语义一致——位移/积分的实际
         # 轨迹段整体被下一帧扫掠覆盖，方向保守，绝不提前穿透）
@@ -288,6 +310,11 @@ class SpriteCollisionWorld:
         flags = collision.FLAG_VISIBLE | collision.FLAG_COLLISION_ENABLED
         if dragging:
             flags |= collision.FLAG_DRAGGING
+        # FLAG_THROWN 必须随快照传给纯数学层：静态成员（岛）的恢复系数分支
+        # 靠它区分"撞岛进抛掷的那一次"（果冻墙 1.3）与"已在抛掷中的触岛"
+        # （≤1 普通反弹）——后者是能量泵的闸门（见 collision.solve_collision_impulse）
+        if getattr(sprite, "interaction_state", INTERACTION_NORMAL) == INTERACTION_THROWN:
+            flags |= collision.FLAG_THROWN
         scale = float(getattr(sprite, "scale", 0.0) or collision.DEFAULT_BASE_SCALE)
         velocity = sprite.velocity
         return collision.MemberState(
@@ -441,6 +468,58 @@ class SpriteCollisionWorld:
                     contact_x=res.contact_x, contact_y=res.contact_y)
                 for listener in list(self._listeners):
                     listener(event)
+
+    # ---------------------------------------------------------------- 内部：静态支撑落定
+    def _settle_supported(self, members: Sequence[collision.MemberState],
+                          sprite_by_id: Dict[str, object]) -> None:
+        """把"静置在静态成员上"的 thrown sprite 收尾回 normal（落岛 = 落地）。
+
+        抛掷物理（sprite_physics._advance_thrown → physics.is_at_rest）只认屏幕
+        地板：落在岛上（或任何静态成员上）的 sprite 被岛持续托住、速度被接触
+        冲量抹平，却永远满足不了地板判据——没有这条出口，thrown 一直挂着，
+        行为机永不重绑、clip 播完停在最后一帧（实机"碰撞后画面卡住不动"）。
+
+        判据（连续 SUPPORT_SETTLE_TICKS 个 tick 同时成立才收尾，贴面掠过不算）：
+        - 该 sprite 仍是 thrown；
+        - 圆链与某个静态成员的最小间距 <= SUPPORT_PROXIMITY（贴住/托住）；
+        - 当前速度 <= SUPPORT_SETTLE_SPEED（不是高速掠过的瞬间接触）。
+        收尾动作与抛掷物理落地一致：velocity 归零 + interaction_state="normal"。
+        """
+        if not self._static_members:
+            self._support_streak.clear()
+            return
+        static_circles = [m.circles for m in members
+                          if m.runtime_id in self._static_members]
+        held: set = set()
+        for member in members:
+            sprite = sprite_by_id.get(member.runtime_id)
+            if sprite is None:
+                continue  # 静态成员自己
+            if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_THROWN:
+                continue
+            velocity = sprite.velocity
+            if math.hypot(float(velocity.x()), float(velocity.y())) > self.support_settle_speed:
+                continue
+            if not self._touches_static(member.circles, static_circles):
+                continue
+            held.add(member.runtime_id)
+            streak = self._support_streak.get(member.runtime_id, 0) + 1
+            if streak >= self.support_settle_ticks:
+                del self._support_streak[member.runtime_id]
+                held.discard(member.runtime_id)
+                sprite.set_velocity(type(velocity)(0.0, 0.0))
+                sprite.interaction_state = INTERACTION_NORMAL
+            else:
+                self._support_streak[member.runtime_id] = streak
+        for member_id in [m for m in self._support_streak if m not in held]:
+            del self._support_streak[member_id]
+
+    def _touches_static(self, circles, static_circles: Sequence) -> bool:
+        limit = self.support_proximity
+        for static in static_circles:
+            if collision.circle_chain_min_gap(circles, static, limit) < limit:
+                return True
+        return False
 
     @staticmethod
     def _translate(sprite, dx: float, dy: float) -> None:
