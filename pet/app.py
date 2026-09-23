@@ -409,6 +409,8 @@ class PetInstance:
         # 随机动作池延迟 2s 补全，避免多开启动时 ffmpeg 进程洪峰。
         lib.schedule_high_priority_warm()
         lib.schedule_low_priority_warm()
+        # 首跑帧序列自动供给（B 档）：延迟 5s 后台低优转热集，静默 no-op 兜底
+        getattr(lib, 'maybe_provision_frameseq', lambda: None)()
         # 同批低优先级预热：播放器路径缓存（右键菜单只读缓存，冷缓存时后台先扫）。
         _schedule_music_player_warm()
         logging.info('素材加载完成：%s %d 段动画', character_id, len(lib.names()))

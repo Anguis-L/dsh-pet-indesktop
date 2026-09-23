@@ -30,6 +30,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QImage, QMovie
 
 from . import catalog
+from . import frameseq_provision
 from . import perfstats
 from .webm_clip import WebMClip, session_ending
 
@@ -177,6 +178,9 @@ class MovieLibrary(QObject):
         self._low_warm_in_flight = False
         self._warm_state_lock = threading.Lock()  # 保护在飞标志与完成标志
         self._shutdown = False
+        # 首跑帧序列供给（B 档）：排期幂等标志 + library 拥有的供给线程句柄
+        self._frameseq_provision_requested = False
+        self._frameseq_worker = None
         # 交互中让路重排期：50ms 短间隔重试（交互一结束立即补上，不把 2s
         # 延迟原样再等一遍）；pause_warm 会停掉它，避免遗留 singleShot 在
         # pause 后仍触发起批。
@@ -329,18 +333,8 @@ class MovieLibrary(QObject):
             raise FileNotFoundError("缺少素材文件: " + ", ".join(missing))
 
         self._paths = resolved
-        # 帧序列化 B 档（热集）：assets/characters/<id>/frameseq/<folder>/<stem>/
-        # 存在即优先走 FrameSeqClip（无损 WebP 帧序列，与 webm 解码 bit-exact，
-        # 见 .scratch/frame-seq-feasibility/FEASIBILITY.md）；不存在 = 现 webm
-        # 路径逐行不变。按 _manifest 的相对路径同名定位，素材包不带 frameseq
-        # 目录时本映射为空、零行为变化
-        self._frameseq_dirs: dict[str, Path] = {}
-        frameseq_root = self._asset_dir.parent / 'frameseq'
-        if frameseq_root.is_dir():
-            for name, fname in self._manifest.items():
-                candidate = frameseq_root / Path(fname).with_suffix('')
-                if candidate.is_dir() and any(candidate.glob('f_*.webp')):
-                    self._frameseq_dirs[name] = candidate
+        # 帧序列化 B 档（热集）映射：见 rescan_frameseq()
+        self.rescan_frameseq()
 
         # 高优先级 clip 必须在主线程创建（QObject 线程亲和），再交给后台线程预热；
         # 低优先级由 QTimer 在主线程触发 _warm_low_priority_background 创建。
@@ -540,6 +534,18 @@ class MovieLibrary(QObject):
             return
         self._shutdown = True
         self.pause_warm()
+        # 首跑供给线程：置取消谓词并 terminate 在飞 ffmpeg（reader 立即返回），
+        # 有界等待（≤2s）后退出——关机/切角色窗口里绝不留下不受控的重编码进程
+        # （issue #111 纪律）。
+        worker, self._frameseq_worker = self._frameseq_worker, None
+        if worker is not None:
+            try:
+                worker.cancel()
+                worker.wait(2000)
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    '帧序列供给线程收尾失败', exc_info=True,
+                )
         for clip in tuple(self._movies.values()):
             try:
                 cleanup = getattr(clip, 'cleanup', None)
@@ -837,6 +843,78 @@ class MovieLibrary(QObject):
             threading.Thread(target=_run, daemon=True).start()
         except Exception:
             pass
+
+    def rescan_frameseq(self) -> None:
+        """重建热集帧序列映射：只认含 f_*.webp 的完成态 ``<stem>/`` 目录。
+
+        帧序列化 B 档：assets/characters/<id>/frameseq/<folder>/<stem>/ 存在
+        即优先走 FrameSeqClip（无损 WebP 帧序列，与 webm 解码 bit-exact，
+        见 .scratch/frame-seq-feasibility/FEASIBILITY.md）；不存在 = 现 webm
+        路径逐行不变。按 _manifest 的相对路径同名定位，素材包不带 frameseq
+        目录时本映射为空、零行为变化。
+
+        首跑自动供给（maybe_provision_frameseq）转换结束后在 GUI 线程调用本
+        方法重建映射：此后**新请求**的 clip 走 FrameSeqClip，已创建的 clip
+        不动（进程内已有播放器不换实现）。供给侧的半成品 ``<stem>.tmp/`` 不在
+        _manifest 命名空间里，天然不会被捡到。
+        """
+        self._frameseq_dirs: dict[str, Path] = {}
+        frameseq_root = self._asset_dir.parent / 'frameseq'
+        if frameseq_root.is_dir():
+            for name, fname in self._manifest.items():
+                candidate = frameseq_root / Path(fname).with_suffix('')
+                if candidate.is_dir() and any(candidate.glob('f_*.webp')):
+                    self._frameseq_dirs[name] = candidate
+
+    # ------------------------------------------------------------ 首跑帧序列供给
+    def maybe_provision_frameseq(self) -> None:
+        """库创建后调用：延迟 5s 后台低优先级供给热集帧序列（幂等入口）。
+
+        PET_FRAMESEQ=0（dev 逃生门）/ 会话结束（issue #111）时静默 no-op；
+        「热集已完整 / 拿不到实例锁 / 无 ffmpeg exe」在延迟回调与供给 worker
+        内静默 no-op。只排一个 QTimer.singleShot，绝不阻塞库创建。
+        """
+        if self._frameseq_provision_requested:
+            return
+        if frameseq_provision.provision_disabled() or session_ending():
+            return
+        self._frameseq_provision_requested = True
+        QTimer.singleShot(frameseq_provision.PROVISION_DELAY_MS,
+                          self._start_frameseq_provision)
+
+    def _start_frameseq_provision(self) -> None:
+        """延迟回调（GUI 线程）：热集完整则静默 no-op，否则起 library 拥有的线程。"""
+        try:
+            if self._shutdown or self._frameseq_worker is not None:
+                return
+            root = self._asset_dir.parent / 'frameseq'
+            if not frameseq_provision.plan_clips(self._asset_dir, root):
+                return  # 热集已完整：不拉线程、不碰 ffmpeg
+            worker = frameseq_provision.FrameseqProvisionWorker(
+                self._asset_dir, root, parent=self)
+        except Exception:
+            logging.getLogger(__name__).debug('帧序列供给排期失败', exc_info=True)
+            return
+        worker.finished_work.connect(self._on_frameseq_provision_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._frameseq_worker = worker
+        try:
+            worker.start()
+        except Exception:
+            self._frameseq_worker = None
+            logging.getLogger(__name__).debug('帧序列供给线程启动失败', exc_info=True)
+
+    def _on_frameseq_provision_finished(self) -> None:
+        """供给收尾（GUI 线程槽）：重建热集映射，此后新 clip 走 FrameSeqClip。"""
+        worker, self._frameseq_worker = self._frameseq_worker, None
+        self.rescan_frameseq()
+        report = getattr(worker, 'report', None)
+        if report is not None:
+            logging.getLogger(__name__).info(
+                '帧序列首跑供给收尾：新转 %s / 跳过 %s / 失败 %s，热集映射 %d 段',
+                report.converted, report.skipped, report.failed,
+                len(self._frameseq_dirs),
+            )
 
     def movie(self, name: str):
         """按需创建并缓存 clip（懒加载）：启动时只创建实际用到/预热的动画。

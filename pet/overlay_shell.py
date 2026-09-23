@@ -180,6 +180,8 @@ class OverlayShell(QObject):
         from .sprite_menu_facade import build_sprite_full_menu
         self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
         self.lib = self._create_main_library()
+        # 首跑帧序列自动供给（B 档）：口径同 app._create_library，库内幂等
+        getattr(self.lib, 'maybe_provision_frameseq', lambda: None)()
         scale = float(self._config.get("scale") or catalog.DEFAULT_SCALE)
         self.sprite = self._sprite_factory(self.lib, QPointF(0, 0), scale)
         self.sprite.home_screen = self._screen
