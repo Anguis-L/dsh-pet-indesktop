@@ -39,6 +39,7 @@ from . import autostart as autostart_mod
 from . import balance as balance_mod
 from . import catalog
 from . import click_sound
+from . import overlay_instance_gate as overlay_gate_mod
 from . import self_talk_voice
 from . import slot_manager as slot_manager_mod
 from . import updater
@@ -1029,7 +1030,7 @@ class AppShell:
 
     def __init__(self, app: QApplication, config: Config, enable_chat: bool = True,
                  slot_handle=None, slot_id: int | None = None,
-                 spawn_offset: int = 0) -> None:
+                 spawn_offset: int = 0, overlay_gate=None) -> None:
         self.app = app
         self.config = config
         self._enable_chat = bool(enable_chat)
@@ -1063,6 +1064,9 @@ class AppShell:
         self._on_about_to_quit_connected = False
         # overlay 拓扑产品壳（4.1a）：仅 PET_RENDER_TOPOLOGY=overlay 时构造
         self._overlay_shell = None
+        # D4：overlay 拓扑单实例进程门（由 main() 抢到后传入；legacy 拓扑恒为
+        # None）。释放挂在会话结束路径（_on_session_end）与 main() 的 finally。
+        self._overlay_gate = overlay_gate
         self._dsh_state_tracker = DshStateTracker(config.dir)
         # 订阅 DSH 统一状态（d04fc10 曾接线，post-merge 重构时丢失，本分支恢复）：
         # 收敛出的 thinking → 联动管线补 legacy 没有的思考气泡/对话开始反应；
@@ -1764,6 +1768,11 @@ class AppShell:
             return
         self._session_end_done = True
         self._mark_session_ending()
+        # D4：会话结束（关机/注销）路径释放 overlay 单实例进程门。与下面的
+        # 「不做会话保存/写盘/槽位解锁」不冲突——本模块的释放是一次 unlink +
+        # 关句柄，O(1)、不派生进程、不写盘；不显式释放则只剩"进程被拆掉后由
+        # OS 回收句柄 + 下次启动按 QLockFile pid 陈旧判定接管"这条兜底链。
+        self._release_overlay_gate()
         stopped = 0
         for inst in self._instances:
             win = getattr(inst, "win", None)
@@ -1784,6 +1793,16 @@ class AppShell:
         logging.info(
             "会话结束：已停止全部 ffmpeg reader（%d 个素材库收口），进入静默退出", stopped,
         )
+
+    def _release_overlay_gate(self) -> None:
+        """释放 overlay 单实例进程门（D4；幂等，legacy 拓扑下恒为 no-op）。"""
+        gate = getattr(self, "_overlay_gate", None)
+        if gate is None:
+            return
+        try:
+            gate.release()
+        except Exception:
+            logging.exception("释放 overlay 进程门失败")
 
     def _mark_session_ending(self) -> None:
         """置位进程级 ffmpeg spawn 闸门（webm_clip.set_session_ending）。
@@ -3395,6 +3414,21 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
     # 确定配置根目录
     config_dir = _default_base() / APP_DIR_NAME
 
+    # D4（PHASE4_DESIGN §4）overlay 拓扑单实例进程门：**先于** slot 竞争。
+    # overlay 双开 = 两个进程各自恢复全部 sprite、位置回写互踩，第二实例必须在
+    # 产生任何配置目录副作用（抢 slot-1、落种 config-slot-N.json）之前退场。
+    # legacy 拓扑（PET_RENDER_TOPOLOGY 未设）下 acquire 返回 None，下面逐行不变。
+    overlay_gate = overlay_gate_mod.acquire_overlay_instance_gate(config_dir)
+    if overlay_gate is not None and not overlay_gate.acquired:
+        # 双击桌面宠物场景：不弹窗、不阻塞，只留痕 + 退出。退出码对齐
+        # pet/__main__.py 的 settings.lock 惯例（「已有实例，本次退出」= 0），
+        # 免得外壳把"第二实例"当启动失败报错。
+        logging.warning(
+            "overlay 拓扑已有实例在运行（门 %s，持有者 pid=%s）：本次启动退出",
+            overlay_gate.path, overlay_gate.holder_pid(),
+        )
+        return overlay_gate_mod.DUPLICATE_EXIT_CODE
+
     # 执行槽位竞争取得排他锁
     slot_handle = None
     slot_id = None
@@ -3430,7 +3464,7 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
             logging.info("已清理 %d 个指向不存在路径的开机自启项", stale_removed)
 
         controller = AppShell(app, config, enable_chat=enable_chat, slot_handle=slot_handle, slot_id=slot_id,
-                              spawn_offset=_read_spawn_offset_env())
+                              spawn_offset=_read_spawn_offset_env(), overlay_gate=overlay_gate)
         try:
             controller.start()
         except Exception as exc:
@@ -3447,6 +3481,14 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
             except Exception:
                 pass
             slot_handle = None
+        # D4：正常退出（app.exec() 返回前 aboutToQuit 已跑完，各窗位置已落盘）
+        # 才释放 overlay 进程门——比 _on_about_to_quit 内更晚，避免"本地还在收尾、
+        # 第二实例已能起来"的位置回写竞态。会话结束路径另见 _on_session_end。
+        if overlay_gate is not None:
+            try:
+                overlay_gate.release()
+            except Exception:
+                logging.exception("释放 overlay 进程门失败")
 
 
 if __name__ == '__main__':

@@ -1,0 +1,375 @@
+# -*- coding: utf-8 -*-
+"""D4 overlay 拓扑单实例进程门测试（全 offscreen）。
+
+覆盖验收口径：
+1. 抢到门拒绝双开、释放后可再开、未持有者 release 不碰别人的锁文件；
+2. 崩溃残留锁（真子进程被 kill 后留下的锁文件）按 QLockFile 既有 stale 语义接管；
+3. 环境错误（锁文件根本建不出来）放行启动，不把坏环境伪装成"已有实例"；
+4. legacy 拓扑无门：不建锁文件/留痕，main 继续走 slot 竞争（行为不变）；
+5. 启动链接线：overlay 双开在 slot 竞争之前被拒 + 留痕 + 静默退出码；
+   正常退出（main finally）与会话结束（_on_session_end）两条路径都释放门；
+6. 真进程/真 QApplication 端到端双开（子进程跑 `python -m pet`）。
+
+时序纪律：子进程就绪用「标记文件 + 宽预算轮询」（同 tests/test_slot_and_memory.py
+的持锁 worker 范式），不赌固定 sleep。env 一律经 monkeypatch 隔离。
+"""
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from pet import overlay_instance_gate as gate_mod
+from pet.config import APP_DIR_NAME
+from pet.slot_manager import SlotLockError, pid_alive
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# 子进程持门脚本：抢到门后写就绪标记（"1 <自己 pid>"），然后挂住直到被杀
+# （模拟"第一个 overlay"）。pid 由子进程自报——Windows 上 venv 的 python.exe
+# 是启动器，Popen.pid 与真正解释器 pid 不同。
+_GATE_HOLDER = """
+import os, sys, time
+from pathlib import Path
+
+from pet.overlay_instance_gate import OverlayInstanceGate
+
+gate = OverlayInstanceGate(sys.argv[1])
+ok = gate.acquire()
+Path(sys.argv[2]).write_text(("1" if ok else "0") + " " + str(os.getpid()), encoding="utf-8")
+while True:
+    time.sleep(0.05)
+"""
+
+
+def _wait_for(predicate, message: str, *, timeout: float = 60.0) -> None:
+    """宽预算轮询到条件成立；超时带上诊断失败（不赌固定 sleep 猜时序）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+def _spawn_gate_holder(config_dir: Path, ready: Path) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", _GATE_HOLDER, str(config_dir), str(ready)],
+        cwd=str(_REPO_ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=60)
+
+
+def _kill_hard(pid: int) -> None:
+    """强杀指定 pid（模拟 overlay 进程崩溃：不给它走 release/析构的机会）。"""
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_TERMINATE = 0x0001
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if handle:
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            finally:
+                kernel32.CloseHandle(handle)
+        return
+    os.kill(int(pid), signal.SIGKILL)
+
+
+class _FakeQApplication:
+    """main() 启动链对 QApplication 的三次调用的最小替身（不建真 Qt 实例）。
+
+    真 Qt 单例在共享测试进程里无法安全重复构造（"destroy the QApplication
+    singleton"），启动链分支用替身测；真 Qt/真进程链路由本文件末尾的子进程
+    用例覆盖。
+    """
+
+    def __init__(self, argv):
+        self.argv = list(argv)
+        self.app_name = None
+        self.quit_on_last_window_closed = None
+
+    def setApplicationName(self, name):  # noqa: N802 - Qt API
+        self.app_name = name
+
+    def setQuitOnLastWindowClosed(self, flag):  # noqa: N802 - Qt API
+        self.quit_on_last_window_closed = bool(flag)
+
+
+# ---------------------------------------------------------------- 核心互斥
+def test_second_gate_refused_then_reopens_after_release(tmp_path):
+    """抢到门 → 第二实例被拒（持有者 pid 就是本进程）→ 释放后可再开。"""
+    lock_path = tmp_path / gate_mod.LOCK_NAME
+    first = gate_mod.OverlayInstanceGate(tmp_path)
+    assert first.acquire() is True
+    assert (first.acquired, first.held) == (True, True)
+    assert first.holder_pid() == os.getpid()
+    # 锁文件第一行就是持有者 pid（QLockFile 的记录格式，进程间排查入口）
+    assert lock_path.read_text(encoding="utf-8").splitlines()[0].strip() == str(os.getpid())
+
+    second = gate_mod.OverlayInstanceGate(tmp_path)
+    assert second.acquire() is False
+    assert (second.acquired, second.held) == (False, False)
+    assert second.holder_pid() == os.getpid()
+
+    first.release()
+    assert lock_path.exists() is False
+
+    third = gate_mod.OverlayInstanceGate(tmp_path)
+    assert third.acquire() is True
+    third.release()
+
+
+def test_release_without_hold_does_not_touch_holder_lock(tmp_path):
+    """未持有门的实例 release 是 no-op：不得删掉真正持有者的锁文件。"""
+    lock_path = tmp_path / gate_mod.LOCK_NAME
+    holder = gate_mod.OverlayInstanceGate(tmp_path)
+    assert holder.acquire() is True
+
+    blocked = gate_mod.OverlayInstanceGate(tmp_path)
+    assert blocked.acquire() is False
+    blocked.release()
+    blocked.release()  # 幂等
+    assert blocked.held is False
+    assert lock_path.exists() is True
+    assert gate_mod.OverlayInstanceGate(tmp_path).acquire() is False  # 仍被拒
+    holder.release()
+
+
+def test_refusal_leaves_trace(tmp_path, caplog):
+    """拒绝路径：进程日志 + 落盘留痕文件（打包产物无 stderr 时的唯一证据）。"""
+    holder = gate_mod.OverlayInstanceGate(tmp_path)
+    assert holder.acquire() is True
+    blocked = gate_mod.OverlayInstanceGate(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        assert blocked.acquire() is False
+    assert any("拒绝启动" in record.getMessage() for record in caplog.records)
+
+    trace = (tmp_path / gate_mod.TRACE_NAME).read_text(encoding="utf-8")
+    assert "refused" in trace
+    assert f"holder={os.getpid()}" in trace
+    holder.release()
+
+
+def test_crash_residue_lock_reclaimed_by_pid_staleness(tmp_path):
+    """崩溃残留：持有进程被 kill（不走 release）→ 锁文件里的 pid 已死 → 新实例接管。"""
+    config_dir = tmp_path
+    ready = tmp_path / "holder-ready"
+    proc = _spawn_gate_holder(config_dir, ready)
+    try:
+        _wait_for(lambda: ready.exists(), "子进程未在预算内抢到进程门")
+        status, holder_pid_text = ready.read_text(encoding="utf-8").split()
+        assert status == "1"
+        holder_pid = int(holder_pid_text)
+        assert holder_pid != os.getpid()
+        lock_path = config_dir / gate_mod.LOCK_NAME
+        assert lock_path.exists() is True
+        assert gate_mod.OverlayInstanceGate(config_dir).holder_pid() == holder_pid
+        _kill_hard(holder_pid)  # 模拟第一个 overlay 进程崩溃：不走 release
+        _wait_for(lambda: not pid_alive(holder_pid), "持有进程未被强杀掉", timeout=30)
+    finally:
+        _reap(proc)
+
+    # 残留锁文件还在（没有 release 就没有 unlink），但持有者 pid 已死
+    assert lock_path.exists() is True
+    assert pid_alive(holder_pid) is False
+
+    recovered = gate_mod.OverlayInstanceGate(config_dir)
+    assert recovered.acquire() is True
+    assert recovered.held is True
+    assert recovered.holder_pid() == os.getpid()
+    recovered.release()
+    assert lock_path.exists() is False
+
+
+def test_gate_path_blocked_fails_open(tmp_path):
+    """环境错误（config 路径被文件占住，锁文件建不出来）→ 放行启动，不误判双开。"""
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("x", encoding="utf-8")
+
+    gate = gate_mod.OverlayInstanceGate(blocked)
+    assert gate.acquire() is True
+    assert gate.held is False  # 放行 ≠ 持锁
+    gate.release()  # no-op，不炸
+
+
+# ---------------------------------------------------------------- 拓扑作用域
+def test_topology_check_forwards_to_overlay_shell(monkeypatch):
+    """门是否启用只认 overlay_shell.is_overlay_topology（唯一判定入口）。"""
+    from pet.overlay_shell import ENV_TOPOLOGY, is_overlay_topology
+
+    for value in (None, "legacy", "", "overlay", " OVERLAY "):
+        if value is None:
+            monkeypatch.delenv(ENV_TOPOLOGY, raising=False)
+        else:
+            monkeypatch.setenv(ENV_TOPOLOGY, value)
+        assert gate_mod.is_required() == is_overlay_topology()
+    assert gate_mod.is_required() is True  # 末项 " OVERLAY " 归一到 overlay
+
+
+def test_legacy_topology_has_no_gate(tmp_path, monkeypatch):
+    """legacy 拓扑无门：入口返回 None，连锁文件/留痕都不建（零副作用）。"""
+    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    assert gate_mod.is_required() is False
+    assert gate_mod.acquire_overlay_instance_gate(tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_overlay_topology_creates_gate_and_refuses_second(tmp_path, monkeypatch):
+    """overlay 拓扑：入口建门；同拓扑第二实例被拒。"""
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
+    first = gate_mod.acquire_overlay_instance_gate(tmp_path)
+    assert first is not None
+    assert (first.acquired, first.held) == (True, True)
+    assert first.path.exists() is True
+
+    second = gate_mod.acquire_overlay_instance_gate(tmp_path)
+    assert second is not None
+    assert (second.acquired, second.held) == (False, False)
+    first.release()
+
+
+# ---------------------------------------------------------------- app 启动链接线
+def test_main_refuses_second_overlay_instance_before_slot(tmp_path, monkeypatch, caplog):
+    """overlay 双开：拒绝先于 slot 竞争（不建 slots/、不落种 slot 配置）+ 留痕。"""
+    from pet import app as app_mod
+
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
+    monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
+    monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)
+
+    config_dir = tmp_path / APP_DIR_NAME
+    holder = gate_mod.OverlayInstanceGate(config_dir)
+    assert holder.acquire() is True
+    try:
+        with caplog.at_level(logging.WARNING):
+            code = app_mod.main(["dsh-pet"])
+        assert code == gate_mod.DUPLICATE_EXIT_CODE == 0
+    finally:
+        holder.release()
+
+    assert not (config_dir / "slots").exists()
+    assert not list(config_dir.glob("config-slot-*.json"))
+    assert not (config_dir / "migration-spawns.done").exists()
+    assert any("已有实例在运行" in record.getMessage() for record in caplog.records)
+    assert "refused" in (config_dir / gate_mod.TRACE_NAME).read_text(encoding="utf-8")
+
+
+def test_main_legacy_topology_skips_gate_and_reaches_slot(tmp_path, monkeypatch):
+    """legacy 拓扑行为不变：门分支不触发，main 照旧走到 slot 竞争（返回既有 1）。"""
+    from pet import app as app_mod
+
+    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
+    monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)
+
+    calls: list = []
+
+    def _slot_busy(_config_dir, preferred_slot=None):
+        calls.append(preferred_slot)
+        raise SlotLockError("测试：legacy 槽位竞争（门不该拦在这里之前）")
+
+    monkeypatch.setattr(app_mod.slot_manager_mod, "acquire_pet_slot", _slot_busy)
+
+    assert app_mod.main(["dsh-pet"]) == 1
+    assert calls == [None]
+    config_dir = tmp_path / APP_DIR_NAME
+    assert not (config_dir / gate_mod.LOCK_NAME).exists()
+    assert not (config_dir / gate_mod.TRACE_NAME).exists()
+
+
+def test_main_releases_gate_when_startup_fails(tmp_path, monkeypatch):
+    """正常退出链：main 的 finally 释放门（启动失败与事件循环结束共用此出口）。"""
+    from pet import app as app_mod
+
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
+    monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
+    monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)
+
+    config_dir = tmp_path / APP_DIR_NAME
+    gate = gate_mod.OverlayInstanceGate(config_dir)
+    assert gate.acquire() is True
+    monkeypatch.setattr(gate_mod, "acquire_overlay_instance_gate", lambda _cfg: gate)
+
+    def _slot_busy(*_args, **_kwargs):
+        raise SlotLockError("测试：启动失败路径")
+
+    monkeypatch.setattr(app_mod.slot_manager_mod, "acquire_pet_slot", _slot_busy)
+
+    assert app_mod.main(["dsh-pet"]) == 1
+    assert gate.held is False
+    assert gate.path.exists() is False
+
+
+def test_session_end_releases_gate(tmp_path, monkeypatch):
+    """会话结束链：_on_session_end 释放门（幂等），legacy（无门）下为 no-op。"""
+    from pet.app import AppShell
+
+    gate = gate_mod.OverlayInstanceGate(tmp_path)
+    assert gate.acquire() is True
+
+    shell = object.__new__(AppShell)  # 只测退出链挂点，不建真壳
+    shell._session_end_done = False
+    shell._instances = []
+    shell._overlay_gate = gate
+    monkeypatch.setattr(AppShell, "_mark_session_ending", lambda self: None)
+
+    AppShell._on_session_end(shell)
+    assert gate.held is False
+    assert gate.path.exists() is False
+    AppShell._on_session_end(shell)  # 幂等：不再收口第二次
+
+    legacy = object.__new__(AppShell)
+    legacy._overlay_gate = None
+    AppShell._release_overlay_gate(legacy)  # legacy 拓扑：no-op
+
+
+# ---------------------------------------------------------------- 真进程端到端
+def _child_base(tmp_path: Path) -> Path:
+    """子进程 ``config._default_base()`` 会返回的根（按平台推导，用于隔离真实配置）。"""
+    if sys.platform == "win32":
+        return tmp_path
+    if sys.platform == "darwin":
+        return tmp_path / "Library" / "Application Support"
+    return tmp_path / ".config"
+
+
+def test_real_second_process_refused_on_overlay_topology(tmp_path):
+    """真 Qt + 真进程：第二实例跑 `python -m pet` 被门拒绝并静默退出。"""
+    config_dir = _child_base(tmp_path) / APP_DIR_NAME
+    holder = gate_mod.OverlayInstanceGate(config_dir)
+    assert holder.acquire() is True
+
+    env = os.environ.copy()
+    env["PET_RENDER_TOPOLOGY"] = "overlay"
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    if sys.platform == "win32":
+        env["APPDATA"] = str(tmp_path)
+    else:
+        env["HOME"] = str(tmp_path)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pet"], cwd=str(_REPO_ROOT), env=env,
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        holder.release()
+
+    assert proc.returncode == gate_mod.DUPLICATE_EXIT_CODE
+    assert "已有实例在运行" in proc.stderr  # 无日志文件时的可见留痕
+    assert not (config_dir / "slots").exists()
+    assert not list(config_dir.glob("config-slot-*.json"))
