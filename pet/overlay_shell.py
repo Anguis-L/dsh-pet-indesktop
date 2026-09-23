@@ -72,6 +72,7 @@ class ShellOverlayWindow(OverlayWindow):
         self._on_advance = on_advance
         self._press_pos = None
         self.behavior = None  # OverlayShell 挂载；contextMenuEvent 查表读它
+        self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
 
     def before_sprites_advance(self, dt: float) -> None:
         self._on_advance(dt)
@@ -92,6 +93,23 @@ class ShellOverlayWindow(OverlayWindow):
             cb = getattr(self, "click_feedback", None)
             if callable(cb):
                 cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        feeding = getattr(self, "_feeding", None)
+        if feeding is not None:
+            feeding.handle_drag_enter(event)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        feeding = getattr(self, "_feeding", None)
+        if feeding is not None:
+            feeding.handle_drop(event)
+        else:
+            event.ignore()
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         """4.1c：有全量菜单建造器（产品壳）走 facade 菜单，否则基类最小集。"""
@@ -165,6 +183,11 @@ class OverlayShell(QObject):
         self.overlay.add_sprite(self.sprite)
         # 位置持久化是 4.2a 的事：本刀恒按 go_default_corner 语义落右下角
         self.sprite.set_pos(self._default_corner_pos(self._bounds, self.sprite.rect()))
+        # 4.1c 投喂（拖文件喂 sprite，命中判定与穿透同口径）
+        from .sprite_feeding import SpriteFeedingController
+        self._feeding = SpriteFeedingController(
+            self.overlay, self.sprite, self._config, self.behavior)
+        self.overlay._feeding = self._feeding
         # 4.1b 窗口能力：on_top/穿透复合/全屏与光标监视/runtime 避让标记
         self._auto_hidden = False
         self._user_mouse_through = bool(self._config.get("mouse_through", False))
