@@ -42,6 +42,7 @@ from PySide6.QtCore import QPointF, QRect
 
 from . import catalog, movement
 from .pet_sprite import INTERACTION_NORMAL
+from .predictive_prewarm import PredictivePrewarm
 
 STATE_IDLE = "idle"
 STATE_MOVE = "move"
@@ -53,7 +54,8 @@ STATE_ACTS = "acts"
 class _SpriteState:
     """单个 sprite 的行为状态（控制器私有，不落在 sprite 上）。"""
 
-    __slots__ = ("state", "anim", "elapsed", "duration", "move_target", "pending_move")
+    __slots__ = ("state", "anim", "elapsed", "duration", "move_target",
+                 "pending_move", "predictor")
 
     def __init__(self) -> None:
         self.state = STATE_IDLE
@@ -90,6 +92,12 @@ class BehaviorController:
         # 不移动开关（菜单/config 写入口）：移动桶并入动作池（window.py
         # _pick_next 的 no_move 语义）
         self.no_move = False
+        # 预测式预热（批10-A1 语义移植）：每 sprite 一个 PredictivePrewarm
+        # （预测是按 sprite 的素材池掷的，控制器级共享会跨池串名）。
+        # 提前量沿用旧默认 350ms；消费规则单源在 predictive_prewarm.consume
+        self._predict_lead_s = 0.35
+        # 预测预热总开关（config predict_prewarm_lead_ms>0 映射；测试可关）
+        self.predict_enabled = True
         self._states: dict = {}
         # V-9：按库对象弱引用缓存——旧实现以 id(lib) 为键，库销毁后地址
         # 被新库复用会命中陈旧分类池（换角色/多宠生灭时拿到错素材名），
@@ -105,6 +113,7 @@ class BehaviorController:
             st = self._states.get(sprite)
             if st is None:
                 st = self._states[sprite] = _SpriteState()
+                st.predictor = self._make_predictor(sprite)
             self._tick_sprite(sprite, st, dt)
 
     def on_sprite_clicked(self, sprite) -> bool:
@@ -129,7 +138,7 @@ class BehaviorController:
         st.pending_move = None
         st.move_target = None
         sprite.set_velocity(QPointF(0, 0))
-        sprite.bind_clip(name)
+        self._bind_with_gen(sprite, st, name)
         return True
 
     def play_once(self, sprite, name: str) -> bool:
@@ -180,6 +189,8 @@ class BehaviorController:
                 self._enter_idle(sprite, st, self._categories(sprite.library))
             elif st.elapsed >= st.duration:
                 self._roll_next(sprite, st)
+            else:
+                self._maybe_predict(sprite, st)
         elif st.state == STATE_MOVE:
             if st.elapsed >= st.duration:
                 if st.move_target is not None:
@@ -200,13 +211,71 @@ class BehaviorController:
         elif st.state == STATE_ACTS:
             if st.elapsed >= st.duration:
                 self._roll_next(sprite, st)
+            else:
+                self._maybe_predict(sprite, st)
         elif st.state == STATE_CLICK:
             if st.elapsed >= st.duration:
                 self._enter_idle(sprite, st, self._categories(sprite.library))
 
+    # ---------------------------------------------------------------- 预测式预热
+    def _make_predictor(self, sprite) -> PredictivePrewarm:
+        """每 sprite 一个 PredictivePrewarm（roll/warm 闭包绑定该 sprite 的库）。
+
+        should_predict 恒 True：帧序列时代预热 ~2.5ms 一帧，webm 路径的
+        warm_first_frame 本就是旧架构的预热入口；预测掷骰只掷一次、产物
+        照存（盲审 P1-1：否则稳态分布漂离 30/10/40/20）。
+        """
+        def _roll(exclude):
+            cats = self._categories(sprite.library)
+            pools = {k: cats[k] for k in ("idles", "turns", "moves", "acts", "clicks")}
+            from .predictive_prewarm import roll_next as _pp_roll_next
+            return _pp_roll_next(pools, exclude, rng=self.rng)
+
+        def _warm(name):
+            try:
+                clip = sprite.library.movie(name)
+                warm = getattr(clip, "warm_first_frame", None)
+                if callable(warm):
+                    warm()
+            except Exception:
+                pass  # 预热失败静默（播放时按需同步解码，语义同旧路径）
+
+        return PredictivePrewarm(roll=_roll, warm=_warm,
+                                 should_predict=lambda name: True)
+
+    def _maybe_predict(self, sprite, st: _SpriteState) -> None:
+        """墙钟适配的预测触发（语义 = PredictivePrewarm.on_frame 的
+        wall_remaining ≤ lead）：行为控制器以 elapsed/duration 墙钟推进，
+        等效换算进 on_frame 的帧口径（frames=1000/fps=1000/divisor=1 →
+        n = 999 - remaining*1000），不复制其触发逻辑。"""
+        if st.predictor is None or not self.predict_enabled or st.duration <= 0:
+            return
+        remaining = st.duration - st.elapsed
+        if remaining > self._predict_lead_s or remaining < 0:
+            return
+        n = max(0, 999 - int(round(remaining * 1000)))
+        st.predictor.on_frame(
+            st.anim, n, 1000, 1000.0, 1, self._predict_lead_s,
+            exclude=st.anim)
+
+    def _bind_with_gen(self, sprite, st: _SpriteState, name: str) -> None:
+        """bind + 预测代次推进（begin_anim 每次切换自增；作废由 consume 的
+        context/gen 校验完成，不手动清预测——GLM A4 单规则）。"""
+        sprite.bind_clip(name)
+        if st.predictor is not None:
+            st.predictor.begin_anim(name)
+
     def _roll_next(self, sprite, st: _SpriteState) -> None:
         """待机播完掷骰：30% 待机 / 10% 转向 / 40% 待机（acts 桶让位）/ 20% 移动。"""
         cats = self._categories(sprite.library)
+        # 批10-A1：先消费预测（context/gen 校验单规则，不符即弃 → 现场掷骰）
+        if st.predictor is not None and self.predict_enabled:
+            predicted = st.predictor.consume(
+                context_anim=st.anim, exclude=st.anim,
+                gap_active=False, moves=set(cats["moves"]))
+            if predicted is not None:
+                self._play_predicted(sprite, st, cats, predicted)
+                return
         roll = self.rng.random()
         if roll < catalog.P_TURN:  # P_IDLE 与 P_TURN 是累计阈值（<0.3 待机，<0.4 转向）
             action = STATE_IDLE if roll < catalog.P_IDLE else STATE_TURN
@@ -233,22 +302,38 @@ class BehaviorController:
             self._enter_idle(sprite, st, cats)
 
     # ---------------------------------------------------------------- 状态进入
-    def _enter_idle(self, sprite, st: _SpriteState, cats: dict) -> None:
+    def _enter_idle(self, sprite, st: _SpriteState, cats: dict,
+                    forced_name: str | None = None) -> None:
         st.state = STATE_IDLE
         st.pending_move = None
         st.move_target = None
         sprite.set_velocity(QPointF(0, 0))
-        name = self._pick(cats["idles"], exclude=st.anim)
+        name = forced_name if forced_name is not None else self._pick(cats["idles"], exclude=st.anim)
         st.elapsed = 0.0
         st.anim = name
         st.duration = self._clip_duration(sprite.library, name) if name else 0.0
         if name is not None:
-            sprite.bind_clip(name)
+            self._bind_with_gen(sprite, st, name)
 
-    def _enter_acts(self, sprite, st: _SpriteState, cats: dict) -> None:
+    def _play_predicted(self, sprite, st: _SpriteState, cats: dict, name: str) -> None:
+        """执行预测产物（window.py _play_roll 语义）：move 名走移动计划
+        （失败回退动作池）；其余按归属池进入对应状态。"""
+        if name in cats["moves"]:
+            if self.no_move or not self._plan_move(sprite, st, cats, anim_override=name):
+                self._enter_acts(sprite, st, cats)
+            return
+        if name in cats["turns"] and cats["turns"]:
+            self._enter_turn(sprite, st, cats, forced_name=name)
+        elif name in cats["acts"]:
+            self._enter_acts(sprite, st, cats, forced_name=name)
+        else:
+            self._enter_idle(sprite, st, cats, forced_name=name)
+
+    def _enter_acts(self, sprite, st: _SpriteState, cats: dict,
+                    forced_name: str | None = None) -> None:
         """随机动作（40% acts 桶）：acts 池随机一段，播完回掷骰
         （window.py _pick_next 的 acts 分支语义）；池空回退待机。"""
-        name = self._pick(cats["acts"], exclude=st.anim)
+        name = forced_name if forced_name is not None else self._pick(cats["acts"], exclude=st.anim)
         if name is None:
             self._enter_idle(sprite, st, cats)
             return
@@ -259,10 +344,12 @@ class BehaviorController:
         st.elapsed = 0.0
         st.anim = name
         st.duration = self._clip_duration(sprite.library, name)
-        sprite.bind_clip(name)
+        self._bind_with_gen(sprite, st, name)
 
-    def _enter_turn(self, sprite, st: _SpriteState, cats: dict, pending_move: dict | None = None) -> None:
-        name = self._pick(cats["turns"], exclude=st.anim)
+    def _enter_turn(self, sprite, st: _SpriteState, cats: dict,
+                    pending_move: dict | None = None,
+                    forced_name: str | None = None) -> None:
+        name = forced_name if forced_name is not None else self._pick(cats["turns"], exclude=st.anim)
         if name is None:  # 调用方已保证 turns 非空；防御性回退
             self._enter_idle(sprite, st, cats)
             return
@@ -273,7 +360,7 @@ class BehaviorController:
         st.pending_move = pending_move
         st.move_target = None
         sprite.set_velocity(QPointF(0, 0))
-        sprite.bind_clip(name)
+        self._bind_with_gen(sprite, st, name)
 
     def _plan_move(self, sprite, st: _SpriteState, cats: dict,
                    anim_override: str | None = None) -> bool:
@@ -331,7 +418,7 @@ class BehaviorController:
         st.pending_move = None
         # 朝向先于 bind：bind 重建首帧时已按新朝向镜像，无首帧镜像错误
         sprite.facing = plan["facing"]
-        sprite.bind_clip(plan["anim"])
+        self._bind_with_gen(sprite, st, plan["anim"])
         if plan["duration"] > 0:
             vx = (plan["target"].x() - sprite.pos.x()) / plan["duration"]
             vy = (plan["target"].y() - sprite.pos.y()) / plan["duration"]

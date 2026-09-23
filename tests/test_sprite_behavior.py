@@ -199,6 +199,7 @@ def test_turn_before_reverse_move():
     lib = _make_library()
     sprite = _make_sprite(lib, facing="left")   # 朝左却要向右走 → 先转向
     c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
     _roll_into_move(c, sprite, lib, choices=(1,))
 
     assert c.state_of(sprite) == STATE_TURN
@@ -219,6 +220,7 @@ def test_turn_roll_without_correction_degrades_to_idle():
     # 屏幕中线附近（滞回带内）掷中转向桶（0.3~0.4）→ 降级待机
     sprite = _make_sprite(lib, pos=(900, 400), facing="left")
     c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.35,)))
+    c.predict_enabled = False
     _roll_into_move(c, sprite, lib, rolls=())
     assert c.state_of(sprite) == STATE_IDLE
     assert lib.clip("turn1").start_count == 0
@@ -246,6 +248,7 @@ def test_non_normal_sprites_are_not_driven():
         sprite.interaction_state = state
         sprite.set_velocity(QPointF(50, 0))
         c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+        c.predict_enabled = False
         _run(c, sprite, 3.0)
         assert c.state_of(sprite) is None           # 从未接管
         assert lib.clip("idle1").start_count == 0   # 未绑定任何 clip
@@ -313,6 +316,7 @@ def test_move_fallback_to_idle_when_no_room():
     # 窄边界：两侧空间都 < MOVE_MIN_PX → choose_move_direction None → 回退待机
     sprite = _make_sprite(lib, pos=(20, 400))
     c = BehaviorController(QRect(0, 0, 400, 1000), rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
     _roll_into_move(c, sprite, lib, rolls=())
     assert c.state_of(sprite) == STATE_IDLE
     assert lib.clip("walk").start_count == 0
@@ -398,6 +402,7 @@ def test_acts_bucket_binds_acts_clip():
     lib = _library_with_acts()
     sprite = _make_sprite(lib)
     c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))
+    c.predict_enabled = False
     _run(c, sprite, lib.duration("idle1") + 0.1)   # 待机播完掷骰 → 0.5 ∈ acts 桶
     assert c.state_of(sprite) == "acts"
     assert sprite._clip_name in ("act1", "act2")
@@ -410,6 +415,7 @@ def test_acts_bucket_falls_back_to_idle_when_pool_empty():
     lib = _make_library()  # 无 acts
     sprite = _make_sprite(lib)
     c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))
+    c.predict_enabled = False
     _run(c, sprite, lib.duration("idle1") + 0.1)
     assert c.state_of(sprite) == "idle"     # acts 空：40% 桶回退待机
     assert lib.clip("idle1").start_count == 2
@@ -424,3 +430,44 @@ def test_move_failure_falls_back_to_acts():
     assert c.state_of(sprite) == "acts"
     assert sprite._clip_name in ("act1", "act2")
     assert sprite.velocity == QPointF(0, 0)
+
+
+# ---------------------------------------------------------------- 批10-A1：预测式预热
+def test_prediction_made_in_lead_and_consumed():
+    """提前量内创建预测 → 播完消费（context/gen 校验通过）。"""
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))
+    # 待机起播后推进到提前量内（duration 1.008 - elapsed ≥ 0.658）
+    _run(c, sprite, 0.75)
+    st = c._states[sprite]
+    assert st.predictor.counts["made"] == 1        # 已创建预测
+    _run(c, sprite, 0.5)                            # 播完 → 消费
+    assert st.predictor.counts["hit"] == 1
+    assert c.state_of(sprite) == "acts"            # 0.5 ∈ acts 桶（预测产物）
+
+
+def test_prediction_invalidated_by_intervening_bind():
+    """点击打断（换代+换 context）→ 预测作废，现场掷骰。"""
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5, 0.0)))
+    _run(c, sprite, 0.75)
+    st = c._states[sprite]
+    assert st.predictor.counts["made"] == 1
+    assert c.on_sprite_clicked(sprite) is True     # 点击绑 click1（换代）
+    _run(c, sprite, lib.duration("click1") + 0.1)  # click 播完回 idle
+    _run(c, sprite, lib.duration("idle1") + 0.1)   # idle 播完掷骰：预测已失效
+    assert st.predictor.counts["hit"] == 0
+    assert st.predictor.counts["miss_invalid"] >= 1
+
+
+def test_predict_disabled_falls_back_to_live_roll():
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))
+    c.predict_enabled = False
+    _run(c, sprite, lib.duration("idle1") + 0.1)
+    st = c._states[sprite]
+    assert st.predictor.counts["made"] == 0
+    assert c.state_of(sprite) == "acts"

@@ -338,6 +338,14 @@ class OverlayShell(QObject):
             bool(self._config.get("auto_hide_fullscreen", True)))
         self._watcher.set_cursor_enabled(
             bool(self._config.get("cursor_hidden_passthrough", True)))
+        # 预测预热提前量（config predict_prewarm_lead_ms，范围 200-600，0=关）
+        try:
+            lead_ms = int(self._config.get("predict_prewarm_lead_ms", 350) or 350)
+        except (TypeError, ValueError):
+            lead_ms = 350
+        lead_ms = max(0, min(600, lead_ms))
+        self.behavior._predict_lead_s = lead_ms / 1000.0
+        self.behavior.predict_enabled = lead_ms > 0
 
     def set_on_top(self, on: bool, *, persist: bool = True) -> None:
         """窗口置顶（window.py set_on_top 等价）。"""
