@@ -8,7 +8,13 @@ rect 会把气泡锚到透明边上沿）；30Hz 跟随节流 + 尾部补发（V
 fanout 游走期每 tick 一次 SetWindowPos ≈1.5ms 的 WM 移动税不能再交）。
 
 构造/跟随/显隐全链路 try/except 静默降级——气泡是外围装饰，失败绝不
-崩主链路。聊天/快速对话锚点（island_chat 域）不在本层，属后续外围刀。
+崩主链路。
+
+4.3 后半（本刀）：气泡主体可点 → 快速对话入口。对齐旧路径
+``window.py:3419-3447`` 的 ``_on_speech_bubble_clicked`` 语义——只有普通
+无按钮气泡可点开对话栏，交互（buttons）/告警气泡的主体点击是 no-op。
+点击能力复用既有 ``PetSpeechBubble`` 公开面（``clicked`` 信号 +
+``set_interactive`` + ``show_text``），不新造控件、不复制气泡实现。
 """
 from __future__ import annotations
 
@@ -37,12 +43,18 @@ def sprite_anchor_rect_global(sprite, overlay_origin: QPoint) -> QRect:
 
 
 class SpriteBubbleFollower:
-    """一只 sprite 的气泡跟随（真实 PetSpeechBubble 独立小窗）。"""
+    """一只 sprite 的气泡跟随（真实 PetSpeechBubble 独立小窗）。
 
-    def __init__(self, overlay, sprite, *, style_id: str = "classic_top") -> None:
+    ``on_clicked(sprite)``：气泡主体点击回调（快速对话入口）；不给 = 气泡
+    保持全鼠标穿透（无聊天变体/未接线，静默降级）。
+    """
+
+    def __init__(self, overlay, sprite, *, style_id: str = "classic_top",
+                 on_clicked=None) -> None:
         self._overlay = overlay
         self._sprite = sprite
         self._origin = overlay.geometry().topLeft()
+        self.on_clicked = on_clicked
         self.bubble: PetSpeechBubble | None = None
         self._last_follow = 0.0
         self._follow_pending = False
@@ -52,6 +64,7 @@ class SpriteBubbleFollower:
         self._follow_timer.timeout.connect(self._flush_follow)
         try:
             self.bubble = PetSpeechBubble(style_id=style_id)
+            self.bubble.clicked.connect(self._on_bubble_clicked)
             overlay.add_position_listener(sprite, self._on_sprite_moved)
         except Exception:
             self.bubble = None  # 构造失败 = 无气泡，静默降级
@@ -88,17 +101,68 @@ class SpriteBubbleFollower:
 
     def say(self, text: str, duration_ms: int = 3200, *, subtitle: str = "") -> bool:
         """播一句气泡文本；气泡不可用/文案为空返回 False（静默降级）。"""
+        return self.show(text, duration_ms, subtitle=subtitle)
+
+    def show(self, text: str, duration_ms: int = 3200, *, subtitle: str = "",
+             sticky: bool = False, buttons: list | None = None,
+             title_first: bool = False, width_locked: bool = False) -> bool:
+        """按 ``PetWindow.show_bubble`` 的形参面呈现一句气泡。
+
+        ``sticky`` / ``buttons`` 原样透传给 ``PetSpeechBubble.show_text``——
+        提醒/审批气泡的交互语义与旧路径同源（气泡控件自身负责按钮与穿透
+        切换），本层只补锚点与降级。返回是否真的展示。
+        """
         text = str(text or "").strip()
         if self.bubble is None or not text:
             return False
         try:
-            self.bubble.show_text(text, self.anchor(), duration_ms,
-                                  subtitle=subtitle,
-                                  pet_scale=getattr(self._sprite, "scale", None))
+            self.bubble.show_text(
+                text, self.anchor(), duration_ms,
+                subtitle=str(subtitle or ""),
+                sticky=bool(sticky),
+                buttons=list(buttons) if buttons else None,
+                title_first=bool(title_first),
+                width_locked=bool(width_locked),
+                pet_scale=getattr(self._sprite, "scale", None))
             return True
         except Exception:
             logger.debug("overlay: 气泡播放失败", exc_info=True)
             return False
+
+    def set_interactive(self, on: bool) -> None:
+        """气泡是否可点（可点 = 可打开快速对话）。
+
+        不可用时保持 QT 的 ``WA_TransparentForMouseEvents`` 全穿透——气泡
+        绝不吞掉桌面上的点击（旧路径 ``_set_speech_bubble_interactive`` 同款）。
+        """
+        setter = getattr(self.bubble, "set_interactive", None)
+        if not callable(setter):
+            return
+        try:
+            setter(bool(on))
+        except Exception:
+            logger.debug("overlay: 气泡交互态切换失败", exc_info=True)
+
+    def hide(self) -> None:
+        """收起当前气泡（气泡不可用时静默）。"""
+        hider = getattr(self.bubble, "hide", None)
+        if callable(hider):
+            try:
+                hider()
+            except Exception:
+                logger.debug("overlay: 气泡收起失败", exc_info=True)
+
+    def _on_bubble_clicked(self) -> None:
+        """气泡主体点击 → 快速对话（``window.py:3419`` 语义）。
+
+        交互（按钮）/告警气泡的主体点击必须是 no-op——按钮自身由气泡控件
+        处理；以实际展示状态判定，不依赖文案关键词。
+        """
+        if getattr(self.bubble, "_interactive_active", False):
+            return
+        callback = self.on_clicked
+        if callable(callback):
+            callback(self._sprite)
 
     def set_origin(self, origin: QPoint) -> None:
         """屏迁移后更新全局原点（overlay 重建时由壳层调用）。"""

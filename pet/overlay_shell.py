@@ -33,12 +33,37 @@ T5 切换策略：PET_RENDER_TOPOLOGY=overlay 环境变量是开发期一次性�
 单托盘多窗语义）、D12「退出子肥鱼」指令通道消费（独立设置进程写指令文件 →
 本壳经 config 目录 watcher + 轮询消费，纯逻辑在 ``overlay_settings_command``）、
 D13 逐 sprite 设置路由（菜单按被点 sprite 的 config 身份传 ``--instance``）。
+
+4.3 后半（本刀）：把本壳做成进程级共享子系统（agent_link / proactive /
+全屏 watcher）的**呈现扇出目标**——overlay 拓扑下 ``instances[].win`` 恒为
+None，扇出集合为空等于联动/自说自话静默缺失（D0 的另一半，见
+``multi_window_shared.presentation_targets``）。本类因此补齐 PetWindow 的
+呈现等价面：
+
+- 气泡：``show_bubble`` / ``hold_bubble`` / ``hide_bubble`` 落主 sprite 头顶
+  （``SpriteBubbleFollower.show``）；提醒队列 ``show_alert`` / ``resolve_alert``
+  / ``clear_alerts`` 直接复用 ``window_alerts`` 的 host 形函数（同一份队列
+  语义，不重复造）；
+- 聚合状态：``isVisible`` / ``_dragging`` / ``_physics_mode`` /
+  ``_click_effect_phase`` / ``mouse_through`` / ``_bubble_busy_until`` /
+  ``_bubble_suppressed``（proactive G1 守卫与联动节流门读的就是这些）；
+- 联动动作：``request_link_anim`` / ``request_link_idle`` / ``switch_clip`` /
+  ``cats`` / ``idles`` 映射到 ``BehaviorController``；
+- 显隐：``set_pet_visible`` 同步 pause/resume proactive 与 agent_link
+  （``window.py:1214-1250`` 语义；共享实例的 pause/resume 是 no-op，见
+  multi_window_shared 的说明——G1 逐 tick 读可见性）；
+- 快速对话：气泡可点 → ``open_quick_chat``，``QuickChatBubble`` 锚定被点
+  sprite（``_SpriteChatAnchor`` 提供 pet 形的 ``visible_content_rect`` /
+  ``on_open_chat``），回车发送走既有 ChatService/SessionStore 链路；
+  无聊天打包变体（``pet.chat`` 被排除）按 app.py 既有 ImportError 守卫
+  静默降级为不可点。
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 
 from PySide6.QtCore import QObject, QPointF, QRect, QTimer, Qt
 from PySide6.QtWidgets import QMenu, QStyle, QSystemTrayIcon
@@ -47,11 +72,18 @@ from . import catalog
 from . import overlay_settings_command
 from . import overlay_spawn_state
 from . import slot_manager
+from . import window_alerts
 from .overlay_peripherals import FullscreenCursorWatcher
 from .overlay_window import OverlayWindow
-from .pet_sprite import PetSprite
+from .pet_sprite import INTERACTION_DRAG, INTERACTION_THROWN, PetSprite
 from .session_watcher import install_session_watcher
-from .sprite_behavior import BehaviorController
+from .sprite_behavior import (
+    STATE_ACTS,
+    STATE_CLICK,
+    STATE_MOVE,
+    BehaviorController,
+)
+from .sprite_bubble import SpriteBubbleFollower, sprite_anchor_rect_global
 from .sprite_collision import SpriteCollisionWorld
 from .sprite_physics import ThrowPhysicsController
 from .sprite_sound import SpriteSoundPlayer
@@ -59,6 +91,90 @@ from .tick_driver import TickDriver
 
 ENV_TOPOLOGY = overlay_settings_command.ENV_TOPOLOGY
 TOPOLOGY_OVERLAY = overlay_settings_command.TOPOLOGY_OVERLAY
+
+# 联动动作链里「一次性动作正在播」（window.py _is_one_shot_playing 的 sprite 等价物）：
+# 动作池 / 点击回应 / 移动三类都不可被打断，联动请求排进待播槽。
+_LINK_ONESHOT_STATES = (STATE_ACTS, STATE_CLICK, STATE_MOVE)
+
+
+def _import_quick_chat():
+    """取 ``QuickChatBubble``；无聊天打包变体返回 None（app.py 既有守卫惯例）。
+
+    打包变体以 ``excludes=['pet.chat']`` 排除聊天模块（见 ``pet/__main__.py
+    _chat_available``），此时 ``pet.quick_chat`` 的模块级 ``from .chat.service
+    import ChatService`` 抛 ImportError。只吞 ``pet.chat`` 系的 ImportError
+    （返回 None = 无聊天变体）；其它导入错误照旧抛出，由壳层统一降级并落
+    日志，不在这里静默吞掉（不掩盖真实故障）。
+    """
+    try:
+        from .quick_chat import QuickChatBubble
+    except ImportError as exc:
+        if str(getattr(exc, "name", "") or "").startswith("pet.chat"):
+            return None
+        raise
+    return QuickChatBubble
+
+
+class _SpriteChatAnchor:
+    """快速对话气泡的 pet 形锚点（``QuickChatBubble.position_near_pet`` 只读两面）。
+
+    ``quick_chat.py`` 只用 ``visible_content_rect()`` 定位（242-285）与
+    ``on_open_chat`` 打开完整聊天窗（445-450），不需要 PetWindow 的其余面；
+    每个 sprite 一个锚点，被点中的是哪一只就锚在哪一只头顶。
+    """
+
+    __slots__ = ("_shell", "_sprite")
+
+    def __init__(self, shell, sprite) -> None:
+        self._shell = shell
+        self._sprite = sprite
+
+    def visible_content_rect(self) -> QRect:
+        """身体框全局矩形（气泡锚点，口径同 SpriteBubbleFollower.anchor）。"""
+        overlay = getattr(self._shell, "overlay", None)
+        if overlay is None:
+            return QRect()
+        return sprite_anchor_rect_global(self._sprite, overlay.geometry().topLeft())
+
+    def on_open_chat(self) -> None:
+        """气泡内「完整聊天窗」入口（QuickChatBubble._open_full_chat 调用面）。"""
+        self._shell.open_full_chat()
+
+
+class _LinkAnimChain:
+    """联动动作链接续（``window.py _on_anim_ended`` → ``_link_next_provider`` 等价物）。
+
+    PetWindow 靠动画结束回调接续联动动作；sprite 世界的行为控制器没有结束
+    回调面（``sprite_behavior`` 不在本刀范围），改由驱动器 extras 每 tick
+    观测「一次性动作结束」的下降边沿，等价地接续待播动作/下一个联动动作。
+    零新线程、每 tick 一次 ``state_of`` 查询（字典取值）。
+    """
+
+    def __init__(self, shell) -> None:
+        self._shell = shell
+        self._was_busy = False
+
+    def tick(self, sprites, dt: float) -> None:
+        shell = self._shell
+        busy = shell._link_anim_busy()
+        was_busy, self._was_busy = self._was_busy, busy
+        if busy or not was_busy:
+            return
+        # 一次性动作刚播完：待播优先，否则向 provider 要下一个
+        # （顺序同 legacy _on_anim_ended：先消费待播，再问联动链）
+        if shell._pending_link_anim:
+            shell._play_pending_link_anim()
+            return
+        provider = shell._link_next_provider
+        if not callable(provider):
+            return
+        try:
+            nxt = provider()
+        except Exception:
+            logging.debug("overlay: 联动动作链取下一个动作失败", exc_info=True)
+            return
+        if nxt:
+            shell.request_link_anim(str(nxt))
 
 
 def is_overlay_topology() -> bool:
@@ -197,9 +313,15 @@ class OverlayShell(QObject):
     依赖最小化：QApplication + 主 PetInstance（config 与 per-pet MovieLibrary
     身份源）。屏事件/会话事件/退出收口全部在本类内自接，AppShell 只在
     拓扑分支处构造并 start()。
+
+    4.3 后半：本类同时是进程级共享子系统（agent_link / proactive）的呈现
+    扇出目标——``agent_link_manager`` / ``proactive_watcher`` 由 AppShell 在
+    拓扑分支处注入（等价 PetWindow 的构造参数）。注入失败=None 时全部呈现面
+    静默空转，绝不阻断启动。
     """
 
-    def __init__(self, app, instance, *, screen=None, sprite_factory=None) -> None:
+    def __init__(self, app, instance, *, screen=None, sprite_factory=None,
+                 agent_link_manager=None, proactive_watcher=None) -> None:
         super().__init__()
         self.app = app
         self._instance = instance
@@ -228,6 +350,29 @@ class OverlayShell(QObject):
         self._spawned: list = []
         self._spawned_libs: dict = {}
         self._spawned_slots: dict = {}
+        # 4.3 后半：共享子系统注入（等价 PetWindow 的构造参数；None = 惰性空转）
+        self.agent_link_manager = agent_link_manager
+        self.proactive_watcher = proactive_watcher
+        # 呈现/提醒状态（PetWindow 同名私有面的 sprite 等价物；window_alerts 的
+        # host 形函数与 agent_link/proactive 的聚合读取都直接读这些属性）
+        self._alert_queue: deque = deque()
+        self._alert_current: dict | None = None
+        self._sticky_bubble_active = False
+        self._sticky_text = ""
+        self._sticky_subtitle = ""
+        self._sticky_buttons: list | None = None
+        self._bubble_busy_until = 0.0
+        self._bubble_suppressed = False
+        self._last_sticky_restore = 0.0
+        # 联动动作链（agent_link 的 request_link_anim/idle 落点）
+        self._pending_link_anim: str | None = None
+        self._link_anim_current: str | None = None
+        self._link_next_provider = None
+        self._link_chain: _LinkAnimChain | None = None
+        # 快速对话气泡（懒建；无聊天变体 = None 静默降级）
+        self._quick_chat = None
+        self._quick_chat_resolved = False
+        self._quick_chat_cls = None
         self._build()
         self._wire_screen_signals()
         self._install_session_watcher()
@@ -307,6 +452,10 @@ class OverlayShell(QObject):
         self._apply_window_capabilities()
         # 4.1c 气泡跟随（真实 PetSpeechBubble；静默降级）
         self._bind_bubble()
+        # 4.3 后半：联动动作链接续控制器（extras 尾段观测一次性动作结束边沿）
+        self._link_chain = _LinkAnimChain(self)
+        self.driver.add_extra_controller(self._link_chain)
+        self._install_shared_link()
         self._build_tray()
         self._install_settings_command_watch()
 
@@ -350,12 +499,454 @@ class OverlayShell(QObject):
         self.overlay._feeding = self._feeding
 
     def _bind_bubble(self) -> None:
-        """气泡跟随器只认主 sprite；重建前先关旧跟随器（防旧顶层气泡残留）。"""
+        """气泡跟随器只认主 sprite；重建前先关旧跟随器（防旧顶层气泡残留）。
+
+        4.3 后半：跟随器接上点击回调（快速对话入口）+ ``hidden_signal``
+        （提醒队列推进/粘滞气泡恢复，``window_alerts.on_speech_bubble_hidden``），
+        并按聊天可用性切换气泡的可点状态。
+        """
         follower = getattr(self, "_bubble_follower", None)
         if follower is not None:
             follower.close()
-        from .sprite_bubble import SpriteBubbleFollower
-        self._bubble_follower = SpriteBubbleFollower(self.overlay, self.sprite)
+        self._bubble_follower = SpriteBubbleFollower(
+            self.overlay, self.sprite, on_clicked=self._on_bubble_clicked)
+        bubble = self._speech_bubble
+        if bubble is not None:
+            try:
+                bubble.hidden_signal.connect(self._on_speech_bubble_hidden)
+            except (AttributeError, RuntimeError, TypeError):
+                logging.debug("overlay: 气泡 hidden 信号接线失败", exc_info=True)
+        if self._quick_chat_resolved:
+            # 快速对话可用性已解析过（不重付 import 成本）：新气泡直接对齐
+            # 可点状态；否则等首次冒泡时由 show_bubble 的
+            # _apply_bubble_interactive 惰性解析（与 legacy 触点一致）。
+            self._apply_bubble_interactive()
+
+    def _install_shared_link(self) -> None:
+        """把本壳接进共享联动链（``AppShell._wire_shared_subsystems`` 的等价物）。
+
+        共享 manager 的 ``win`` 是 ``MultiWindowProxy``，其 ``__init__`` 期
+        注入 provider 时 overlay 壳还不存在（AppShell.start() 才构造），
+        扇出集合为空 → provider 永远送不到。这里由壳自接一次；legacy 路径
+        仍由 app.py 在每窗创建后调用，两边不重叠。
+        """
+        shared = getattr(getattr(self._instance, "shell", None), "_shared", None)
+        if shared is None:
+            return
+        try:
+            shared.proxy.set_link_next_provider(shared.agent_link._next_busy_anim)
+        except Exception:
+            logging.debug("overlay: 接入共享联动链失败", exc_info=True)
+
+    # ---------------------------------------------------------------- 4.3 后半：共享子系统呈现面
+    #
+    # 本段是 PetWindow 呈现面的 sprite 等价物，消费方是进程级共享子系统：
+    #   - ``MultiWindowProxy``（agent_link / proactive 的 win）：读聚合状态属性
+    #     （isVisible/_dragging/_physics_mode/_click_effect_phase/mouse_through/
+    #     _bubble_busy_until/_bubble_suppressed/_sticky_bubble_active/
+    #     _alert_current/_alert_queue/agent_link_manager）并调用呈现方法；
+    #   - ``window_alerts`` 的 host 形函数：show_alert/resolve_alert/
+    #     pump_alerts/clear_alerts/hide_bubble/on_speech_bubble_hidden/
+    #     set_bubble_suppressed——直接复用同一份提醒队列实现（不重复造）。
+    # 缺失任一方法只会让对应功能静默降级，绝不抛到调用方。
+    @property
+    def _speech_bubble(self):
+        """主 sprite 的气泡控件（PetWindow._speech_bubble 的等价物；无气泡=None）。"""
+        return getattr(getattr(self, "_bubble_follower", None), "bubble", None)
+
+    @property
+    def scale(self) -> float:
+        """主 sprite 缩放（气泡字号/锚点的 pet_scale 来源）。"""
+        return float(getattr(self.sprite, "scale", 1.0) or 1.0)
+
+    def isVisible(self) -> bool:  # noqa: N802 (Qt/PetWindow 命名)
+        """聚合可见性 = overlay 是否可见（隐藏/全屏自动隐藏都算不可见）。"""
+        overlay = getattr(self, "overlay", None)
+        return bool(overlay is not None and overlay.isVisible())
+
+    def visible_content_rect(self) -> QRect:
+        """主 sprite 身体框的全局矩形（气泡锚点；window_placement 口径的 sprite 版）。"""
+        if self.sprite is None:
+            return QRect()
+        return sprite_anchor_rect_global(self.sprite, self.overlay.geometry().topLeft())
+
+    @property
+    def _dragging(self) -> bool:
+        """拖拽中（proactive G1 守卫的 interacting 判定之一）。"""
+        return getattr(self.overlay, "_mouse_grab", None) is not None
+
+    @property
+    def _physics_mode(self):
+        """'drag'/'throw'/None——**必须保持哨兵语义**（None = 不在物理模式）。
+
+        消费方读 ``getattr(win, "_physics_mode", None) is not None``：返回
+        ``False`` 会让 G1 恒真拦截（multi_window_shared 的同款注释记录了
+        legacy 侧踩过的坑）。
+        """
+        state = getattr(self.sprite, "interaction_state", None)
+        if state == INTERACTION_DRAG:
+            return "drag"
+        if state == INTERACTION_THROWN:
+            return "throw"
+        return None
+
+    @property
+    def _click_effect_phase(self) -> int:
+        """sprite 世界没有点击效果相位（旧路径的 squash 相位计数）→ 恒 0。"""
+        return 0
+
+    @property
+    def mouse_through(self) -> bool:
+        return bool(getattr(self.overlay, "mouse_through", False))
+
+    @property
+    def cats(self) -> dict:
+        """素材分类（联动动作链按 acts 名筛选用）。失败回空字典，不抛。"""
+        try:
+            return dict(self.behavior._categories(self.sprite.library))
+        except Exception:
+            logging.debug("overlay: 取素材分类失败", exc_info=True)
+            return {}
+
+    @property
+    def idles(self) -> list:
+        return list(self.cats.get("idles", []) or [])
+
+    @property
+    def on_look_synced(self):
+        """主动识屏答复同步进 AI 会话（``PetInstance.sync_look_to_chat`` 注入面）。
+
+        无聊天变体 / 未启用聊天 → None（proactive 侧 callable 判定后静默跳过）；
+        这正是 app.py ``_wire_window`` 里 ``win.on_look_synced`` 的等价注入。
+        """
+        if not self._chat_enabled():
+            return None
+        return getattr(self._instance, "sync_look_to_chat", None)
+
+    @property
+    def hidden_bubble_redirect(self):
+        """桌宠隐藏时的气泡改道面（灵动岛反馈气泡；``window_alerts`` 读它）。
+
+        可见时返回 None：改道只在隐藏期有意义，且 AppShell 的
+        ``_island_feedback_bubble`` 用 ``_aggregate_pet_visible()``（读
+        ``instances[].win``）判定——overlay 拓扑下恒为 False，故这里先按
+        本壳自己的可见性过滤，语义与 legacy 逐条对齐。
+
+        agent_link 侧经共享 ``MultiWindowProxy`` 读到本属性（proxy 仅在
+        overlay 拓扑转发它，见 multi_window_shared）。
+        """
+        if self.isVisible():
+            return None
+        shell = getattr(self._instance, "shell", None)
+        redirect = getattr(shell, "_island_feedback_bubble", None)
+        return redirect if callable(redirect) else None
+
+    # ---- 气泡呈现（PetWindow.show_bubble / hold_bubble 等价）----
+    def show_bubble(self, text: str, duration_ms: int = 3200,
+                    subtitle: str | None = None, *, sticky: bool = False,
+                    buttons: list | None = None, title_first: bool = False,
+                    width_locked: bool = False, **_ignored) -> None:
+        """向主 sprite 头顶冒泡（window.py:3850-3886 的 sprite 等价语义）。"""
+        if not self.isVisible() or self._bubble_suppressed:
+            return
+        if self._speech_bubble is None:
+            return
+        if not sticky and not buttons and self._alert_current is not None:
+            return  # 有提醒在展示：普通气泡让路，绝不覆盖审批弹窗
+        if sticky or buttons:
+            self._sticky_bubble_active = True
+            self._sticky_text = str(text)
+            self._sticky_subtitle = str(subtitle or "")
+            self._sticky_buttons = list(buttons) if buttons else None
+            self._show_bubble_text(self._sticky_text, 0,
+                                   subtitle=self._sticky_subtitle,
+                                   sticky=True, buttons=self._sticky_buttons)
+            return
+        self._apply_bubble_interactive()
+        self.hold_bubble(duration_ms / 1000.0 + 2.0)
+        self._show_bubble_text(str(text), duration_ms,
+                               subtitle=str(subtitle or ""),
+                               title_first=title_first,
+                               width_locked=width_locked)
+
+    def _show_bubble_text(self, text: str, duration_ms: int, **kwargs) -> bool:
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is None:
+            return False
+        return follower.show(text, duration_ms, **kwargs)
+
+    def hold_bubble(self, seconds: float) -> None:
+        """声明重要气泡占用时长（联动/识屏气泡在此期间让路）。"""
+        self._bubble_busy_until = max(
+            self._bubble_busy_until, time.monotonic() + max(0.0, float(seconds)))
+
+    def hide_bubble(self) -> None:
+        """主动关闭当前气泡并推进提醒队列（window_alerts 同源实现）。"""
+        if self._speech_bubble is None:
+            self._clear_sticky_state()
+            return
+        window_alerts.hide_bubble(self)
+
+    def clear_alerts(self) -> None:
+        """清空提醒队列并关闭当前提醒（DSH 离线/重启收口）。"""
+        if self._speech_bubble is None:
+            self._alert_queue.clear()
+            self._clear_sticky_state()
+            return
+        window_alerts.clear_alerts(self)
+
+    def show_alert(self, text: str, *, subtitle: str = "", duration_ms: int = 0,
+                   buttons: list | None = None, sticky: bool = True,
+                   alert_id: str = "", priority: int = 3,
+                   alert_type: str = "watchdog", metadata: dict | None = None) -> None:
+        """提醒入队（审批/问题/硬失败/卡住提醒；一次只展示一个）。"""
+        if self._speech_bubble is None:
+            return
+        window_alerts.show_alert(
+            self, text, subtitle=subtitle, duration_ms=duration_ms,
+            buttons=buttons, sticky=sticky, alert_id=alert_id,
+            priority=priority, alert_type=alert_type, metadata=metadata)
+
+    def resolve_alert(self, alert_id: str) -> None:
+        """按 alert_id 精确收起某条提醒（并发审批各自定位，不误关他人）。"""
+        if self._speech_bubble is None:
+            return
+        window_alerts.resolve_alert(self, alert_id)
+
+    def set_bubble_suppressed(self, suppressed: bool) -> None:
+        """设置页打开期间暂停气泡（PetWindow.set_bubble_suppressed 等价）。"""
+        if self._speech_bubble is None:
+            self._bubble_suppressed = bool(suppressed)
+            return
+        window_alerts.set_bubble_suppressed(self, suppressed)
+
+    def _pump_alerts(self) -> None:
+        """弹出队首提醒（window_alerts 的 host 回调面）。"""
+        if self._speech_bubble is None:
+            return
+        window_alerts.pump_alerts(self)
+
+    def _on_speech_bubble_hidden(self, *_args, **_kwargs) -> None:
+        """气泡隐藏后的恢复/队列推进（PetWindow 同款委托）。"""
+        if self._speech_bubble is None:
+            return
+        window_alerts.on_speech_bubble_hidden(self)
+
+    def _clear_sticky_state(self) -> None:
+        self._sticky_bubble_active = False
+        self._sticky_text = ""
+        self._sticky_subtitle = ""
+        self._sticky_buttons = None
+
+    # ---- 联动动作（agent_link 的 request_link_* 落点）----
+    def _link_anim_busy(self) -> bool:
+        """一次性动作（动作池/点击/移动）是否在播——联动请求不打断它。"""
+        behavior = getattr(self, "behavior", None)
+        if behavior is None:
+            return False
+        try:
+            return behavior.state_of(self.sprite) in _LINK_ONESHOT_STATES
+        except Exception:
+            logging.debug("overlay: 读行为状态失败", exc_info=True)
+            return False
+
+    def switch_clip(self, name: str, link_request: bool = False) -> bool:
+        """播放指定动画（window.switch_clip 语义：一次性，播完回掷骰链）。"""
+        if self.behavior is None or not str(name or ""):
+            return False
+        try:
+            return bool(self.behavior.play_once(self.sprite, str(name)))
+        except Exception:
+            logging.debug("overlay: 切换动画失败 %s", name, exc_info=True)
+            return False
+
+    def request_link_anim(self, name: str) -> None:
+        """Agent 联动动作请求：一次性动作播放中不打断，存为待播（最新覆盖旧的）。"""
+        self.mark_activity()
+        name = str(name or "")
+        if not name:
+            return
+        self._pending_link_anim = name
+        if not self._link_anim_busy():
+            self._play_pending_link_anim()
+
+    def _play_pending_link_anim(self) -> None:
+        name, self._pending_link_anim = self._pending_link_anim, None
+        if not name:
+            return
+        self._link_anim_current = name
+        self.switch_clip(name)
+
+    def request_link_idle(self) -> None:
+        """Agent 回到空闲：取消待播联动；一次性动作让它播完自然回待机。"""
+        self._pending_link_anim = None
+        self._link_anim_current = None
+        if self._link_anim_busy():
+            return
+        idles = self.idles
+        if idles:
+            self.switch_clip(self._pick_idle(idles))
+
+    def _pick_idle(self, idles: list) -> str:
+        rng = getattr(getattr(self, "behavior", None), "rng", None)
+        chooser = getattr(rng, "choice", None)
+        if callable(chooser):
+            try:
+                return str(chooser(list(idles)))
+            except Exception:
+                logging.debug("overlay: 随机待机取素材失败", exc_info=True)
+        return str(idles[0])
+
+    def set_link_next_provider(self, provider) -> None:
+        """注入联动动作链「下一个动作」提供者（``_LinkAnimChain`` 消费）。"""
+        self._link_next_provider = provider
+
+    def clear_pending_link_anim(self) -> None:
+        self._pending_link_anim = None
+
+    def mark_activity(self) -> None:
+        """用户/联动活跃锚点。
+
+        overlay 路径尚无闲置降帧门（D9 未落地项），本方法保留调用面以承接
+        agent_link 的事件语义，等降帧刀落地后在此接真。
+        """
+
+    # ---- 快速对话（气泡可点 → 锚定 sprite 的输入气泡）----
+    def _chat_enabled(self) -> bool:
+        """进程级聊天开关（E2 单源 = AppShell.enable_chat，经 PetInstance 转发）。"""
+        return bool(getattr(self._instance, "enable_chat", True))
+
+    def quick_chat_available(self) -> bool:
+        """快速对话是否可用（未启用聊天 / 无聊天打包变体 → False）。"""
+        return self._quick_chat_class() is not None
+
+    def _quick_chat_class(self):
+        """解析 ``QuickChatBubble``（结果缓存；不可用时 None，**绝不抛**）。
+
+        呈现面纪律：入口探测失败一律降级——气泡/联动链路不能因为一个可选
+        外围模块而中断；真故障仍由 ``_import_quick_chat`` 的 log 暴露。
+        """
+        if not self._chat_enabled():
+            return None
+        if not self._quick_chat_resolved:
+            self._quick_chat_resolved = True
+            try:
+                self._quick_chat_cls = _import_quick_chat()
+            except Exception:
+                logging.exception("overlay: 快速对话模块导入失败，入口静默降级")
+                self._quick_chat_cls = None
+            else:
+                if self._quick_chat_cls is None:
+                    logging.info("overlay: 无聊天变体，快速对话入口静默降级")
+        return self._quick_chat_cls
+
+    def _apply_bubble_interactive(self) -> None:
+        """按快速对话可用性切换气泡可点（旧路径 ``_set_speech_bubble_interactive``）。"""
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None:
+            follower.set_interactive(self.quick_chat_available())
+
+    def _on_bubble_clicked(self, sprite) -> None:
+        """气泡主体点击 → 快速对话（``window.py:3419`` 语义：提醒/交互气泡 no-op）。"""
+        if self._sticky_bubble_active or self._alert_current is not None:
+            return
+        self.open_quick_chat(sprite)
+
+    def open_quick_chat(self, sprite=None) -> bool:
+        """打开快速对话输入气泡，锚定被点 sprite；回车发送走既有 chat 链路。
+
+        返回是否真的打开（无聊天变体/构造失败 → False，静默降级）。
+        """
+        cls = self._quick_chat_class()
+        if cls is None:
+            return False
+        target = self.sprite if sprite is None else sprite
+        anchor = _SpriteChatAnchor(self, target)
+        try:
+            bubble = self._quick_chat
+            if bubble is None:
+                bubble = cls(self._config, pet_window=anchor)
+                bubble.open_chat_callback = self.open_full_chat
+                self._quick_chat = bubble
+            else:
+                bubble.settings = self._config.chat_settings()
+                bubble.refresh_session()
+            bubble.show_for_pet(anchor)
+            return True
+        except Exception:
+            logging.exception("overlay: 打开快速对话失败")
+            return False
+
+    def open_full_chat(self) -> None:
+        """打开完整聊天窗（快速对话气泡的「全文见聊天窗」入口）。"""
+        opener = getattr(self._instance, "open_chat", None)
+        if not callable(opener):
+            return
+        try:
+            opener()
+        except Exception:
+            logging.exception("overlay: 打开完整聊天窗失败")
+
+    def _close_quick_chat(self) -> None:
+        """收起并释放快速对话气泡（stop/aboutToQuit 收口）。"""
+        bubble, self._quick_chat = self._quick_chat, None
+        if bubble is None:
+            return
+        try:
+            bubble.close()
+        except Exception:
+            logging.debug("overlay: 收起快速对话失败", exc_info=True)
+
+    # ---- 显隐：共享子系统 pause/resume（window.py:1214-1250 语义）----
+    def _pause_shared_subsystems(self) -> None:
+        """隐藏 → proactive.pause + agent_link.pause（岛反馈面可用时不停联动）。
+
+        共享实例（overlay 拓扑恒为 SharedSubsystems）的 ``pause`` 是刻意的
+        no-op——单窗显隐不该停进程级监视器，G1 守卫逐 tick 读 ``isVisible()``
+        拦下截图（限流器状态因此不丢）。本方法保留调用面与 legacy 逐条对齐。
+        """
+        proactive = getattr(self, "proactive_watcher", None)
+        if proactive is not None:
+            try:
+                proactive.pause()
+            except Exception:
+                logging.debug("overlay: 暂停主动识屏失败", exc_info=True)
+        manager = getattr(self, "agent_link_manager", None)
+        if manager is None:
+            return
+        if self._island_feedback_available():
+            return  # 隐藏期间岛是交互面，联动事件仍需驱动岛反馈气泡
+        try:
+            manager.pause()
+        except Exception:
+            logging.debug("overlay: 暂停联动监视器失败", exc_info=True)
+
+    def _resume_shared_subsystems(self) -> None:
+        """恢复显示 → proactive.resume + agent_link.resume（按最新配置重评估）。"""
+        proactive = getattr(self, "proactive_watcher", None)
+        if proactive is not None:
+            try:
+                proactive.resume()
+            except Exception:
+                logging.debug("overlay: 恢复主动识屏失败", exc_info=True)
+        manager = getattr(self, "agent_link_manager", None)
+        if manager is not None:
+            try:
+                manager.resume()
+            except Exception:
+                logging.debug("overlay: 恢复联动监视器失败", exc_info=True)
+
+    def _island_feedback_available(self) -> bool:
+        """岛反馈面是否可用（隐藏期气泡改道 + 联动是否暂停的判定探针）。"""
+        shell = getattr(self._instance, "shell", None)
+        probe = getattr(shell, "_island_feedback_available", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logging.debug("overlay: 岛反馈面探测失败", exc_info=True)
+            return False
 
     # ---------------------------------------------------------------- 灵动岛碰撞桥（4.3）
     def attach_island(self, island) -> None:
@@ -411,6 +1002,7 @@ class OverlayShell(QObject):
             self.island_bridge = None
         self._watcher.stop()
         self._delete_runtime_marker()
+        self._close_quick_chat()
         if getattr(self, "_bubble_follower", None) is not None:
             self._bubble_follower.close()
         self.overlay.stop()
@@ -423,6 +1015,7 @@ class OverlayShell(QObject):
         self._watcher.stop()
         self._teardown_settings_command_watch()
         self._delete_runtime_marker()
+        self._close_quick_chat()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
             bridge.close()
@@ -525,13 +1118,9 @@ class OverlayShell(QObject):
 
     def _hide_bubble_for_menu(self) -> None:
         """托盘菜单弹出前隐藏气泡（legacy menu.aboutToShow → hide_speech_bubble）。"""
-        bubble = getattr(getattr(self, "_bubble_follower", None), "bubble", None)
-        hide = getattr(bubble, "hide", None)
-        if callable(hide):
-            try:
-                hide()
-            except Exception:
-                logging.debug("overlay: 托盘弹出前隐藏气泡失败", exc_info=True)
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None:
+            follower.hide()
 
     def _tray_icon(self):
         """托盘图标尽力取鱼本体 idle 首帧（裁剪/精修是 4.1b 的事）；
@@ -602,16 +1191,25 @@ class OverlayShell(QObject):
         self._apply_effective_mouse_through()
 
     def _on_fullscreen_changed(self, hit: bool) -> None:
-        """全屏出现 → 隐藏；退出 → 恢复（window_screen.on_fullscreen_changed 等价）。"""
+        """全屏出现 → 隐藏；退出 → 恢复（window_screen.on_fullscreen_changed 等价）。
+
+        自动隐藏与手动隐藏同语义（4.3 后半）：隐藏期间 proactive/agent_link
+        一并 pause，恢复时 resume——legacy 的 ``host.hide()`` 走自定义 hide →
+        ``_pause_activity`` 正是这条链。
+        """
         logging.info("overlay: 全屏状态变化 hit=%s auto_hidden=%s",
                      hit, self._auto_hidden)
         if hit:
             if not self._auto_hidden and self.overlay.isVisible():
                 self._auto_hidden = True
+                self._hide_bubble_for_visibility()
                 self.overlay.hide()
+                self._pause_shared_subsystems()
         elif self._auto_hidden:
             self._auto_hidden = False
             self.overlay.show()
+            self._restore_sticky_bubble()
+            self._resume_shared_subsystems()
 
     def _cursor_transition_blocked(self) -> bool:
         """拖拽进行中（window._cursor_transition_blocked 等价）。"""
@@ -1062,30 +1660,48 @@ class OverlayShell(QObject):
         return bool(opener(_SettingsIdentity(self.sprite_instance_id(sprite))))
 
     def set_pet_visible(self, visible: bool) -> None:
-        """显隐切换（app.py toggle_visible 等价）+ 岛状态同步。"""
+        """显隐切换（app.py toggle_visible 等价）+ 岛状态同步 + 共享子系统 pause/resume。
+
+        4.3 后半：显隐钩子上接主动识屏/联动监视器的 pause/resume
+        （``window.py:1214-1250`` 语义）。隐藏时也收起气泡；恢复时把仍挂着的
+        粘滞提醒重新挂上（legacy ``_resume_activity`` 同款）。
+        """
         if visible:
             self.overlay.show()
             probe = getattr(self, "_probe", None)
             if probe is not None:
                 probe.resume()
+            self._restore_sticky_bubble()
+            self._resume_shared_subsystems()
         else:
+            self._hide_bubble_for_visibility()
             self.overlay.hide()
             probe = getattr(self, "_probe", None)
             if probe is not None:
                 probe.pause()
-            if getattr(self, "_bubble_follower", None) is not None:
-                bub = getattr(self._bubble_follower, "bubble", None)
-                if bub is not None:
-                    try:
-                        bub.hide()
-                    except Exception:
-                        pass
+            self._pause_shared_subsystems()
         island = getattr(getattr(self._instance, "shell", None), "island", None)
         if island is not None:
             try:
                 island.set_pet_visible(bool(visible))
             except Exception:
                 pass
+
+    def _hide_bubble_for_visibility(self) -> None:
+        """隐藏期收起气泡（气泡是置顶 Tool 窗，不随 overlay 隐藏）。"""
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None:
+            follower.hide()
+
+    def _restore_sticky_bubble(self) -> None:
+        """恢复显示：仍挂着的粘滞提醒重新挂上（legacy ``_resume_activity`` 同款）。"""
+        if not self._sticky_bubble_active or not self._sticky_text:
+            return
+        if self._speech_bubble is None:
+            return
+        self._show_bubble_text(self._sticky_text, 0,
+                              subtitle=self._sticky_subtitle, sticky=True,
+                              buttons=self._sticky_buttons)
 
     def _toggle_pet_visible(self) -> None:
         self.set_pet_visible(not self.overlay.isVisible())

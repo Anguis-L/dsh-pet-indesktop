@@ -391,9 +391,10 @@ def test_app_start_overlay_topology_takes_overlay_shell(tmp_path, monkeypatch):
     created = []
 
     class FakeOverlayShell:
-        def __init__(self, qapp, instance):
+        def __init__(self, qapp, instance, **kwargs):
             self.qapp = qapp
             self.instance = instance
+            self.kwargs = kwargs
             self.started = 0
             created.append(self)
 
@@ -415,6 +416,10 @@ def test_app_start_overlay_topology_takes_overlay_shell(tmp_path, monkeypatch):
     assert created[0].started == 1
     assert shell._overlay_shell is created[0]
     assert ui_calls == []                              # overlay 路径不建 PetWindow
+    # 4.3 后半：D0 常建的共享子系统注入 sprite 世界的壳（扇出目标）
+    assert shell._shared is not None
+    assert created[0].kwargs["agent_link_manager"] is shell._shared.agent_link
+    assert created[0].kwargs["proactive_watcher"] is shell._shared.proactive
 
 
 # ---------------------------------------------------------------- D0 门控解绑（T3）

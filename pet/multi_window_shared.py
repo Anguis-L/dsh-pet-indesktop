@@ -40,11 +40,31 @@ log = logging.getLogger("dsh-pet-standalone")
 _LIVE_SHARED_SUBSYSTEMS: "weakref.WeakSet[SharedSubsystems]" = weakref.WeakSet()
 
 
+def presentation_targets(shell) -> list:
+    """共享子系统的呈现扇出目标集合（T1 的 ``instances[].win`` 位置 + D0 另一半）。
+
+    legacy 拓扑 = 各窗 ``instances[].win``（PetWindow），逐行不变；overlay
+    拓扑下 ``instances[].win`` **恒为 None**（单合成窗里没有 PetWindow），
+    共享 manager 的扇出集合因此为空 = 联动/主动识屏静默缺失。sprite 世界的
+    等价物是 ``OverlayShell``：它提供 PetWindow 的呈现面（气泡/提醒/联动
+    动作/聚合状态），落点就是主 sprite 的头顶气泡与行为控制器。
+
+    ``_overlay_shell`` 在 ``AppShell.start()`` 才构造（晚于 SharedSubsystems
+    的 ``__init__``），故本函数必须在每次扇出时动态读取，绝不缓存。
+    兼容无该属性的替身 shell（测试 ``_ProxyShell``）。
+    """
+    overlay_shell = getattr(shell, "_overlay_shell", None)
+    if overlay_shell is not None:
+        return [overlay_shell]
+    return [inst.win for inst in shell.instances if inst.win is not None]
+
+
 class MultiWindowProxy:
     """单进程多窗的「窗集合替身」：把单窗接口扇出到全部窗。
 
     生命周期：作为共享 ``AgentLinkManager`` / ``ProactiveScreenWatcher`` 的
-    ``win`` 实参。只读 ``shell._instances``（含各窗 ``win``），不持有窗对象
+    ``win`` 实参。只读 ``shell`` 的呈现目标集合（``presentation_targets``：
+    legacy = ``instances[].win``，overlay = sprite 世界的壳），不持有窗对象
     引用；任一窗退出/重建后自动忽略它（逐窗探活读取）。
 
     呈现类方法只扇出到**可见**窗（隐藏窗不跳舞/不弹泡，与多进程各窗独立显隐
@@ -57,7 +77,8 @@ class MultiWindowProxy:
         self.cfg = shell.config
 
     def _windows(self) -> list:
-        return [inst.win for inst in self._shell.instances if inst.win is not None]
+        # overlay 拓扑 = sprite 世界的壳（presentation_targets 的注释）
+        return presentation_targets(self._shell)
 
     def _visible_windows(self) -> list:
         return [w for w in self._windows() if getattr(w, "isVisible", lambda: True)()]
@@ -251,6 +272,20 @@ class MultiWindowProxy:
         shared = getattr(self._shell, "_shared", None)
         return getattr(shared, "agent_link", None) if shared is not None else None
 
+    @property
+    def hidden_bubble_redirect(self):
+        """隐藏期气泡改道面（``window_alerts.redirect_hidden_bubble`` 读它）。
+
+        **仅 overlay 拓扑转发**：sprite 世界的壳（OverlayShell）提供该面，
+        agent_link 的联动气泡在隐藏期才能落到灵动岛反馈面（4.3 后半）。
+        legacy 拓扑返回 None——共享 proxy 此前不转发该属性，转发就是 legacy
+        行为变化（PetWindow 的注入面由各窗自持），不在本刀范围。
+        """
+        overlay_shell = getattr(self._shell, "_overlay_shell", None)
+        if overlay_shell is None:
+            return None
+        return getattr(overlay_shell, "hidden_bubble_redirect", None)
+
 
 class SharedAgentLinkManager(AgentLinkManager):
     """进程级共享的 ``AgentLinkManager``：呈现扇出 + 生命周期按「任窗仍存活」处理。
@@ -358,7 +393,14 @@ class SharedFullscreenWatcher(QObject):
         self._stop.set()
 
     def _windows(self) -> list:
-        return [inst.win for inst in self._shell.instances if inst.win is not None]
+        # overlay 拓扑下返回 sprite 世界的壳（presentation_targets 的注释）；
+        # 该壳**刻意不暴露** ``auto_hide_fullscreen`` / ``_watch_required`` /
+        # ``_cursor_hidden_passthrough_enabled``——overlay 壳自持一个
+        # ``FullscreenCursorWatcher``（4.1b），共享 watcher 若同时探测就是
+        # 双倍轮询（硬指标③回退）。三个 getattr 缺省为假 → ``_any_wants()``
+        # 恒 False → 探测线程保持 1s 空转，与 overlay 壳构造前（instances
+        # 为空）逐位等价。
+        return presentation_targets(self._shell)
 
     def _any_wants(self) -> bool:
         # 任一窗需要全屏自动隐藏或光标穿透（_watch_required 已含 Windows 平台判定）

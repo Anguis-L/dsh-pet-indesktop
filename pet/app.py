@@ -1694,7 +1694,16 @@ class AppShell:
         from .overlay_shell import is_overlay_topology
         if is_overlay_topology():
             from .overlay_shell import OverlayShell
-            self._overlay_shell = OverlayShell(self.app, self.instance)
+            # 4.3 后半：把进程级共享子系统（agent_link / proactive）注入 sprite
+            # 世界的壳——overlay 拓扑下 instances[].win 恒为 None，扇出目标就是
+            # 这个壳（见 multi_window_shared.presentation_targets）。D0 已保证
+            # overlay 拓扑下 _shared 常建；拿不到时传 None，壳内呈现面静默
+            # 空转（绝不因注入缺失阻断启动）。legacy 分支逐行不变。
+            shared = getattr(self, "_shared", None)
+            self._overlay_shell = OverlayShell(
+                self.app, self.instance,
+                agent_link_manager=getattr(shared, "agent_link", None),
+                proactive_watcher=getattr(shared, "proactive", None))
             self._overlay_shell.start()
         else:
             self._create_ui_with_character_fallback(character_id)
