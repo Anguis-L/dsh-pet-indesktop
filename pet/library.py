@@ -19,6 +19,7 @@ GifClip 基于 QMovie 播放透明 GIF（兼容旧 GIF 路线）。
 from __future__ import annotations
 
 import logging
+import queue
 import random
 import threading
 import time
@@ -39,6 +40,13 @@ _LIVE_MOVIE_LIBRARIES: weakref.WeakSet = weakref.WeakSet()
 
 # QMovie 播放速度补偿（%）：GIF 路线使用，校准 QMovie 偏慢问题
 PLAYBACK_SPEED = 120
+
+# 素材池低频兜底回收（内存瘦身第一刀）：每 10s 扫一遍"已停播且 reader 已退出"
+# 的 clip，把它们残留的解码帧队列与显示槽交还内存。事件驱动的回收已经挂在
+# movie()（切换动画 = 残留产生的时刻）上，本定时器只兜住"停播后再也没有新
+# clip 被创建"的场景（驻留宽限期满的原地等待、长时间单动画播放等）。
+# 单次成本 = 已创建 clip 数（≤素材总数）次属性读；实测 106 段素材下远低于 1ms。
+IDLE_FRAME_TRIM_INTERVAL_MS = 10_000
 
 
 class GifClip(QObject):
@@ -188,6 +196,11 @@ class MovieLibrary(QObject):
         self._low_warm_retry_timer.setSingleShot(True)
         self._low_warm_retry_timer.setInterval(50)
         self._low_warm_retry_timer.timeout.connect(self._warm_low_priority_background)
+        # 非播放中 clip 的残留帧回收（内存瘦身第一刀）：低频兜底定时器，随
+        # 低优先级预热排期开、随隐藏/关闭停（见 pause_warm / shutdown）。
+        self._idle_trim_timer = QTimer(self)
+        self._idle_trim_timer.setInterval(IDLE_FRAME_TRIM_INTERVAL_MS)
+        self._idle_trim_timer.timeout.connect(self._on_idle_trim)
         self.low_warm_batch_finished.connect(self._on_low_warm_batch_finished)
         self.media_type: str = 'webm'
         self.no_mirror: set[str] = self._load_no_mirror()
@@ -509,6 +522,7 @@ class MovieLibrary(QObject):
         self._warm_paused = True
         self._low_warm_timer.stop()
         self._low_warm_retry_timer.stop()
+        self._idle_trim_timer.stop()  # 隐藏即停：池级回收也没有可见收益
         self._warm_generation += 1
         # 取消在飞的首帧预热（B7 审查 P1-2）：其拉起的 ffmpeg 进程随 clip 侧
         # 取消（换代 + 主动 terminate）回收，隐藏/切角色后不再有不受控的
@@ -778,6 +792,77 @@ class MovieLibrary(QObject):
         if not self._prewarm_enabled:
             return
         self._low_warm_timer.start()
+        # 预热排期即代表进程进入"会反复切换动画"的常态：启动池级残留回收。
+        if not self._idle_trim_timer.isActive():
+            self._idle_trim_timer.start()
+
+    # ------------------------------------------------------------------ 池级回收
+    def _on_idle_trim(self) -> None:
+        """定时器槽：低频兜底回收（异常绝不逃逸到 Qt 事件循环）。"""
+        try:
+            self.release_idle_frames()
+        except Exception:
+            logging.getLogger(__name__).debug('素材池残留帧回收失败', exc_info=True)
+
+    @staticmethod
+    def _drain_clip_queue(clip) -> int:
+        """排空一个 clip 的帧队列，返回释放的字节数（坏对象按 0 计）。"""
+        handle = getattr(clip, '_queue', None)
+        if handle is None:
+            return 0
+        freed = 0
+        while True:
+            try:
+                item = handle.get_nowait()
+            except queue.Empty:
+                return freed
+            except Exception:
+                return freed  # 半销毁对象：能从队列里拿多少算多少
+            if item is None:
+                continue  # 圈末结束标记本身不占像素
+            try:
+                freed += len(item[0])
+            except Exception:
+                continue
+
+    def release_idle_frames(self) -> int:
+        """回收"已停播且 reader 已退出"的 clip 残留解码帧，返回释放字节数。
+
+        实测依据（.scratch/mem-probe/base-overlay-trace，tracemalloc 口径 B）：
+        稳态 50.1MB Python 堆集中在 ``pet/webm_clip.py:2545``（``next(it)`` 解出的
+        RGBA 帧）共 57 块 —— 66 段素材被切走后各攥着一条 8 帧队列（8×0.879MB）。
+
+        不变量与功能等价（为什么这一刀不换功能）：
+        - 队列只被该 clip 自己的 QTimer(_poll) 消费；clip 不在播 = 定时器已停，
+          这些帧物理上不可能再被任何路径读到；
+        - webm_clip.start() 每次都重建 ``_queue``（maxsize=8），下一次播放拿到的
+          是全新队列，不依赖旧队列里的任何一帧；
+        - 圈末软停驻留（_soft_parked，等 re-arm 续圈）时 reader 仍存活，被
+          "reader 已退出"判据排除；宽限期满 reader 自行退出后，re-arm 已不可能
+          成功（_rearm_loop_reader 判 is_alive），start() 必走全新队列路径；
+        - 显示槽只在非软停驻留的 clip 上清空（与 webm_clip.clear_display_frame
+          的既有契约一致："软停驻留（park）绝不清"）；桌宠真正显示的是
+          PetSprite 自己那份 pixmap，清空已停播 clip 的显示槽无可见变化。
+        """
+        freed = 0
+        for clip in tuple(self._movies.values()):
+            try:
+                if getattr(clip, '_running', False):
+                    continue  # 在播：队列是活数据
+                thread = getattr(clip, '_thread', None)
+                if thread is not None and thread.is_alive():
+                    continue  # reader 未退出（含圈末驻留）：队列仍会被续写
+                freed += self._drain_clip_queue(clip)
+                if not getattr(clip, '_soft_parked', False):
+                    clear = getattr(clip, 'clear_display_frame', None)
+                    if callable(clear):
+                        clear()
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    '回收 %s 的残留帧失败', getattr(clip, 'path', '?'), exc_info=True,
+                )
+                continue
+        return freed
 
     def stop_all_clips(self) -> None:
         """停止全部已建 clip 的 reader（会话结束/关机专用，issue #111）。
@@ -921,8 +1006,16 @@ class MovieLibrary(QObject):
 
         这样多开实例不会在启动瞬间一次性 new 出 91 个播放器对象；
         随机动作池由 _warm_low_priority_background 在启动后 2s 补全。
+
+        新建 clip = 动画切换点：顺手回收兄弟 clip 的残留解码帧
+        （release_idle_frames，内存瘦身第一刀的事件驱动触发点）。回收只动
+        "不在播且 reader 已退出"的 clip，正在播的对象与本 clip 都不受影响。
         """
         if name not in self._movies:
+            try:
+                self.release_idle_frames()
+            except Exception:
+                logging.getLogger(__name__).debug('切换动画时回收残留帧失败', exc_info=True)
             frameseq_dir = self._frameseq_dirs.get(name)
             if frameseq_dir is not None:
                 # 热集帧序列：无 ffmpeg 进程/spawn 冷启动/看门狗（B 档）
