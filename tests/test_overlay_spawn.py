@@ -2,8 +2,8 @@
 """4.2a 位置持久化 + 4.2b 多 sprite 生灭 offscreen 单测。
 
 覆盖：rx/ry 恢复与保存（身体中心比例口径）、无记录落右下角、facing 恢复、
-spawn 增 sprite（per-pet 库/行为接管/错开落位）、clear 全清（clip 释放/
-库 shutdown/行为注销）、菜单 spawn 入口。
+spawn 增 sprite（per-pet 库/行为接管/错开落位）、D1 clip 所有权隔离、clear
+全清（clip 释放/库 shutdown/行为注销）、菜单 spawn 入口。
 """
 from __future__ import annotations
 
@@ -85,6 +85,34 @@ def test_spawn_and_clear_pets(tmp_path):
         # 行为状态已注销（V-9 挂点）
         for s in libs:
             pass
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_spawn_pet_clips_are_per_sprite_owned(tmp_path):
+    """D1 clip 所有权守卫：同名 clip 在每个 sprite 上必须是不同对象。
+
+    设计稿 T3/D1：共享 clip = 一速多宠锁步/互相冻结（demo 已修）。产品侧由
+    spawn_pet 的 per-pet MovieLibrary 保证——本测试锁定该语义：主 sprite 与
+    两个子 sprite 各自 bind 同名 ``idle1`` 后，库对象与 clip 对象都不得同一。
+    """
+    shell, main_lib = fac._make_shell(tmp_path)
+    try:
+        made = []
+        shell._create_main_library = lambda: (made.append(1), fac.RichLibrary())[1]
+        shell.spawn_pet()
+        shell.spawn_pet()
+        assert len(made) == 2                       # per-pet 库（T3）
+        sprites = [shell.sprite, *shell._spawned]
+        clips = []
+        for sprite in sprites:
+            sprite.bind_clip("idle1")
+            clip = sprite.library.movie("idle1")
+            assert sprite._clip is clip             # bind 取自本 sprite 的库
+            clips.append(clip)
+        # 同角色的同名 clip 不允许跨 sprite 共享同一播放器对象
+        assert len({id(c) for c in clips}) == len(sprites)
+        assert all(s.library is not main_lib for s in shell._spawned)
     finally:
         shell._delete_runtime_marker()
 

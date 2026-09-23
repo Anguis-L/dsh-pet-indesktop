@@ -1100,15 +1100,26 @@ class AppShell:
         # config-slot-N.json 里该键不再有任何作用，运行期手改 config.json
         # 翻 flag 也因此失效（需重启）。
         self._single_process_spawn = bool(config.get('experimental_single_process_spawn', False))
+        # D0 门控解绑（PHASE4_DESIGN T3）：overlay 拓扑下 hub 必须**常开**——
+        # 多 sprite 同角色若各自建链会退化成 N 路独立 ffmpeg（硬指标③回退）。
+        # 拓扑判定唯一入口收口在 overlay_shell.is_overlay_topology（T5 的 dev
+        # 环境变量，不进 Config/设置页/schema）；legacy 拓扑读 False，下面的
+        # 使能表达式与批5.3 逐行等价（行为零变化）。
+        from .overlay_shell import is_overlay_topology
+        overlay_topology = is_overlay_topology()
         # 批5.3：进程级共享解码 hub（同角色帧扇出）——`experimental_shared_decode`
-        # 默认开，但 `experimental_single_process_spawn` 关时整条 fan-out 不激活
-        #（单窗无共享可言）。门关 = 每窗各自独立解码（批5.2 形态，hub 恒回 local）。
+        # 默认开，但使能门 = `experimental_single_process_spawn` **或 overlay 拓扑**；
+        # 两者皆关时整条 fan-out 不激活（单窗无共享可言）。门关 = 每窗各自独立
+        # 解码（批5.2 形态，hub 恒回 local）。
         self._decode_hub = DecodeFanoutHub(
             enabled=bool(config.get('experimental_shared_decode', True))
-            and self._single_process_spawn)
+            and (self._single_process_spawn or overlay_topology))
         # 批5.2a §③.1/.2：flag 开时进程级共享子系统（agent_link / proactive /
         # 全屏 watcher），各窗经 PetWindow 构造参数引用同一份，崩溃/换角色不重建；
         # flag 关时保持 None = 每窗各自创建（现状逐位一致）。
+        # D0 解绑（T3）：overlay 拓扑下同样**常建**——sprite 拓扑里共享子系统
+        # 缺位即静默缺失（agent_link/主动识屏/全屏 watcher 无人承载）。门控 =
+        # flag 或 overlay 拓扑；legacy 且 flag 关仍为 None（逐行不变）。
         #（位置在 _instances 就绪之后，共享 manager 构造期即遍历窗集合）。
         self._shared = None
         # 批5.2 P1-1：碰撞会话/broker 移回各 PetInstance 自持（不再由 AppShell 持有）；
@@ -1131,7 +1142,7 @@ class AppShell:
             slot_id=slot_id, spawn_offset=spawn_offset,
         )
         self._instances.append(self.instance)
-        if self._single_process_spawn:
+        if self._single_process_spawn or overlay_topology:
             from .multi_window_shared import SharedSubsystems
 
             self._shared = SharedSubsystems(self)
