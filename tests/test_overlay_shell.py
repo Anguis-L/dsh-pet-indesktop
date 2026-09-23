@@ -479,3 +479,19 @@ def test_shell_wires_edge_probe_world():
     assert probe.bounds == new_bounds
     # sprite 移除监听已挂 probe.forget
     assert shell._probe.forget in shell.overlay._sprite_removed_listeners
+
+
+def test_shell_wires_throw_egg_world():
+    """throw_egg 接线：世界挂 driver extras（probe 之后）+ 碰撞真撞击 arm 链 +
+    sprite 移除注销 + bounds 同步。"""
+    shell, screen, _ = _make_shell()
+    egg = shell._throw_egg
+    assert egg is not None
+    assert egg in shell.driver._extras
+    # extras 顺序：probe 先（cancel 会话）、egg 后（读物理结算速度）
+    assert shell.driver._extras.index(shell._probe) < shell.driver._extras.index(egg)
+    assert egg.forget in shell.overlay._sprite_removed_listeners
+    from PySide6.QtCore import QRect
+    new_bounds = QRect(0, 0, 1280, 720)
+    shell._apply_bounds(new_bounds)
+    assert egg.bounds == new_bounds

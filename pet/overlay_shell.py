@@ -195,6 +195,12 @@ class OverlayShell(QObject):
         self._probe = create_edge_probe_world(self._config, QRect(self._bounds))
         self.driver.add_extra_controller(self._probe)
         self.collision.add_collision_listener(self._on_collision_probe)
+        # throw_egg 彩蛋：探头被撞飞头部跟随速度（extras 尾段，读物理结算后
+        # 的速度——落地兜底依赖 physics 已切回 normal，顺序天然满足）
+        from .sprite_throw_egg import create_throw_egg_world
+        self._throw_egg = create_throw_egg_world(
+            QRect(self._bounds), probe=self._probe)
+        self.driver.add_extra_controller(self._throw_egg)
         self.overlay = ShellOverlayWindow(self._screen, driver=self.driver)
         self.overlay.behavior = self.behavior
         self.overlay.edge_probe = self._probe
@@ -214,6 +220,7 @@ class OverlayShell(QObject):
         # 4.2b：sprite 移除时注销行为状态（spawn/退出子肥鱼的清理链）
         self.overlay.add_sprite_removed_listener(self.behavior.forget)
         self.overlay.add_sprite_removed_listener(self._probe.forget)
+        self.overlay.add_sprite_removed_listener(self._throw_egg.forget)
         # 4.2a：按 rx/ry 比例恢复上次位置（无记录 → 默认右下角）
         self._restore_position()
         # 4.1c 投喂（拖文件喂 sprite，命中判定与穿透同口径）
@@ -579,16 +586,22 @@ class OverlayShell(QObject):
                     squash()
 
     def _on_collision_probe(self, event) -> None:
-        """碰撞真撞击 → 边缘探头取消会话（旧机 collision_client 取消链语义）。"""
+        """碰撞真撞击 → 边缘探头取消会话（旧机 collision_client 取消链语义）
+        + throw_egg arm（探头被撞飞头部跟随速度）。"""
         if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
             return
         probe = getattr(self, "_probe", None)
-        if probe is None:
+        egg = getattr(self, "_throw_egg", None)
+        if probe is None and egg is None:
             return
         from .sprite_collision import SpriteCollisionWorld
         for sprite in self.overlay.sprites:
             if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
-                probe.on_sprite_collision_hit(sprite)
+                if probe is not None:
+                    probe.on_sprite_collision_hit(sprite)
+                if egg is not None:
+                    # 必须在探头 cancel 之后：靠重进倒计时识别探头会话
+                    egg.on_probe_collision_throw(sprite)
 
     def _say_feeding_bubble(self, files: int, folders: int,
                             total_bytes: int, stats: dict) -> None:
@@ -619,6 +632,9 @@ class OverlayShell(QObject):
         current = str(self._config.get("character", catalog.DEFAULT_CHARACTER))
         if not character_id or character_id == current:
             return
+        egg = getattr(self, "_throw_egg", None)
+        if egg is not None:
+            egg.cancel_all("character_switch")  # 换角色即换素材，飞行会话兜底回正
         try:
             new_lib = self._instance._create_library(character_id)
         except Exception:
@@ -698,6 +714,9 @@ class OverlayShell(QObject):
         probe = getattr(self, "_probe", None)
         if probe is not None:
             probe.set_bounds(QRect(new_bounds))
+        egg = getattr(self, "_throw_egg", None)
+        if egg is not None:
+            egg.set_bounds(QRect(new_bounds))
 
     def _migrate_sprite_position(self, old_bounds: QRect, new_bounds: QRect) -> None:
         """rx/ry 语义迁移：sprite 中心相对可用区的比例在几何变化前后不变
