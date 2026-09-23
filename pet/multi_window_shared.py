@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """批5.2a：单进程多窗的进程级共享子系统（agent_link / proactive / 全屏 watcher）。
 
-feature flag ``experimental_single_process_spawn`` 关（现状）时本模块不被实例化
-——每窗各自创建子系统，行为与 a2a3fc5 逐位一致（回退保险）。flag 开（多窗）时
-``AppShell`` 持有一个共享实例，把呈现/探测事件**扇出**到全部窗，同时只运行一份
-监视器/探测线程（省 (N-1) 份重复的后台轮询）。
+4.4b：多进程多宠退役层删除后本模块**常开化**（T6）——``AppShell`` 恒持有一个
+共享实例，把呈现/探测事件**扇出**到全部窗，同时只运行一份监视器/探测线程
+（省 (N-1) 份重复的后台轮询）。历史上由 ``experimental_single_process_spawn``
+feature flag 门控（flag 关 = 每窗各自创建）；该键已随退役层删除。
 
 设计要点（对应 BATCH5_SINGLE_PROCESS_DESIGN §4.7 / §4.8 / §8）：
 - **agent_link**：AppShell 持有一个共享 ``AgentLinkManager``，经 ``MultiWindowProxy``

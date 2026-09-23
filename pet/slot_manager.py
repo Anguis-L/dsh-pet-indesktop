@@ -1,7 +1,23 @@
 # -*- coding: utf-8 -*-
-"""桌宠槽位管理与跨平台文件锁协议。
+"""桌宠槽位身份、配置播种与旧 spawn 迁移。
 
-实现多开桌宠的槽位竞争、内核排他锁、配置播种与旧 spawn 迁移。
+4.4b（PHASE4_DESIGN §3 T6）：多进程多宠退役层删除后，本模块**不再承载**
+跨进程 slot 文件锁（``acquire_pet_slot`` / ``acquire_file_lock`` /
+``_try_acquire_slot_lock`` / 定长 PID 记录 / ``SlotLockError`` /
+``SlotManagerError``）——多宠身份改由 overlay 拓扑的 D6 无锁分配器
+（``overlay_spawn_state.allocate_slot``）与进程内窗身份承担。
+
+保留面（T6 明确「不能整删」）：
+
+- ``backup_corrupt_config``：``Config._load`` 的核心依赖（损坏配置备份）；
+- ``seed_slot_config_from_main`` / ``get_config_path_for_slot`` /
+  ``get_sessions_dir_for_slot``：新身份落种（首启迁移仍需跑）；
+- ``migrate_legacy_spawns``：旧 ``config-spawn*.json`` → ``config-slot-N.json``
+  一次性原子迁移；
+- ``slot_to_instance_id``：slot 编号 ↔ 配置身份（overlay 壳 D13 复用）；
+- **runtime 标记 API**（``write/delete/read_live_instances`` 等）：D7 设置进程
+  避让几何通道，overlay 壳与独立设置进程共用，不属退役层。
+
 纯 Python 实现，不依赖 Qt。
 """
 from __future__ import annotations
@@ -10,201 +26,14 @@ import copy
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
-import re
 from pathlib import Path
-from typing import Any, BinaryIO
 
 from . import catalog
 from .config import _bool_or_default
-
-# 定长 PID 格式（16字节，右补空格与换行）
-PID_RECORD_LEN = 16
-LOCK_BYTE_COUNT = 1
-
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
-
-
-class SlotLockError(Exception):
-    """槽位锁获取异常。"""
-
-
-class SlotManagerError(Exception):
-    """槽位管理通用异常。"""
-
-
-def get_slot_lock_path(config_dir: Path | str, slot_id: int) -> Path:
-    """返回槽位对应的锁文件路径：<config_dir>/slots/slot-{N}.lock"""
-    return Path(config_dir) / "slots" / f"slot-{slot_id}.lock"
-
-
-def _try_lock_file(file_obj: BinaryIO) -> bool:
-    """尝试对打开的文件对象取得 1 字节排他锁（非阻塞）。"""
-    fileno = file_obj.fileno()
-    if sys.platform == "win32":
-        try:
-            file_obj.seek(0)
-            msvcrt.locking(fileno, msvcrt.LK_NBLCK, LOCK_BYTE_COUNT)
-            return True
-        except (OSError, IOError):
-            return False
-    else:
-        try:
-            file_obj.seek(0)
-            fcntl.flock(fileno, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except (BlockingIOError, OSError, IOError):
-            return False
-
-
-def _unlock_file(file_obj: BinaryIO) -> None:
-    """释放锁并关闭文件。"""
-    try:
-        fileno = file_obj.fileno()
-        if sys.platform == "win32":
-            file_obj.seek(0)
-            msvcrt.locking(fileno, msvcrt.LK_UNLCK, LOCK_BYTE_COUNT)
-        else:
-            fcntl.flock(fileno, fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
-        file_obj.close()
-    except Exception:
-        pass
-
-
-def _format_pid_record(pid: int) -> bytes:
-    """生成定长 16 字节 PID 记录。"""
-    text = f"{pid}\n"
-    raw = text.encode("ascii", errors="replace")
-    if len(raw) < PID_RECORD_LEN:
-        raw = raw + b" " * (PID_RECORD_LEN - len(raw))
-    else:
-        raw = raw[:PID_RECORD_LEN]
-    return raw
-
-
-def _open_lock_file(path: Path) -> BinaryIO:
-    """Open or create a lock file and ensure the lock byte exists.
-
-    The absolute truncate is intentionally idempotent.  Multiple first-time
-    openers may all observe size zero before any of them acquires the kernel
-    lock; appending the observed deficit would grow the file to 32+ bytes.
-    """
-    fd = os.open(path, os.O_RDWR | os.O_CREAT)
-    handle = os.fdopen(fd, "r+b")
-    try:
-        size = os.fstat(fd).st_size
-        if size < PID_RECORD_LEN:
-            os.ftruncate(fd, PID_RECORD_LEN)
-        handle.seek(0)
-        return handle
-    except Exception:
-        handle.close()
-        raise
-
-
-def _write_pid_record(file_obj: BinaryIO) -> None:
-    """Write this process PID and restore the fixed-size lock-file format."""
-    file_obj.seek(0)
-    file_obj.write(_format_pid_record(os.getpid()))
-    file_obj.flush()
-    os.ftruncate(file_obj.fileno(), PID_RECORD_LEN)
-    file_obj.seek(0)
-
-
-def _try_acquire_slot_lock(config_dir: Path, slot_id: int) -> BinaryIO | None:
-    """尝试获取指定 slot_id 的文件锁并写入定长 PID。成功返回 open 句柄，失败返回 None。"""
-    lock_path = get_slot_lock_path(config_dir, slot_id)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        f = _open_lock_file(lock_path)
-    except OSError:
-        return None
-
-    # 尝试加锁 1 字节排他锁
-    if not _try_lock_file(f):
-        try:
-            f.close()
-        except Exception:
-            pass
-        return None
-
-    # 加锁成功后，写入定长 PID 记录到文件头并 flush
-    try:
-        _write_pid_record(f)
-    except OSError:
-        _unlock_file(f)
-        return None
-
-    return f
-
-
-def acquire_file_lock(lock_path: Path | str) -> BinaryIO | None:
-    """Try to acquire the shared one-byte kernel lock at an arbitrary path."""
-    path = Path(lock_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        handle = _open_lock_file(path)
-    except OSError:
-        return None
-    if not _try_lock_file(handle):
-        handle.close()
-        return None
-    try:
-        _write_pid_record(handle)
-    except OSError:
-        _unlock_file(handle)
-        return None
-    return handle
-
-
-def release_file_lock(handle: BinaryIO | None) -> None:
-    if handle is not None:
-        _unlock_file(handle)
-
-
-def acquire_pet_slot(
-    config_dir: Path | str,
-    preferred_slot: int | None = None,
-    max_scan_slots: int = 128,
-) -> tuple[int, BinaryIO]:
-    """获取桌宠槽位及排他锁句柄。
-
-    参数:
-        config_dir: 配置根目录（例如 APPDATA/dsh-pet-standalone）
-        preferred_slot: 若指定 slot（如 0 或命令行 --slot N），只尝试该槽位，失败直接抛 SlotLockError
-        max_scan_slots: 自动扫描时的最大槽位数上限
-
-    返回:
-        (slot_id, lock_handle)
-
-    异常:
-        SlotLockError: 指定槽位被占用或无法获取锁
-        SlotManagerError: 无可用空闲槽位
-    """
-    config_path = Path(config_dir)
-
-    if preferred_slot is not None:
-        handle = _try_acquire_slot_lock(config_path, preferred_slot)
-        if handle is None:
-            raise SlotLockError(f"槽位 slot-{preferred_slot} 已被占用或无法获取锁")
-        return preferred_slot, handle
-
-    # 未指定时按 0, 1, 2, ... 顺序竞争
-    for slot_id in range(max_scan_slots):
-        handle = _try_acquire_slot_lock(config_path, slot_id)
-        if handle is not None:
-            return slot_id, handle
-
-    raise SlotManagerError(f"在前 {max_scan_slots} 个槽位中未找到可用空闲槽位")
 
 
 def slot_to_instance_id(slot_id: int) -> str:
@@ -337,20 +166,13 @@ def _recover_migration_staging(config_path: Path, staging_dir: Path) -> bool:
     为保证幂等与安全：
     staging 中的 target 格式文件（如 config-slot-N.json），若目标路径不存在则移入目标路径；若目标已存在则忽略。
     清理完成后移除 staging 目录。
+    4.4b：目标槽位文件锁已退役——「是否可落位」只看目标是否已存在。
     """
     if not staging_dir.is_dir():
         return True
     remaining = False
     for item in list(staging_dir.iterdir()):
         target = config_path / item.name
-        match = re.match(r"(?:config|sessions)-slot-(\d+)", item.name)
-        lock_handle = None
-        if match:
-            lock_handle = _try_acquire_slot_lock(config_path, int(match.group(1)))
-            if lock_handle is None:
-                logging.warning("恢复 staging 时目标槽位被占用，保留残留: %s", item)
-                remaining = True
-                continue
         try:
             if target.exists():
                 logging.warning("恢复 staging 时目标已存在，保留残留: %s", item)
@@ -360,9 +182,6 @@ def _recover_migration_staging(config_path: Path, staging_dir: Path) -> bool:
         except Exception as exc:
             logging.warning("恢复 staging 文件失败: %s -> %s (%s)", item, target, exc)
             remaining = True
-        finally:
-            if lock_handle is not None:
-                _unlock_file(lock_handle)
     if not remaining:
         try:
             staging_dir.rmdir()
@@ -375,10 +194,10 @@ def migrate_legacy_spawns(config_dir: Path | str) -> bool:
     """将旧版 config-spawn*.json 和 sessions-spawn*/ 原子迁移到 slot-1, slot-2, ...。
 
     约束:
-    1. 仅在确认没有运行中的旧 spawn 实例时进行；
+    1. 仅在确认没有运行中的旧 spawn 实例时进行（runtime 标记探活）；
     2. 按旧 config 的 mtime 升序稳定排序，依次映射到 slot-1, slot-2, ...；
     3. config 与对应 sessions 作为原子迁移单元，使用 staging 临时目录回滚；
-    4. 目标槽位需尝试获取该槽位锁，被占用则跳过该槽位（保留原文件，记 warning）；
+    4. 目标槽位已有文件则跳过该槽位（保留原文件，记 warning）；
     5. config 已移到目标后 sessions 移动失败必须把目标 config 移回原路径（完整回滚）；
     6. 启动时检测到 .migration_staging 非空，先恢复或回滚上次中断的迁移；
     7. 完成后写入 migration-spawns.done 标记文件；
@@ -406,30 +225,15 @@ def migrate_legacy_spawns(config_dir: Path | str) -> bool:
             pass
         return True
 
-    # 检查是否有旧实例正在运行（通过 runtime marker 探测；同时认旧名与
+    # 检查是否有旧实例正在运行（通过 runtime marker 探活；同时认旧名与
     # 批5.2 版本化新名，否则多进程模式的新标记匹配不到、迁移被误放行）
     for runtime_file in list_runtime_marker_files(config_path):
         try:
             data = json.loads(runtime_file.read_text(encoding="utf-8"))
             pid = data.get("pid")
-            if pid and isinstance(pid, int):
-                # 检查进程是否存活
-                if sys.platform == "win32":
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-                    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-                    if h:
-                        kernel32.CloseHandle(h)
-                        logging.warning("检测到正在运行的桌宠进程 (PID: %s)，跳过旧 spawn 迁移", pid)
-                        return False
-                else:
-                    try:
-                        os.kill(pid, 0)
-                        logging.warning("检测到正在运行的桌宠进程 (PID: %s)，跳过旧 spawn 迁移", pid)
-                        return False
-                    except OSError:
-                        pass
+            if pid and isinstance(pid, int) and pid_alive(pid):
+                logging.warning("检测到正在运行的桌宠进程 (PID: %s)，跳过旧 spawn 迁移", pid)
+                return False
         except Exception:
             pass
 
@@ -452,23 +256,16 @@ def migrate_legacy_spawns(config_dir: Path | str) -> bool:
             logging.warning("旧 spawn 配置损坏，跳过迁移: %s (%s)", old_cfg, exc)
             continue
 
-        # 寻找下一个目标 slot 文件不存在且能取得锁的 slot ID
-        target_lock_handle = None
+        # 寻找下一个目标 slot 文件不存在的 slot ID
         target_cfg = None
         target_sessions = None
         while True:
             t_cfg = get_config_path_for_slot(config_path, slot_idx)
             t_sessions = get_sessions_dir_for_slot(config_path, slot_idx)
             if not t_cfg.exists() and not t_sessions.exists():
-                # 尝试取得目标槽位锁
-                lock_h = _try_acquire_slot_lock(config_path, slot_idx)
-                if lock_h is not None:
-                    target_lock_handle = lock_h
-                    target_cfg = t_cfg
-                    target_sessions = t_sessions
-                    break
-                else:
-                    logging.warning("槽位 slot-%s 已被占用，跳过该槽位", slot_idx)
+                target_cfg = t_cfg
+                target_sessions = t_sessions
+                break
             slot_idx += 1
 
         # 执行单元原子移动（先 staging 再 target）
@@ -507,9 +304,6 @@ def migrate_legacy_spawns(config_dir: Path | str) -> bool:
             except Exception as rollback_exc:
                 logging.error("回滚迁移单元失败: %s (%s)", old_cfg, rollback_exc)
             success_all = False
-        finally:
-            if target_lock_handle is not None:
-                _unlock_file(target_lock_handle)
 
     try:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -548,6 +342,8 @@ def pid_alive(pid: int) -> bool:
 # 旧版（runtime-<pid>.json）用 glob('runtime-*.json') 读取；为避免新旧混跑时
 # 旧版把新版标记也计入「存活实例」而虚高计数（多开位置避让被干扰），新版标记
 # 改用不与 'runtime-*.json' 匹配的 pet-runtime-v2-<pid>-slot-<N>.json 前缀。
+# 4.4b：本 API 是 D7 设置进程避让几何通道（overlay 壳写、独立设置进程读），
+# 与多进程多宠退役层无关，保留。
 _RUNTIME_V2_PREFIX = "pet-runtime-v2-"
 
 
@@ -563,7 +359,7 @@ def _slot_label(instance_id: str) -> str:
 
 def runtime_marker_name(instance_id: str = "", *, versioned: bool = False) -> str:
     """返回某窗 runtime 标记文件名。versioned=False 用旧名
-    runtime-<pid>.json（单窗/flag 关时保持旧行为）；True 用版本化新名
+    runtime-<pid>.json（单窗时保持旧行为）；True 用版本化新名
     pet-runtime-v2-<pid>-slot-<N>.json（批5.2 多窗，规避旧 glob 匹配）。"""
     pid = os.getpid()
     if versioned:
@@ -580,7 +376,7 @@ def runtime_marker_path(config_dir: Path | str, instance_id: str = "",
 def write_runtime_marker(config_dir: Path | str, instance_id: str,
                          x: int, y: int, w: int, h: int,
                          *, versioned: bool = False) -> Path:
-    """写入本窗 runtime 标记（旧格式仅主窗/pflag 关时用；versioned 多窗用）。
+    """写入本窗 runtime 标记（旧格式仅主窗用；versioned 多窗用）。
 
     写版本化标记时顺手清掉同 pid 的旧格式标记，避免同进程混用重复计数。
     """
@@ -618,8 +414,7 @@ def list_runtime_marker_files(config_dir: Path | str) -> list[Path]:
     """列出 config 目录内全部 runtime 标记文件。
 
     同时认旧名 ``runtime-<pid>.json`` 与批5.2 版本化新名
-    ``pet-runtime-v2-<pid>-slot-<N>.json``。清理/迁移必须覆盖两种命名，否则
-    多进程模式下的新标记（只写 v2 名）匹配不到、子进程杀不掉/迁移被误放行。
+    ``pet-runtime-v2-<pid>-slot-<N>.json``。
     """
     root = Path(config_dir)
     try:
@@ -639,11 +434,11 @@ def read_live_instances(
 ) -> list[tuple[int, int, int, int, int]]:
     """读取目录内 runtime 标记，返回存活实例 (pid, x, y, w, h) 列表。
 
-    同时认旧（runtime-<pid>.json）与批5.2 新（pet-runtime-v2-*）两种命名
+    同时认旧（runtime-<pid>.json）与新（pet-runtime-v2-*）两种命名
     （避让定位兼容新旧混跑）。死进程 pid、损坏 JSON、字段非法的标记顺手
     删除（避免越积越多）；exclude_markers（本窗自己的标记路径/文件名）跳过
-    且保留——批5.2 多窗同 pid 下不能再用 exclude_pid 这种按 pid 过滤的
-    方式（会把同进程所有窗都排除）。pid_alive_fn 可注入（测试用）。
+    且保留——同 pid 多窗下不能再用 exclude_pid 这种按 pid 过滤的方式
+    （会把同进程所有窗都排除）。pid_alive_fn 可注入（测试用）。
     """
     alive = pid_alive_fn if pid_alive_fn is not None else pid_alive
     try:

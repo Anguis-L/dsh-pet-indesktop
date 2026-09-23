@@ -375,7 +375,7 @@ def launch_harness(port: int = DEFAULT_PORT, *, open_browser: bool = True) -> tu
 # 关闭它的唯一入口——以前关掉那个可见控制台窗口就等于关服务，现在窗口不存在了。
 
 # 命令行必须命中的特征：dsh 的包名/可执行名 + web 子命令。这是防「pid 复用
-# 误杀」的身份核验（实机教训见 child_pet_cleanup 里对 pid 复用的核验注释）。
+# 误杀」的身份核验（实机教训：杀前必须核对命令行/可执行路径，不能只看 pid）。
 _HARNESS_CMDLINE_TOKENS = ("dsh", "web")
 
 
@@ -600,7 +600,7 @@ def describe_harness_process(port: int = DEFAULT_PORT) -> HarnessProcess | None:
 def _terminate_process_tree(pid: int) -> None:
     """终止进程及其子进程树（Windows taskkill /T /F；POSIX 按进程组先 TERM 后 KILL）。
 
-    与 child_pet_cleanup._terminate_pet_process 同款：Windows 上的 .cmd shim
+    Windows 上的 .cmd shim
     会让 dsh 以「cmd → node」两层形态存在，/T 才能收干净；CREATE_NO_WINDOW
     防止 GUI 进程里凭空弹一个空白控制台窗口（实机反馈）。
     POSIX 上 dsh 常为「npx → node」两层：只 kill 顶层 pid 会留下 node 子进程，
@@ -654,8 +654,8 @@ def is_running_pid(pid: int) -> bool:
     """进程是否仍存活（供停止后确认用）。
 
     Windows 用 GetExitCodeProcess==STILL_ACTIVE：OpenProcess 能打开并不代表
-    进程活着（父进程持有句柄时，已死的子进程仍可被打开）——这条实机教训写在
-    child_pet_cleanup._pid_alive 的注释里，这里沿用同一判定。
+    进程活着（父进程持有句柄时，已死的子进程仍可被打开）——实机教训，
+    故这里以退出码判定而非"能否打开句柄"。
     """
     if pid <= 0:
         return False

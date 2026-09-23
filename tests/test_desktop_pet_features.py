@@ -604,36 +604,6 @@ def test_icon_composition_ignores_low_alpha_noise_and_fills_canvas():
     assert max(bbox[2] - bbox[0], bbox[3] - bbox[1]) >= 248
 
 
-def test_new_pet_command_relaunches_current_frozen_executable(monkeypatch):
-    from pet import instance_launcher
-
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", "/Applications/dsh-pet.app/Contents/MacOS/dsh-pet")
-    assert instance_launcher.new_pet_command() == [sys.executable]
-
-
-def test_launch_new_pet_uses_detached_process(monkeypatch):
-    from pet import instance_launcher
-
-    captured = {}
-
-    def fake_popen(command, **kwargs):
-        captured["command"] = command
-        captured["kwargs"] = kwargs
-        return object()
-
-    monkeypatch.setattr(instance_launcher, "new_pet_command", lambda: ["pet-program"])
-    monkeypatch.setattr(instance_launcher.subprocess, "Popen", fake_popen)
-    instance_launcher.launch_new_pet()
-
-    assert captured["command"] == ["pet-program"]
-    assert captured["kwargs"]["env"]["DSH_PET_SPAWN_OFFSET_INDEX"] == "1"
-    if sys.platform == "win32":
-        assert captured["kwargs"]["creationflags"]
-    else:
-        assert captured["kwargs"]["start_new_session"] is True
-
-
 def test_pet_app_assigns_distinct_offsets_to_spawned_pets(tmp_path, monkeypatch):
     from PySide6.QtWidgets import QApplication
 

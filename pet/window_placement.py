@@ -158,8 +158,14 @@ def pid_alive(pid: int) -> bool:
 
 
 def runtime_marker_versioned(host: Any) -> bool:
-    """Return whether the host uses the versioned runtime-marker name."""
-    return bool(getattr(host, '_single_process_spawn', False))
+    """本窗是否用版本化 runtime 标记名。
+
+    4.4b：进程内多窗常开化（``experimental_single_process_spawn`` 键删除）——
+    同 pid 多窗恒可能存在，故**恒用** ``pet-runtime-v2-<pid>-slot-<N>.json``
+    （旧名 ``runtime-<pid>.json`` 无法区分同进程的多个窗）。读取侧
+    （``slot_manager.read_live_instances``）同时认两种命名，回滚兼容不变。
+    """
+    return True
 
 
 def live_instance_rects(

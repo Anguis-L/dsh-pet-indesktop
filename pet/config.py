@@ -797,12 +797,9 @@ class Config:
             # 退出杀进程、下一次 start() 自然 fresh spawn（把 47→64MB 的 ffmpeg
             # 内部累积周期性清零）。0 = 关闭回收（回退保险）；否则范围 [2, 120]。
             "ffmpeg_recycle_minutes": 10,
-            # 批5.2 spike（默认关）：开 = 「生小肥鱼」从 spawn 新进程改为进程内
-            # 创建第二个 PetInstance。关 = 行为与现状逐位一致（回退保险）。
-            "experimental_single_process_spawn": False,
-            # 批5.3：同角色共享解码链（进程内帧扇出）开关，默认开。仅当
-            # experimental_single_process_spawn（多窗）也为开时才真正激活——
-            # 单窗无共享可言，双门关任一即回每窗独立解码（批5.2 形态）。
+            # 批5.3：同角色共享解码链（进程内帧扇出）开关，默认开。多宠恒为
+            # 进程内多窗/多 sprite（`experimental_single_process_spawn` 键已随
+            # 4.4b 退役删除），关掉即回每窗独立解码。
             "experimental_shared_decode": True,
             # 设置页进程隔离：默认开 = 设置页拉到独立进程（--settings），关窗即
             # 进程退出，OS 连锅端走首开留下的字体/样式/模块高水位（无卸载 API）；
@@ -1043,7 +1040,6 @@ class Config:
             "first_frame_cache_max_mb",
             "predict_prewarm_lead_ms",
             "ffmpeg_recycle_minutes",
-            "experimental_single_process_spawn",
             "experimental_shared_decode",
             "settings_process_isolation",
         ):
@@ -1354,8 +1350,6 @@ class Config:
         # [2, 120]（默认 10）。
         _ffr = _float_or_default(self.data.get("ffmpeg_recycle_minutes"), 10, 0, 120)
         self.data["ffmpeg_recycle_minutes"] = 0 if _ffr <= 0 else int(max(2.0, _ffr))
-        # 批5.2 spike 开关：同其它布尔键规约，防字符串布尔误开。
-        self.data["experimental_single_process_spawn"] = _bool_or_default(self.data.get("experimental_single_process_spawn"), False)
         # 批5.3 共享解码链开关：同规防字符串布尔误开（默认开）。
         self.data["experimental_shared_decode"] = _bool_or_default(self.data.get("experimental_shared_decode"), True)
         # 设置页进程隔离：同规防字符串布尔误开；默认开（关掉 = 回退进程内设置页）。

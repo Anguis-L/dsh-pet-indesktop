@@ -299,9 +299,9 @@ def _read_spawn_offset_env() -> int:
     """P0-1：读取 spawn 子进程路径写入的 DSH_PET_SPAWN_OFFSET_INDEX，显式传给
     主窗 PetInstance.spawn_offset（进程 spawn 路径依赖它错开落位）。
 
-    flag 关（生小肥鱼走独立进程）时 instance_launcher 写该 env、子进程 main()
-    启动须把它接到主窗的 spawn_offset 构造参数——否则 _apply_spawn_offset 的
-    index 恒为 0，新孵化的桌宠直接与母桌宠完全重叠（flag 关行为回归）。
+    该 env 是历史多进程 spawn 的落点错峰通道，4.4b 后不再有进程 spawn，但
+    **兼容解析保留**（T5）：存量快捷方式/外壳脚本仍可能带它，读到就照旧接到
+    主窗的 spawn_offset 构造参数。
     """
     try:
         return max(0, int(os.environ.get('DSH_PET_SPAWN_OFFSET_INDEX', '0') or '0'))
@@ -413,10 +413,11 @@ class PetInstance:
         return lib
 
     def _slot_wrap(self, fn):
-        """包一层：调用回调时把线程本地日志槽位设为本窗 slot（批5.2 §③.7）。
+        """包一层：多窗时把线程本地日志槽位设为本窗 slot（批5.2 §③.7）。
 
-        flag 关（单窗）时槽位为 None，日志格式与现状逐位一致；flag 开/多窗
-        时槽位为 'slot-N'，由 _SlotLogFilter 加 [slot-N] 前缀。
+        4.4b：进程内多窗常开化后不再有 flag 快照——按**活窗数**判定：单窗
+        （含 legacy 默认形态）槽位为 None，日志格式与历史逐位一致；≥2 窗时
+        槽位为 'slot-N'，由 _SlotLogFilter 加 [slot-N] 前缀。
         """
         if fn is None:
             return None
@@ -424,9 +425,7 @@ class PetInstance:
 
         def wrapper(*args, **kwargs):
             prev = getattr(_pet_log_slot, "slot", None)
-            # P1-2：窗级逻辑一律读进程级 flag 快照（shell._single_process_spawn），
-            # 不读每窗 config（第二窗 config-slot-N 里该键无效）。
-            if self.shell._single_process_spawn:
+            if len(getattr(self.shell, "_instances", ())) > 1:
                 _pet_log_slot.slot = slot
             else:
                 _pet_log_slot.slot = None
@@ -478,12 +477,9 @@ class PetInstance:
         win.on_toggle_festival = self._slot_wrap(self.shell.toggle_festival_reminder)
         win.on_restore_fun_windows = restore_ojingjing_windows
         win.on_hidden = self._slot_wrap(self._notify_pet_hidden)
-        # 批5.2 P0-2：右键「退出」注入窗级「退出这只」只在 flag 开（多窗）时；
-        # flag 关（单窗）不注入 → _request_quit 走旧 app.quit 分支，逐位一致。
-        if self.shell._single_process_spawn:
-            win.on_exit_window = self._slot_wrap(self._request_exit_window)
-        else:
-            win.on_exit_window = None
+        # 4.4b：窗级「退出这只」恒注入（多窗常开化；最后一窗退出即全进程退出，
+        # 与旧 flag 关时的 app.quit 分支语义等价）。
+        win.on_exit_window = self._slot_wrap(self._request_exit_window)
 
     def _build_window(self, character_id: str, lib: MovieLibrary | None = None,
                       build_tray: bool = True) -> PetWindow:
@@ -499,24 +495,22 @@ class PetInstance:
         """
         if lib is None:
             lib = self._create_library(character_id)
-        # 批5.2a：flag 开时各窗引用同一份进程级共享子系统（agent_link /
-        # proactive），flag 关时传 None → PetWindow 各自创建（现状逐位一致）。
+        # 4.4b：进程级共享子系统（agent_link / proactive / 全屏 watcher）常建，
+        # 各窗引用同一份；窗口全屏监视交由共享 watcher（本窗不再自建线程）。
         shared = getattr(self.shell, "_shared", None)
-        # 批5.2a §③.5：窗自身构造期日志（恢复位置/runtime 标记等）加 [slot-N] 前缀
-        #（P2-2 残余尽力而为——运行时动画/物理等 GUI 线程日志不动 window.py，预算仅 4360）。
+        # 批5.2a §③.5：**子窗**构造期日志加 [slot-N] 前缀（主窗 slot 0 保持
+        # 历史格式不变）；运行时动画/物理等 GUI 线程日志不动 window.py。
         _prev_slot = getattr(_pet_log_slot, "slot", None)
-        if shared is not None and self.slot_id is not None:
+        if self.slot_id:
             _pet_log_slot.slot = f"slot-{self.slot_id}"
         try:
             win = PetWindow(lib, self.config,
                             broker_facade=self.broker_facade,
-                            single_process_spawn=self.shell._single_process_spawn,
                             agent_link_manager=shared.agent_link if shared else None,
                             proactive_watcher=shared.proactive if shared else None)
         finally:
             _pet_log_slot.slot = _prev_slot
-        # P1-2：窗级 runtime 标记版本化 / 日志前缀读进程级 flag 快照（不读每窗 config）。
-        # N-1：快照经构造参数在 _restore_position 之前生效（窗构造期就会写标记）。
+        win.shared_fullscreen_watcher_active = shared is not None
         self._wire_window(win)
         # 文件投喂（拖文件模拟吃掉）：PR73 引入的接线在批5.2 重构时被丢，
         # 必须随每只窗的创建（启动/切角色/多窗）挂载，缺失则拖放无效。
@@ -986,7 +980,7 @@ class PetInstance:
             self.shell.island.set_pet_visible(self.shell._aggregate_pet_visible())
         if self.shell.tray is None:
             return
-        if self.shell._single_process_spawn and self is not self.shell.instance:
+        if self is not self.shell.instance:
             message = "点击托盘菜单中该窗口的「显示 / 隐藏」即可恢复。"
         else:
             if sys.platform == "darwin" and not bool(self.config.get("show_dock_icon", True)):
@@ -1087,32 +1081,23 @@ class AppShell:
         self.festival_service = None
         if self._festival_wanted():
             self._ensure_festival_service()
-        # 批5.2 P1-2/P2-6：进程级 flag 快照——启动期从主窗 config 读一次存
-        # _single_process_spawn；窗级逻辑（runtime 标记版本化、日志前缀、
-        # 退出分派、spawn 分发）一律读本快照，不读每窗 config。第二窗的
-        # config-slot-N.json 里该键不再有任何作用，运行期手改 config.json
-        # 翻 flag 也因此失效（需重启）。
-        self._single_process_spawn = bool(config.get('experimental_single_process_spawn', False))
+        # 4.4b：`experimental_single_process_spawn` 键删除——进程内多窗从
+        # "实验开关"升格为**唯一**多宠形态（多进程多宠退役层已删除），
+        # 原先依赖该 flag 快照的窗级逻辑（runtime 标记版本化、日志前缀、
+        # 退出分派、共享子系统）一律常开/按活窗数派生。
         # D0 门控解绑（PHASE4_DESIGN T3）：overlay 拓扑下 hub 必须**常开**——
         # 多 sprite 同角色若各自建链会退化成 N 路独立 ffmpeg（硬指标③回退）。
         # 拓扑判定唯一入口收口在 overlay_shell.is_overlay_topology（T5 的 dev
-        # 环境变量，不进 Config/设置页/schema）；legacy 拓扑读 False，下面的
-        # 使能表达式与批5.3 逐行等价（行为零变化）。
-        from .overlay_shell import is_overlay_topology
-        overlay_topology = is_overlay_topology()
-        # 批5.3：进程级共享解码 hub（同角色帧扇出）——`experimental_shared_decode`
-        # 默认开，但使能门 = `experimental_single_process_spawn` **或 overlay 拓扑**；
-        # 两者皆关时整条 fan-out 不激活（单窗无共享可言）。门关 = 每窗各自独立
-        # 解码（批5.2 形态，hub 恒回 local）。
+        # 环境变量，不进 Config/设置页/schema）。
+        # 批5.3：进程级共享解码 hub（同角色帧扇出）——使能门收敛为
+        # `experimental_shared_decode` 这一个用户级总闸（flag 快照已删；
+        # overlay 拓扑不再需要额外门控，legacy 多窗同样受益）。
         self._decode_hub = DecodeFanoutHub(
-            enabled=bool(config.get('experimental_shared_decode', True))
-            and (self._single_process_spawn or overlay_topology))
-        # 批5.2a §③.1/.2：flag 开时进程级共享子系统（agent_link / proactive /
-        # 全屏 watcher），各窗经 PetWindow 构造参数引用同一份，崩溃/换角色不重建；
-        # flag 关时保持 None = 每窗各自创建（现状逐位一致）。
-        # D0 解绑（T3）：overlay 拓扑下同样**常建**——sprite 拓扑里共享子系统
-        # 缺位即静默缺失（agent_link/主动识屏/全屏 watcher 无人承载）。门控 =
-        # flag 或 overlay 拓扑；legacy 且 flag 关仍为 None（逐行不变）。
+            enabled=bool(config.get('experimental_shared_decode', True)))
+        # 4.4b（T6「multi_window_shared 不删，常开化」）：进程级共享子系统
+        # （agent_link / proactive / 全屏 watcher）**恒建**，各窗经 PetWindow
+        # 构造参数引用同一份，崩溃/换角色不重建。sprite 拓扑里共享子系统缺位
+        # 即静默缺失（agent_link/主动识屏/全屏 watcher 无人承载）。
         #（位置在 _instances 就绪之后，共享 manager 构造期即遍历窗集合）。
         self._shared = None
         # 每窗容器：批5.1 单进程单窗仅一个；批5.2 spike 扩成多窗集合
@@ -1133,10 +1118,9 @@ class AppShell:
             slot_id=slot_id, spawn_offset=spawn_offset,
         )
         self._instances.append(self.instance)
-        if self._single_process_spawn or overlay_topology:
-            from .multi_window_shared import SharedSubsystems
+        from .multi_window_shared import SharedSubsystems
 
-            self._shared = SharedSubsystems(self)
+        self._shared = SharedSubsystems(self)  # 4.4b：常开化（T6）
         _LIVE_SHELLS.add(self)
 
     @property
@@ -1504,7 +1488,7 @@ class AppShell:
             return False
         instance_id = str(getattr(getattr(instance, "config", None), "instance_id", "") or "")
         if instance_id and instance_id != (os.environ.get("DSH_PET_INSTANCE") or "").strip():
-            # 进程内多窗（experimental_single_process_spawn）下第二窗的 instance_id
+            # 进程内多窗下第二窗的 instance_id
             # 不等于进程级 env：显式传参，否则独立设置进程会打开主窗的配置。
             # 主窗/独立槽位进程 env 已一致，命令保持 ["--settings"] 原样。
             arguments += ["--instance", instance_id]
@@ -2674,13 +2658,11 @@ class AppShell:
 
     # ------------------------------------------------------------ 生小肥鱼 / 多窗
     def spawn_pet(self) -> None:
-        """生小肥鱼（4.4a）：统一走进程内新窗，不再拉起独立桌宠进程。
+        """生小肥鱼：统一走进程内新窗，不再拉起独立桌宠进程。
 
-        多进程多宠退役层停用后，多宠的唯一定拓扑是进程内多窗/多 sprite。
-        ``experimental_single_process_spawn`` 键仍被读取，但它从此只参与解码
-        hub / 共享子系统的门控（4.4b 随键一并清理）；``--slot`` /
-        ``DSH_PET_SPAWN_OFFSET_INDEX`` 兼容解析保留（T5），落点错峰仍按
-        spawn 序号计算。
+        4.4b：多进程多宠退役层删除后，多宠的唯一形态是进程内多窗/多 sprite。
+        ``--slot`` / ``DSH_PET_SPAWN_OFFSET_INDEX`` 兼容解析保留（T5），
+        落点错峰仍按 spawn 序号计算。
         """
         try:
             self._spawned_pet_count += 1

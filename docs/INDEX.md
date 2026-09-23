@@ -123,7 +123,9 @@
 | [`PR-MERGE-LESSONS-2026-09-12.md`](PR-MERGE-LESSONS-2026-09-12.md) | PR 合并三则教训：叠放 PR 在 squash 父 PR 后必然冲突、预算/红线只在两 PR 组合时才破、时序测试 flake 纪律。 | **合并 PR 之前必读**（AGENTS.md 口径）。 |
 | [`NETWORK-PROXY-AND-VPN-2026-09-22.md`](NETWORK-PROXY-AND-VPN-2026-09-22.md) | 代理/VPN 影响面清单：歌词取词（代理下 20~41s 超时）、edge-tts 语音、更新检查（jsdelivr 只有代理能通）、余额/识屏/对话（用户自配端点）、localhost 类（本地 TTS / DSH 联动）各自该不该走代理，附 30 秒探针与推荐分流配置。 | **改任何联网功能，或用户报「某功能昨天还好好的 / 歌词没了 / 语音不出声 / 更新检查失败」时必读**（系统代理与 VPN 是一等嫌疑）；也用于回答"桌宠为什么不自己绕过代理"。 |
 
-> 注：`AGENTS.md` 的 "Context pointers" 还指向 `docs/ISSUE-42-POSIX-COLLISION-IPC-2026-08-31.md`（碰撞选举 / QLocal IPC / 协调者锁），但该文件在当前工作树中不存在。改动碰撞选举、QLocal IPC 或协调者锁之前，需要先确认该文档是被删除、改名还是从未入库——本索引无法为它登记有效条目。
+> 注：`docs/ISSUE-42-POSIX-COLLISION-IPC-2026-08-31.md`（碰撞选举 / QLocal IPC / 协调者锁）从未入库，
+> `AGENTS.md` 曾经指向它的那条 Context pointer 已随 Phase 4.4b 退役（碰撞 IPC / 协调者文件锁
+> 整体删除）一并移除——该课题不再存在待读文档。
 
 ---
 
@@ -131,6 +133,7 @@
 
 | 文档 | 一句话内容 | 何时必读 |
 |---|---|---|
+| [`PR-REPORT-PHASE4-4-RETIRE-MULTIPROCESS-2026-09-23.md`](PR-REPORT-PHASE4-4-RETIRE-MULTIPROCESS-2026-09-23.md) | Phase 4.4a/4.4b 多进程多宠退役层（停用 → 删除）报告：T6 清单逐条处置（碰撞 IPC/codec/client、instance_launcher、slot 锁、child_pet_cleanup、岛远端墙、spawn 开关键）、机器化守卫（文件不存在 + 全树零 import）、导入期 A/B 实测、两条拓扑真进程冒烟与既存 frameseq 缺陷。 | 改碰撞/多宠生命周期、`slot_manager`、`multi_window_shared`、runtime 标记、`PET_RENDER_TOPOLOGY` 分流时；或需要「为什么多进程多宠层被删、还剩什么」的权威口径时。 |
 | [`PR-REPORT-ISLAND-HIDDEN-CHAT-DEADLOCK-2026-09-23.md`](PR-REPORT-ISLAND-HIDDEN-CHAT-DEADLOCK-2026-09-23.md) | 纯桌宠版岛隐藏死锁修复：无聊天构建 hidden_chat 单击路由回退展开卡片（岛能力开关 + 设置页开关按构建变体隐藏）。 | 改灵动岛单击路由 / hidden_chat 设置 / 打包变体（无 pet.chat）行为时。 |
 | [`PR-REPORT-TEMPLATE.md`](PR-REPORT-TEMPLATE.md) | PR 报告模板：三份交付证据（修改文件说明 / 性能分析 / 实机运行记录）的逐节骨架与判定标准。 | **开新 PR 写报告前必读并整份复制**；2026-09-22 起三份证据是硬要求（`AGENTS.md` Delivery evidence discipline），由 `tests/test_pr_report_discipline.py` 机器化校验。 |
 | [`PR-REPORT-PR76-2026-09-10.md`](PR-REPORT-PR76-2026-09-10.md) | PR76 批次的完整报告：事件汇报概率门 + Persona 模板升级 + 全链路错误语义统一（46 文件，+3004/−917）。 | 追溯 PR76 批次改了什么、以及概率门/persona 模板/错误语义三条线的组合动机时。 |

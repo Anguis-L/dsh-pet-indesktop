@@ -847,7 +847,7 @@ def _duck_candidates(duck_dir: Path) -> list[Path]:
     """内置小鸭包候选列表（带进程级缓存）。
 
     包内素材是打包资源，运行期不会变；但点击（window 每次按下/确认点击）与
-    碰撞命中（collision_client/island_collision 每次真撞）都会走到这里，
+    碰撞命中（sprite 世界 / 岛墙每次真撞）都会走到这里，
     不缓存就是 GUI 线程上每次命中一次目录扫描——碰撞瞬时尖峰来源之一。
     返回副本，调用方的改动不污染缓存。
     """

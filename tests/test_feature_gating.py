@@ -64,7 +64,6 @@ def test_petapp_start_disabled_services_stay_stopped(tmp_path, monkeypatch):
     shell.instance._create_ui = lambda cid: None
     shell.instance._apply_spawn_offset = lambda: None
     shell._apply_balance_timer = lambda: None
-    shell.instance.collision_ipc = type("FakeCollision", (), {"start": lambda self: None})()
     shell.start()
     assert shell.todo_service is None
 

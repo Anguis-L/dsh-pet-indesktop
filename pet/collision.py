@@ -9,8 +9,8 @@
 5. 稳定重合方向（两 ID 稳定哈希，禁用随机）
 6. 多体碰撞冲量合并与迭代分离
 
-协议帧编解码与水位去重位于 collision_codec.py（批2 迁出，批3 移除本模块的
-re-export 过渡层）；编解码符号请直接从 .collision_codec 导入。
+本模块只做纯数学/几何：协议帧编解码与水位去重曾住在 collision_codec.py，
+已随多进程多宠退役层（4.4b）删除。
 """
 
 from __future__ import annotations

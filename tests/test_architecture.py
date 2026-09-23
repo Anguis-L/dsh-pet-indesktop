@@ -2,11 +2,10 @@
 """架构红线断言（结构线纪律的机器化）。
 
 三条红线，红了就是架构倒退，不许靠改测试放行：
-1. 依赖方向：纯逻辑层（collision/physics/collision_codec）不依赖 Qt；
+1. 依赖方向：纯逻辑层（collision/physics）不依赖 Qt；
    decode_fanout 不反向依赖 window/webm_clip（钩子经 movie 属性注入）。
-2. 私有面冻结：PetWindow 私有成员（win._xxx）只许 window.py 自身与
-   collision_client.py（窗口的碰撞客户端，半内部）访问；app.py /
-   agent_link.py / context_menus/ 再出现即为违规（S2 已清零，防回潮）。
+2. 私有面冻结：PetWindow 私有成员（win._xxx）只许 window.py 自身访问；
+   app.py / agent_link.py / context_menus/ 再出现即为违规（S2 已清零，防回潮）。
 3. window.py 行数预算：结构线拆到 4200 量级后只许降不许涨——
    新功能请先按 docs/WINDOW_PY_SPLIT_GUIDE.md 拆对应控制器，
    而不是继续往上帝类里塞。确实该涨时，预算上调必须在 PR 里说明理由。
@@ -214,7 +213,7 @@ def test_pure_logic_modules_do_not_import_qt():
     # 必须零 Qt——独立设置进程（pet/__main__.py --settings）禁止导入 pet.app/
     # overlay_shell，env 读取的唯一实现只能落在两侧都能 import 的轻模块里。
     for name in (
-        "collision.py", "physics.py", "collision_codec.py",
+        "collision.py", "physics.py",
         "festival_calendar.py", "festival_data.py", "festival.py",
         "festival_quotes_cn.py", "festival_quotes_west.py",
         "festival_quotes_west_movie.py", "festival_quotes_west_game.py",
@@ -235,13 +234,47 @@ def test_decode_fanout_does_not_depend_on_window_or_player():
 # 4.4a 机器化守卫：**overlay 新路径**（单合成窗渲染面）必须零 import 这些
 # 模块——新架构的多宠碰撞/身份/生命周期全部在进程内 sprite 世界自足，
 # 一旦回潮就是"新路径又骑回多进程 IPC/文件锁"的架构倒退。
+# 4.4b 追加守卫：这些模块文件本身必须**不存在**（删除刀不许被静默回退），
+# 且全 pet/ 树（不只新路径）不得再 import 它们。
 RETIRED_MULTIPROCESS_MODULES = (
     "collision_ipc",
     "collision_codec",
     "collision_client",
+    "collision_debug",
     "instance_launcher",
     "child_pet_cleanup",
 )
+
+
+def test_retired_multiprocess_layer_files_are_gone():
+    """4.4b 机器化守卫：退役层文件必须不存在（防"删了又被合回来"）。"""
+    present = [name for name in RETIRED_MULTIPROCESS_MODULES
+               if (PET_DIR / f"{name}.py").exists()]
+    assert not present, (
+        "多进程多宠退役层文件回潮（T6 清单已删除）：\n" + "\n".join(present)
+    )
+
+
+def test_pet_tree_has_zero_retired_layer_imports():
+    """4.4b 机器化守卫：整个 pet/ 树（含 legacy 路径）零 import 退役层模块。
+
+    与上一条互补：文件不存在是"删干净"，本条约住"任何模块都不得再 import"
+    （含函数级延迟 import 与 from pet.xxx 绝对写法）。
+    """
+    offenders = []
+    for path in sorted(PET_DIR.rglob("*.py")):
+        for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if not (stripped.startswith("from ") or stripped.startswith("import ")):
+                continue
+            for retired in RETIRED_MULTIPROCESS_MODULES:
+                if re.search(rf"\b{retired}\b", stripped):
+                    offenders.append(f"{path.name}:{lineno}: {stripped}")
+    assert not offenders, (
+        "pet/ 内仍有 import 多进程多宠退役层（架构倒退）：\n"
+        + "\n".join(offenders)
+    )
 
 
 def _overlay_new_path_modules() -> tuple[str, ...]:

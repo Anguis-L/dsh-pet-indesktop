@@ -6,8 +6,8 @@
 before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举、
 无快照版本协商，数学全部复用 pet/collision.py（零 Qt 纯 Python）。
 
-与现架构（collision_ipc._coordinator_tick + collision_client._on_collision_impulse）
-的语义对照：
+与已退役的旧多进程实现（collision_ipc 协调者 tick + collision_client 冲量应用，
+4.4b 已删除）的语义对照：
 
 保留：
 - 拖拽中的 sprite 视为无限质量（撞得动别人，自己不动；FLAG_DRAGGING 语义）；
@@ -17,8 +17,8 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
 - 纯位置分离（j==0 且 sep>0）按 pair 去抖 15 tick（防贴贴抖动）；
 - 真撞击阈值：普通对 dv >= 300px/s、撞静态成员放宽到 60px/s、已 thrown
   成员继续吸收冲量的下限 50px/s（对齐 window.py 的 COLLISION_HIT_MIN_DV /
-  COLLISION_CONTACT_DV_FLOOR 与 collision_client 的静态放宽分支）；
-- 速度写回过 soft_clamp_speed 软上限（对齐 collision_client 的限速分支）。
+  COLLISION_CONTACT_DV_FLOOR 与旧实现的静态放宽分支）；
+- 速度写回过 soft_clamp_speed 软上限（对齐旧实现的限速分支）。
 
 简化（进程内直调后自然消亡）：
 - 无 epoch/watermark 去重、无 seq 版本化扫掠（每 tick 全量重算，N 很小）、
@@ -73,12 +73,12 @@ def capsule_circles(left: float, top: float, width: float, height: float,
     step = span / (n - 1)
     return [[x0 + i * step, axis_y, r] for i in range(n)]
 
-# 真撞击阈值（语义对齐现架构 window.py:147-150 / collision_client.py:373-381）
+# 真撞击阈值（语义对齐 window.py:147-150 与已退役碰撞客户端的判定分支）
 HIT_MIN_DV = 300.0          # COLLISION_HIT_MIN_DV：普通对 |dv| 阈值 (px/s)
 STATIC_HIT_MIN_DV = 60.0    # 撞静态布景放宽（岛的语义就是"撞上去会弹"）
 CONTACT_DV_FLOOR = 50.0     # 已 thrown 成员继续吸收冲量的下限 (px/s)
 
-# 纯位置分离去抖窗口（对齐 collision_ipc._coordinator_tick 的 15 tick 去抖）
+# 纯位置分离去抖窗口（对齐旧协调者 tick 的 15 tick 去抖）
 SEPARATION_DEBOUNCE_TICKS = 15
 
 
@@ -392,7 +392,7 @@ class SpriteCollisionWorld:
                 if sprite is None or self._is_dragging(sprite):
                     continue  # 拖拽中无限质量：求解器本就给 0，这里双保险
                 hit_dv = math.hypot(dvx, dvy)
-                # 撞静态成员放宽命中阈值（对齐 collision_client 的岛分支）
+                # 撞静态成员放宽命中阈值（对齐旧实现的岛分支）
                 floor = self.static_hit_min_dv \
                     if other_id in self._static_members else self.hit_min_dv
                 is_real_hit = hit_dv >= floor
@@ -421,7 +421,7 @@ class SpriteCollisionWorld:
             if real_hit:
                 fired.append(res)
 
-        # 速度写回 + 软限速（对齐 collision_client：超过 cap 才过软膝曲线）
+        # 速度写回 + 软限速（对齐旧实现：超过 cap 才过软膝曲线）
         for sprite, dvx, dvy in dv_acc.values():
             velocity = sprite.velocity
             vx = float(velocity.x()) + dvx

@@ -28,7 +28,7 @@ import pytest
 
 from pet import overlay_instance_gate as gate_mod
 from pet.config import APP_DIR_NAME
-from pet.slot_manager import SlotLockError, pid_alive
+from pet.slot_manager import pid_alive
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -275,25 +275,24 @@ def test_main_refuses_second_overlay_instance_before_slot(tmp_path, monkeypatch,
 
 def test_main_legacy_topology_skips_gate_and_does_not_take_slot_lock(
         tmp_path, monkeypatch):
-    """legacy 拓扑不触门，且 4.4a 起 main() 不再抢 slot 文件锁（T5）。
+    """legacy 拓扑不触门，且 main() 不再抢 slot 文件锁（T5）。
 
     `--slot N` 兼容解析保留：合法值只用于选 config-slot-N.json 身份，
     不再有任何跨进程竞争副作用（不建 slots/、不落种、不留痕）。
     """
     from pet import app as app_mod
+    from pet.config import Config as RealConfig
 
     monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
     monkeypatch.delenv("DSH_PET_INSTANCE", raising=False)
     monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
     monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)
+    monkeypatch.setattr(app_mod, "Config", lambda *a, **k: RealConfig(base=tmp_path))
     monkeypatch.setattr(app_mod, "_setup_logging", lambda _config: None)
     monkeypatch.setattr(app_mod.autostart_mod, "cleanup_stale_entries", lambda: 0)
 
-    def _slot_must_not_be_used(*_args, **_kwargs):
-        raise AssertionError("legacy 拓扑不应再抢 slot 文件锁")
-
-    monkeypatch.setattr(app_mod.slot_manager_mod, "acquire_pet_slot",
-                        _slot_must_not_be_used)
+    # 退役层符号已删除：取用即失败（比"断言没调用"更强的守卫）
+    assert not hasattr(app_mod.slot_manager_mod, "acquire_pet_slot")
 
     started = []
 
@@ -319,20 +318,29 @@ def test_main_legacy_topology_skips_gate_and_does_not_take_slot_lock(
 def test_main_releases_gate_when_startup_fails(tmp_path, monkeypatch):
     """正常退出链：main 的 finally 释放门（启动失败与事件循环结束共用此出口）。"""
     from pet import app as app_mod
+    from pet.config import Config as RealConfig
 
     monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
     monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
     monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)
+    # 隔离真实用户配置目录与日志（Config/_setup_logging 不走 _default_base）
+    monkeypatch.setattr(app_mod, "Config", lambda *a, **k: RealConfig(base=tmp_path))
+    monkeypatch.setattr(app_mod, "_setup_logging", lambda _config: None)
+    monkeypatch.setattr(app_mod.autostart_mod, "cleanup_stale_entries", lambda: 0)
 
     config_dir = tmp_path / APP_DIR_NAME
     gate = gate_mod.OverlayInstanceGate(config_dir)
     assert gate.acquire() is True
     monkeypatch.setattr(gate_mod, "acquire_overlay_instance_gate", lambda _cfg: gate)
 
-    def _slot_busy(*_args, **_kwargs):
-        raise SlotLockError("测试：启动失败路径")
+    class _BoomShell:
+        def __init__(self, *_args, **_kwargs):
+            pass
 
-    monkeypatch.setattr(app_mod.slot_manager_mod, "acquire_pet_slot", _slot_busy)
+        def start(self):
+            raise RuntimeError("测试：启动失败路径")
+
+    monkeypatch.setattr(app_mod, "AppShell", _BoomShell)
 
     assert app_mod.main(["dsh-pet"]) == 1
     assert gate.held is False

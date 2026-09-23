@@ -53,7 +53,7 @@ def _rect_radial(rx: float, ry: float, nx: float, ny: float) -> float:
 def _virtual_xy(win) -> tuple[float, float]:
     """虚拟窗口坐标（物理/碰撞的坐标系，贴边时与实际窗口位置差一个绘制偏移）。
 
-    与 collision_client._virtual_xy 同口径：#137 视口模型后抛掷物理按虚拟坐标
+    与已退役的碰撞客户端（4.4b 删除）同口径：#137 视口模型后抛掷物理按虚拟坐标
     跑，撞岛进 throw 的起点必须用同一坐标系（issue #146 后续反馈「意料之外
     的情况」）。轻量桩无该接口时回退实际位置。
     """
@@ -434,7 +434,7 @@ class IslandCollisionBody(QObject):
 
     def _apply_hit(self, win, dvx: float, dvy: float, now: float, key: int) -> None:
         """复用桌宠侧真实撞击反应（原有业务）：加冲量 → 限速 → 音效 → 挤压 →
-        进抛掷物理。与 collision_client 权威冲量路径保持一致的手感，但不走 IPC。
+        进抛掷物理（口径沿用已退役碰撞客户端的手感，不走 IPC）。
         """
         cancel_move = getattr(win, "_cancel_move", None)
         if callable(cancel_move):
@@ -461,7 +461,7 @@ class IslandCollisionBody(QObject):
             if callable(cancel):
                 cancel("island_hit", restore=False)
         win._interaction_state = "THROWN"
-        # 与权威冲量路径（collision_client）补齐两个副作用：幽灵点击抑制
+        # 补齐旧权威冲量路径的两个副作用：幽灵点击抑制
         #（被撞飞的鱼落地不应触发点击动画）+ 落地后允许重新进入边缘探头
         clear_dragged = getattr(win, "_clear_just_dragged", None)
         if callable(clear_dragged):

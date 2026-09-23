@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""批5.2 spike：进程内双窗（feature flag 默认关）的机器可验测试。
+"""进程内多窗（4.4b 起为唯一多宠形态）的机器可验测试。
 
-覆盖批5.2 修复轮（DISPATCH_batch52_fix1）处置清单与验收：
+覆盖批5.2 修复轮（DISPATCH_batch52_fix1）处置清单与验收（4.4b 已删去
+feature flag / 碰撞 IPC 相关项）：
 - P0-1：spawn 偏移链（env DSH_PET_SPAWN_OFFSET_INDEX → 主窗 spawn_offset）接线；
-- P0-2：flag 关右键退出不注入窗级「退出这只」（走 app.quit 逐位一致）；
-- P1-1：每窗各持一个 CollisionIpcSession（runtime_id 不同、互不为 peer-self）；
-- P1-2/P2-6：flag 取进程级快照，第二窗标记也是 versioned；
+- P0-2：右键退出恒注入窗级「退出这只」；
+- P1-2/P2-6：runtime 标记恒用 versioned 名；
 - P1-3：「退出这只」退主窗后实例提升，托盘/灵动岛动作仍指向存活实例；
 - P1-5：「退出这只」关闭该窗从属聊天窗/设置窗（防 writer 复活）；
 - P1-7：close_root 改为 per-root 屏障（关 A 窗 writer 期间 B 窗 save 不被拒）；
@@ -18,7 +18,6 @@ import json
 import os
 import threading
 import time
-import uuid
 
 import pytest
 from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
@@ -31,7 +30,6 @@ from pet import catalog
 from pet.app import AppShell, PetInstance, _read_spawn_offset_env
 from pet.chat import session_store as session_store_mod
 from pet.chat.session_store import SessionStore
-from pet.collision_ipc import CollisionIpcSession
 from pet.config import APP_DIR_NAME, Config
 from pet.window import PetWindow
 
@@ -60,8 +58,7 @@ class _FakeAgentLink:
 class _FakeWindow:
     """窗级退出/切换所需的薄替身：记录调用，不触碰真实 Qt 窗口。
 
-    T-2：不硬编码 versioned=True——remove_runtime_marker 读取进程级 flag 快照
-    ``_single_process_spawn``（真实 PetWindow 在 _build_window 里同样被写入）。
+    4.4b：进程内多窗常开化，runtime 标记恒用 versioned 名（无 flag 快照）。
     """
 
     def __init__(self):
@@ -69,8 +66,6 @@ class _FakeWindow:
         self.lib = _FakeLib()
         self.agent_link_manager = _FakeAgentLink()
         self.is_shown = True
-        # P1-2：进程级 flag 快照（默认 = flag 关）。工厂/测试需按 shell 快照设置。
-        self._single_process_spawn = False
 
     def save_position(self):
         self.calls.append("save")
@@ -118,9 +113,8 @@ class _FanoutMovie:
 
 
 def _make_primary_with_slot(tmp_path):
-    """建主窗 AppShell（4.4a 起不再有 slot 文件锁，第三返回值恒 None）。"""
+    """建主窗 AppShell（无 slot 文件锁，第三返回值恒 None）。"""
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", True)
     config.save()
     shell = AppShell(QApplication.instance(), config, enable_chat=True, slot_id=0)
     return shell, config, None
@@ -139,7 +133,6 @@ def test_spawn_in_process_creates_isolated_second_window(tmp_path, app, monkeypa
     def fake_build_window(self, character_id, lib=None, build_tray=True):
         win = _FakeWindow()
         win.cfg = self.config
-        win._single_process_spawn = self.shell._single_process_spawn
         self.win = win
         built.append((self.slot_id, build_tray))
         return win
@@ -172,7 +165,6 @@ def test_spawn_in_process_creates_isolated_second_window(tmp_path, app, monkeypa
     # spawn 路径不新建/替换进程级托盘
     assert built[-1][1] is False
     # P1-2：第二窗标记版本化读进程级快照（flag 开 = versioned）
-    assert second.win._single_process_spawn is True
 
     # 释放：停本测试启动的 second 会话
     _stop_sessions(second)
@@ -192,7 +184,6 @@ def test_spawn_refreshes_island_wall_hooks(tmp_path, app, monkeypatch):
     def fake_build_window(self, character_id, lib=None, build_tray=True):
         win = _FakeWindow()
         win.cfg = self.config
-        win._single_process_spawn = self.shell._single_process_spawn
         self.win = win
         return win
 
@@ -219,7 +210,6 @@ def test_spawn_refreshes_island_wall_hooks(tmp_path, app, monkeypatch):
 def test_spawn_pet_always_creates_in_process_window(tmp_path, app, monkeypatch):
     """4.4a：`spawn_pet` 不再拉起独立桌宠进程——统一走进程内新窗。"""
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", False)
     config.save()
     shell = AppShell(QApplication.instance(), config, enable_chat=True)
 
@@ -243,7 +233,6 @@ def test_exit_window_cleans_window_resources_only(tmp_path, app, monkeypatch):
     sec = PetInstance(shell, sec_config, enable_chat=True, slot_id=1)
     win = _FakeWindow()
     win.cfg = sec_config
-    win._single_process_spawn = shell._single_process_spawn  # True（P1-2）
     sec.win = win
     shell._instances.append(sec)
 
@@ -310,7 +299,6 @@ def test_switch_character_keeps_process_shared_decode_hub(tmp_path, app, monkeyp
     def fake_build_window(self, character_id, lib=None, build_tray=True):
         win = _FakeWindow()
         win.cfg = self.config
-        win._single_process_spawn = self.shell._single_process_spawn
         self.win = win
         return win
 
@@ -353,10 +341,9 @@ def test_switch_character_keeps_process_shared_decode_hub(tmp_path, app, monkeyp
 
 
 def test_runtime_marker_versioned_name_avoids_legacy_glob(tmp_path, app):
-    """R4：flag 开时标记用版本化新名（不被旧 'runtime-*.json' glob 匹配），
-    且新版读取侧同时认新旧两种命名。"""
+    """R4：窗口恒用版本化新名（不被旧 'runtime-*.json' glob 匹配），
+    且读取侧同时认新旧两种命名（回滚兼容）。"""
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", True)
     config.save()
 
     ver_path = slot_manager_mod.runtime_marker_path(
@@ -364,7 +351,7 @@ def test_runtime_marker_versioned_name_avoids_legacy_glob(tmp_path, app):
     # 新名不匹配旧 glob（旧 glob 只认 'runtime-*.json' 前缀）
     assert ver_path.name.startswith("pet-runtime-v2-")
     assert len(list(config.dir.glob("runtime-*.json"))) == 0, \
-        "新窗（flag 开）不得写入旧格式标记"
+        "新窗不得写入旧格式标记"
 
     # 写新标记
     slot_manager_mod.write_runtime_marker(
@@ -380,19 +367,8 @@ def test_runtime_marker_versioned_name_avoids_legacy_glob(tmp_path, app):
     assert len(live) == 2
 
 
-def test_runtime_marker_versioned_off_keeps_legacy_name(tmp_path, app):
-    """R4：flag 关时仍用旧名 runtime-<pid>.json（与现状逐位一致）。"""
-    config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", False)
-    config.save()
-    leg = slot_manager_mod.runtime_marker_path(
-        config.dir, config.instance_id, versioned=False)
-    assert leg.name == f"runtime-{os.getpid()}.json"
-
-
 def test_spawn_offset_env_wired_to_primary_instance(tmp_path, app, monkeypatch):
-    """P0-1：spawn 偏移链接线（env → 主窗 spawn_offset），flag 关 spawn 子进程
-    仍与母桌宠错开落位。"""
+    """P0-1：spawn 偏移链接线（env → 主窗 spawn_offset）——兼容解析保留（T5）。"""
     monkeypatch.setenv("DSH_PET_SPAWN_OFFSET_INDEX", "3")
     assert _read_spawn_offset_env() == 3
     monkeypatch.setenv("DSH_PET_SPAWN_OFFSET_INDEX", "-2")
@@ -419,14 +395,12 @@ def test_exit_primary_promotes_primary_window(tmp_path, app, monkeypatch):
     primary = shell.instance
     primary.win = _FakeWindow()
     primary.win.cfg = config
-    primary.win._single_process_spawn = True
 
     # 第二个实例即将成为新主窗
     sec = PetInstance(shell, Config(base=tmp_path, instance_id="slot-1"),
                       enable_chat=True, slot_id=1)
     sec_win = _FakeWindow()
     sec_win.cfg = sec.config
-    sec_win._single_process_spawn = True
     sec.win = sec_win
     shell._instances.append(sec)
 
@@ -452,7 +426,6 @@ def test_exit_window_closes_subwindows(tmp_path, app, monkeypatch):
     shell, config, primary_handle = _make_primary_with_slot(tmp_path)
     shell.instance.win = _FakeWindow()
     shell.instance.win.cfg = config
-    shell.instance.win._single_process_spawn = True
 
     saves = []
 
@@ -490,7 +463,6 @@ def test_exit_window_closes_subwindows(tmp_path, app, monkeypatch):
                       enable_chat=True, slot_id=1)
     sec_win = _FakeWindow()
     sec_win.cfg = sec.config
-    sec_win._single_process_spawn = True
     sec.win = sec_win
     shell._instances.append(sec)
 
@@ -516,11 +488,13 @@ def test_exit_window_closes_subwindows(tmp_path, app, monkeypatch):
     assert shell.instance is sec
 
 
-def test_exit_flag_off_does_not_inject_on_exit_window(tmp_path, app, monkeypatch):
-    """P0-2/T-4：flag 关右键退出等价——on_exit_window 不注入，
-    _request_quit 走旧 app.quit 分支（逐位一致）。"""
+def test_exit_window_callback_injected_on_every_window(tmp_path, app, monkeypatch):
+    """P0-2（4.4b 语义）：窗级「退出这只」恒注入；_request_quit 走窗级分支。
+
+    多窗常开化后不再有 flag 关的"不注入走 app.quit"分支——最后一窗退出即
+    全进程退出，两者对外行为等价。
+    """
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", False)
     config.save()
     shell = AppShell(QApplication.instance(), config, enable_chat=True)
     inst = shell.instance
@@ -528,31 +502,7 @@ def test_exit_flag_off_does_not_inject_on_exit_window(tmp_path, app, monkeypatch
     win.cfg = config
     inst.win = win
     inst._wire_window(win)
-    # flag 关：不注入窗级「退出这只」
-    assert win.on_exit_window is None
-
-    # _request_quit 在 on_exit_window 缺失时走 app.quit
-    quit_calls = []
-    _app = QApplication.instance()
-    monkeypatch.setattr(_app, "quit", lambda: quit_calls.append(1))
-    win._active_context_menu = None
-    PetWindow._request_quit(win)
-    assert quit_calls == [1], "flag 关右键退出应走 app.quit（与现状逐位一致）"
-
-
-def test_exit_flag_on_injects_on_exit_window(tmp_path, app, monkeypatch):
-    """P0-2：flag 开注入窗级「退出这只」；_request_quit 走窗级退出分支。"""
-    config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", True)
-    config.save()
-    shell = AppShell(QApplication.instance(), config, enable_chat=True)
-    inst = shell.instance
-    win = _FakeWindow()
-    win.cfg = config
-    win._single_process_spawn = True
-    inst.win = win
-    inst._wire_window(win)
-    assert callable(win.on_exit_window), "flag 开应注入窗级「退出这只」"
+    assert callable(win.on_exit_window), "每窗都应注入窗级「退出这只」"
 
     # _request_quit 走窗级分支（on_exit_window 被调用，而非 app.quit）
     exit_calls = []
@@ -562,8 +512,8 @@ def test_exit_flag_on_injects_on_exit_window(tmp_path, app, monkeypatch):
     _app = QApplication.instance()
     monkeypatch.setattr(_app, "quit", lambda: quit_calls.append(1))
     PetWindow._request_quit(win)
-    assert exit_calls == [1], "flag 开右键退出应走窗级「退出这只」"
-    assert quit_calls == [], "flag 开右键退出不应走 app.quit"
+    assert exit_calls == [1], "右键退出应走窗级「退出这只」"
+    assert quit_calls == [], "右键退出不应走 app.quit"
 
 
 # --------------------------------------------------------------------------
@@ -652,59 +602,6 @@ def _pump(seconds: float) -> None:
         time.sleep(0.005)
 
 
-def test_two_windows_distinct_runtime_ids_not_peer_self(tmp_path, app):
-    """T-1：主窗与第二窗各 attach 各自 session → runtime_id 不同，且同进程
-    多 session 经 _local_election_names 收敛成一个协调者 + 两个独立成员
-    （互不为 peer-self，与多进程双开等价，P1-1）。"""
-    from pet import collision
-
-    name = f"sp52-{uuid.uuid4().hex[:8]}"
-    primary = CollisionIpcSession(Config(tmp_path, instance_id=""), server_name=name)
-    second = CollisionIpcSession(Config(tmp_path, instance_id="slot-1"), server_name=name)
-    assert primary.runtime_id != second.runtime_id, "两窗 runtime_id 必须不同"
-    # runtime_id 由各自 instance_id 派生（前缀区分主窗/第二窗）
-    assert primary.runtime_id.startswith("instance-pid")
-    assert second.runtime_id.startswith("slot-1-pid")
-
-    flags = collision.FLAG_VISIBLE | collision.FLAG_COLLISION_ENABLED
-
-    def _state(seq, x):
-        return {"seq": seq, "ts": time.monotonic(), "x": x, "y": 0.0,
-                "w": 100, "h": 100, "radius_x": 40.0, "radius_y": 40.0,
-                "vx": 0.0, "vy": 0.0, "flags": flags}
-
-    primary.start()
-    second.start()
-    try:
-        # 等都收敛出一个协调者（server 非空的那侧）
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            _pump(0.1)
-            if primary._worker.server is not None or second._worker.server is not None:
-                break
-        coord_session = primary if primary._worker.server is not None else second
-        client_session = second if coord_session is primary else primary
-        assert coord_session._worker.server is not None
-        _pump(0.5)  # 客户端连接/握手
-
-        # 两窗都上报 state → 各自成为协调者成员表里的独立成员（互不为 peer-self）
-        coord_session.submit_state(_state(1, x=10.0))
-        client_session.submit_state(_state(1, x=20.0))
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            _pump(0.05)
-            if (primary.runtime_id in coord_session._worker.members
-                    and second.runtime_id in coord_session._worker.members):
-                break
-        assert primary.runtime_id in coord_session._worker.members
-        assert second.runtime_id in coord_session._worker.members
-        assert len(coord_session._worker.members) >= 2, \
-            "两窗必须是两个独立成员，而不是共享一个成员槽位"
-    finally:
-        primary.stop()
-        second.stop()
-
-
 def test_spawn_in_process_slot_scan_cap_raises(tmp_path, app, monkeypatch):
     """D6：slot 身份扫描超过上限抛 SpawnStateError（不许无限循环）。"""
     from pet import overlay_spawn_state
@@ -736,11 +633,9 @@ def test_enable_chat_setter_does_not_write_shell(tmp_path, app):
 
 def test_in_process_spawn_shares_process_hub(tmp_path, app, monkeypatch):
     """批5.3：P1-6 移除——进程内多窗与``decode_broker_enabled``的互斥声明作废。
-    新窗与主窗共用同一进程级``DecodeFanoutHub``（experimental_shared_decode 默认
-    开 且 experimental_single_process_spawn 开 → hub 启用），不再有「停用新窗
-    broker（不 bind）」的限制。"""
+    新窗与主窗共用同一进程级``DecodeFanoutHub``（experimental_shared_decode
+    默认开 → hub 启用），不再有「停用新窗 broker（不 bind）」的限制。"""
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", True)
     config.set("experimental_shared_decode", True)
     config.save()
     shell = AppShell(QApplication.instance(), config, enable_chat=True, slot_id=0)
@@ -751,7 +646,6 @@ def test_in_process_spawn_shares_process_hub(tmp_path, app, monkeypatch):
     def fake_build_window(self, character_id, lib=None, build_tray=True):
         win = _FakeWindow()
         win.cfg = self.config
-        win._single_process_spawn = self.shell._single_process_spawn
         self.win = win
         return win
 
@@ -771,7 +665,6 @@ def test_in_process_spawn_shares_process_hub(tmp_path, app, monkeypatch):
 def test_in_process_spawn_hub_disabled_when_shared_decode_off(tmp_path, app, monkeypatch):
     """experimental_shared_decode 关 → 进程级 hub 不激活（各窗独立解码）。"""
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", True)
     config.set("experimental_shared_decode", False)
     config.save()
     shell = AppShell(QApplication.instance(), config, enable_chat=True, slot_id=0)
@@ -851,37 +744,20 @@ class _FakeAnimLib:
         return 1.0
 
 
-def test_real_window_construction_writes_versioned_marker_when_flag_on(tmp_path, app):
-    """N-1（红→绿回归）：flag 开时真实 PetWindow 构造期就写 v2 名标记，
-    绝不写旧名（修复前：构造期快照未注入 → 写旧名 runtime-<pid>.json）。"""
+def test_real_window_construction_writes_versioned_marker(tmp_path, app):
+    """N-1（红→绿回归）：真实 PetWindow 构造期就写 v2 名标记，绝不写旧名
+    （4.4b：多窗常开化 → 恒版本化，旧名无法区分同进程多窗）。"""
     from pet.window import PetWindow
 
     config = Config(tmp_path)
     config.save()  # 确保 config.dir 已建（生产路径由启动流程建，测试需显式）
-    win = PetWindow(_FakeAnimLib(), config, single_process_spawn=True)
+    win = PetWindow(_FakeAnimLib(), config)
     try:
         v2 = slot_manager_mod.runtime_marker_path(
             config.dir, config.instance_id, versioned=True)
-        assert v2.exists(), "flag 开的窗构造后必须已写 v2 标记（N-1）"
+        assert v2.exists(), "窗构造后必须已写 v2 标记（N-1）"
         legacy = [p for p in config.dir.glob("runtime-*.json")]
-        assert legacy == [], f"flag 开的窗不得写旧名标记，实际: {legacy}"
-    finally:
-        win.close()
-        win.deleteLater()
-
-
-def test_real_window_construction_writes_legacy_marker_when_flag_off(tmp_path, app):
-    """N-1 对照：flag 关（默认）构造后写旧名标记（与 HEAD 逐位一致）。"""
-    from pet.window import PetWindow
-
-    config = Config(tmp_path)
-    config.save()  # 同上：先建 config.dir
-    win = PetWindow(_FakeAnimLib(), config)
-    try:
-        legacy = config.dir / f"runtime-{os.getpid()}.json"
-        assert legacy.exists(), "flag 关的窗构造后必须写旧名标记"
-        v2 = list(config.dir.glob("pet-runtime-v2-*.json"))
-        assert v2 == [], f"flag 关的窗不得写 v2 标记，实际: {v2}"
+        assert legacy == [], f"窗不得写旧名标记，实际: {legacy}"
     finally:
         win.close()
         win.deleteLater()
@@ -1059,7 +935,6 @@ def test_spawn_in_process_window_routes_through_shared_seed(tmp_path, app, monke
     def fake_build_window(self, character_id, lib=None, build_tray=True):
         win = _FakeWindow()
         win.cfg = self.config
-        win._single_process_spawn = self.shell._single_process_spawn
         self.win = win
         return win
 
@@ -1102,7 +977,6 @@ def test_clear_spawned_pets_closes_in_process_children_no_residue(
     primary = shell.instance
     primary_win = _FakeWindow()
     primary_win.cfg = config
-    primary_win._single_process_spawn = True
     primary.win = primary_win
     primary_marker = slot_manager_mod.runtime_marker_path(
         config.dir, config.instance_id, versioned=True)
@@ -1115,7 +989,6 @@ def test_clear_spawned_pets_closes_in_process_children_no_residue(
                       enable_chat=True, slot_id=1)
     sec_win = _FakeWindow()
     sec_win.cfg = sec.config
-    sec_win._single_process_spawn = True
     sec.win = sec_win
     shell._instances.append(sec)
     sec_marker = slot_manager_mod.runtime_marker_path(
@@ -1160,7 +1033,6 @@ def test_clear_spawned_pets_without_in_process_children_is_noop(
     """4.4a：无进程内子窗时 clear_spawned_pets 是空操作——跨进程文件级清理
     （child_pet_cleanup：runtime 标记 + taskkill）随退役层停用。"""
     config = Config(tmp_path)
-    config.set("experimental_single_process_spawn", False)
     config.save()
     shell = AppShell(QApplication.instance(), config, enable_chat=True)
 
@@ -1192,7 +1064,6 @@ def _add_child_instance(shell, tmp_path, config, preferred_slot, monkeypatch):
                        enable_chat=True, slot_id=preferred_slot)
     win = _FakeWindow()
     win.cfg = inst.config
-    win._single_process_spawn = True
     inst.win = win
     shell._instances.append(inst)
     monkeypatch.setattr(inst.broker_facade, "shutdown", lambda: None)
@@ -1400,8 +1271,9 @@ def test_runtime_marker_written_on_first_show(tmp_path, app):
     win = PetWindow(FakeLibrary(), config)
     win.show()
     QApplication.instance().processEvents()
-    # 默认（flag 关）写旧名 runtime-<pid>.json
-    marker = config.dir / f"runtime-{os.getpid()}.json"
+    # 4.4b：恒写版本化名 pet-runtime-v2-<pid>-slot-<N>.json
+    marker = slot_manager_mod.runtime_marker_path(
+        config.dir, config.instance_id, versioned=True)
     assert marker.exists(), "首次显示必须登记 runtime 标记"
     data = json.loads(marker.read_text(encoding="utf-8"))
     assert data["pid"] == os.getpid()

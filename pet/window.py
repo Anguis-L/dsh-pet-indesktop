@@ -353,14 +353,14 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
     _draw_delta = QPoint(0, 0)
 
     def __init__(self, lib: MovieLibrary, config: Config,
-                 broker_facade=None, *, clock=None, single_process_spawn: bool = False, agent_link_manager=None, proactive_watcher=None) -> None:
+                 broker_facade=None, *, clock=None, agent_link_manager=None, proactive_watcher=None) -> None:
         super().__init__()
         self.lib = lib
         self.cfg = config
-        # 批5.2 N-1（复审阻塞项）：进程级 flag 快照必须在 __init__ 早期就位——
-        # 尾部 _restore_position() 会写/读 runtime 标记，若等构造返回后再注入，
-        # flag 开下每个窗的初始标记都会错用旧名（两窗互踩）。
-        self._single_process_spawn = bool(single_process_spawn)
+        # 4.4b：进程级共享子系统（agent_link / proactive / 全屏 watcher）常建，
+        # 全屏监视由共享 watcher 接管——建窗时由 app 置位（测试自建宿主缺席时
+        # 保留窗口自建 watcher 的旧路径）。
+        self.shared_fullscreen_watcher_active = False
         # 批5.3：ProcessShell 注入的共享解码 hook（DecodeFanoutHub，替代原
         # P3 BrokerFacade；默认 None = hub 关，窗口全部 broker 分支 no-op，
         # 与历史行为逐位一致）。

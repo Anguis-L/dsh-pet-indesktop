@@ -178,15 +178,8 @@ def _close_qt_top_level_widgets():
         _webm_clip_mod._reset_session_ending_for_tests()
     except Exception:
         pass
-    # collision IPC：stop 仍存活的 CollisionIpcSession（finally 语义）。
-    # 会话若在测试里未 stop，其 QThread 被 GC 时仍在跑 → 后续无关测试的
-    # processEvents 处 native abort（QThread: Destroyed while thread is still
-    # running，崩溃点漂移、Linux exit 139 根因）。
-    try:
-        from pet.collision_ipc import _stop_live_sessions_for_tests
-        _stop_live_sessions_for_tests()
-    except Exception:
-        pass
+    # collision IPC：4.4b 随多进程多宠退役层删除——collision_ipc 会话不再存在，
+    # 对应的 `_stop_live_sessions_for_tests` 收口一并移除。
     try:
         from pet.agent_link import AgentLinkManager, BaseAgentMonitor
         AgentLinkManager._shutdown_live_for_tests()

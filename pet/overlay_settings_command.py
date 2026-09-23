@@ -3,15 +3,15 @@
 
 设计稿：``.scratch/single-overlay-window/PHASE4_DESIGN.md``（§4 D12 / §5 4.2c）。
 
-问题：overlay 拓扑下子肥鱼是**进程内 sprite**，独立设置进程（``--settings``，
-settings.lock 单实例）里点「一键退出子肥鱼」无法跨进程删 sprite；旧回退链
-``child_pet_cleanup.clear_spawned_pets`` 靠 runtime 标记/slot 锁 taskkill
-子进程，在 overlay 拓扑下找不到任何目标，按钮静默失效。
+问题：子肥鱼是**进程内 sprite**，独立设置进程（``--settings``，
+settings.lock 单实例）里点「一键退出子肥鱼」无法跨进程删 sprite；已退役的
+旧回退链（runtime 标记/slot 锁 + taskkill 子进程）在进程内形态下找不到任何
+目标，按钮必然静默失效。
 
 机制：设置进程把一条指令原子写进配置目录的运行时状态文件，主进程（overlay
-壳）经 config 目录 watcher + 定时轮询消费，命中后执行 ``OverlayShell`` 侧的
-``clear_spawned_pets`` / ``exit_pet``。旧多进程路径（legacy 拓扑）完全不走这里，
-仍走 child_pet_cleanup，行为逐行不变。
+壳 / legacy AppShell）经 config 目录 watcher + 定时轮询消费，命中后执行各自的
+``clear_spawned_pets`` / ``exit_pet``。4.4b 起**两个拓扑共用这一条通道**（多进程
+多宠退役层删除后不再有跨进程子宠；见 modern_settings_dialog._on_clear_spawned_pets）。
 
 硬约束（本模块承载的纯逻辑部分）：
 

@@ -30,7 +30,7 @@ from pathlib import Path
 # glob（agent_link/config 迁移），也不与 runtime 标记 glob 相撞。
 ACTIVE_PETS_FILENAME = "overlay-active-pets.json"
 ACTIVE_PETS_VERSION = 1
-# slot 扫描上限（对齐 slot_manager.acquire_pet_slot 的 max_scan_slots=128）
+# slot 扫描上限（128：与前垃圾槽位分配器的 max_scan_slots 同口径）
 MAX_SCAN_SLOTS = 128
 
 _GEOMETRY_KEYS = ("rx", "ry", "facing", "scale")

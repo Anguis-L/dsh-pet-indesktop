@@ -945,34 +945,6 @@ def test_modern_provisional_config_falls_back_to_keyring(tmp_path, monkeypatch):
     app.processEvents()
 
 
-def test_spawned_children_are_reaped_after_exit():
-    """孵化的子进程退出后必须从登记表回收（防 POSIX 僵尸 / 句柄泄漏）。"""
-    import sys
-
-    import pet.instance_launcher as launcher
-
-    before = list(launcher._SPAWNED_CHILDREN)
-    try:
-        proc = launcher.launch_new_pet(offset_index=99)
-        assert proc in launcher._SPAWNED_CHILDREN
-        # 触发回收：活着的子进程必须保留
-        launcher._reap_children()
-        assert proc in launcher._SPAWNED_CHILDREN
-        # 退出后必须被回收
-        proc.terminate()
-        import time
-        deadline = time.time() + 10
-        while proc.poll() is None and time.time() < deadline:
-            time.sleep(0.05)
-        launcher._reap_children()
-        assert proc not in launcher._SPAWNED_CHILDREN
-    finally:
-        for proc in list(launcher._SPAWNED_CHILDREN):
-            if proc not in before and proc.poll() is None:
-                proc.terminate()
-        launcher._SPAWNED_CHILDREN[:] = before
-
-
 def test_modern_settings_close_autosaves(tmp_path, monkeypatch):
     """直接关闭（X）新版设置也必须落盘，不能只靠「保存并退出」。
 

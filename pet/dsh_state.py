@@ -42,7 +42,7 @@ from .agent_link import DirGlobTailer
 log = logging.getLogger("dsh-pet-standalone")
 
 # 存活 tracker 登记（弱引用）：供测试/退出路径统一收口在线探测线程。
-# 与 collision_ipc._live_sessions / agent_link 的 _shutdown_live_for_tests
+# 与 agent_link 的 _shutdown_live_for_tests
 # 同一防线：QTimer 停了还不够——在途 socket 探测线程必须作废其结果，
 # 否则 teardown 里 QObject 销毁后 worker 仍跨线程 emit（macOS 全量 segfault 族）。
 _LIVE_TRACKERS: "weakref.WeakSet[DshStateTracker]" = weakref.WeakSet()

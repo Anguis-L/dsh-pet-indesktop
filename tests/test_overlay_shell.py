@@ -422,28 +422,24 @@ def test_app_start_overlay_topology_takes_overlay_shell(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- D0 门控解绑（T3）
-def test_overlay_topology_enables_hub_and_shared_without_spawn_flag(
-        tmp_path, monkeypatch):
-    """D0：overlay 拓扑下 hub 常开 + 共享子系统常建，不再要求 spawn flag。
+def test_hub_and_shared_subsystems_are_always_on(tmp_path, monkeypatch):
+    """D0 + 4.4b：hub 常开、共享子系统常建，**不再有任何 spawn flag 门控**。
 
-    契约来源 PHASE4_DESIGN T3/D0：overlay 拓扑里多 sprite 同角色若各建解码链
-    会退化成 N 路独立 ffmpeg；共享子系统缺位则是静默缺失。门控改挂拓扑门，
-    但 flag 本身的默认值/设置页/schema 一律不动。
+    契约来源 PHASE4_DESIGN T3/D0：多 sprite/多窗同角色若各建解码链会退化成
+    N 路独立 ffmpeg；共享子系统缺位则是静默缺失。4.4b 起 spawn 开关键已删除，
+    拓扑差异只剩 OverlayShell 与 PetWindow 两条渲染面。
     """
     monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
-    cfg = Config(tmp_path)
-    cfg.set("experimental_single_process_spawn", False)
-    shell = AppShell(app, cfg)
+    shell = AppShell(app, Config(tmp_path))
     try:
-        assert shell._single_process_spawn is False    # 只解门控，不改 flag 快照
-        assert shell._decode_hub.enabled is True       # overlay 拓扑：hub 常开
-        assert shell._shared is not None               # overlay 拓扑：共享子系统常建
+        assert shell._decode_hub.enabled is True       # hub 常开
+        assert shell._shared is not None               # 共享子系统常建
     finally:
         shell._shared.stop_all()
 
 
 def test_overlay_topology_hub_respects_shared_decode_off(tmp_path, monkeypatch):
-    """拓扑门不吞 `experimental_shared_decode` 这个用户级总闸。"""
+    """用户级总闸 `experimental_shared_decode` 仍然生效。"""
     monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
     cfg = Config(tmp_path)
     cfg.set("experimental_shared_decode", False)
@@ -455,14 +451,18 @@ def test_overlay_topology_hub_respects_shared_decode_off(tmp_path, monkeypatch):
         shell._shared.stop_all()
 
 
-def test_legacy_topology_gate_unchanged_when_spawn_flag_off(tmp_path, monkeypatch):
-    """D0 回归护栏：legacy 拓扑 + flag 关 = 旧门控逐位一致（hub 关/无共享）。"""
+def test_legacy_topology_also_builds_shared_subsystems(tmp_path, monkeypatch):
+    """4.4b 回归护栏：legacy 拓扑同样常建共享子系统（T6 常开化）。
+
+    hub 的开关收敛为用户级 `experimental_shared_decode`（默认开）。
+    """
     monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
-    cfg = Config(tmp_path)
-    cfg.set("experimental_single_process_spawn", False)
-    shell = AppShell(app, cfg)
-    assert shell._decode_hub.enabled is False
-    assert shell._shared is None
+    shell = AppShell(app, Config(tmp_path))
+    try:
+        assert shell._decode_hub.enabled is True
+        assert shell._shared is not None
+    finally:
+        shell._shared.stop_all()
 
 
 # ---------------------------------------------------------------- 边缘探头壳层接线
