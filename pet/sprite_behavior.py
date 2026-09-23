@@ -87,6 +87,9 @@ class BehaviorController:
         self.margin = margin
         self.min_distance = min_distance
         self.max_distance = max_distance
+        # 不移动开关（菜单/config 写入口）：移动桶并入动作池（window.py
+        # _pick_next 的 no_move 语义）
+        self.no_move = False
         self._states: dict = {}
         # V-9：按库对象弱引用缓存——旧实现以 id(lib) 为键，库销毁后地址
         # 被新库复用会命中陈旧分类池（换角色/多宠生灭时拿到错素材名），
@@ -127,6 +130,36 @@ class BehaviorController:
         st.move_target = None
         sprite.set_velocity(QPointF(0, 0))
         sprite.bind_clip(name)
+        return True
+
+    def play_once(self, sprite, name: str) -> bool:
+        """一次性播放指定动画，播完回掷骰链（菜单「播放动画」入口，
+        window.py switch_clip 语义）。"""
+        if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL:
+            return False
+        st = self._states.setdefault(sprite, _SpriteState())
+        st.state = STATE_ACTS
+        st.pending_move = None
+        st.move_target = None
+        sprite.set_velocity(QPointF(0, 0))
+        st.elapsed = 0.0
+        st.anim = name
+        st.duration = self._clip_duration(sprite.library, name)
+        sprite.bind_clip(name)
+        return True
+
+    def play_move_once(self, sprite, name: str) -> bool:
+        """以指定移动素材触发一次移动（菜单「移动」类入口；无可达空间
+        回退动作池，window.py trigger_move 语义）。"""
+        if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL:
+            return False
+        cats = self._categories(sprite.library)
+        if name not in cats["moves"]:
+            return False
+        st = self._states.setdefault(sprite, _SpriteState())
+        if not self._plan_move(sprite, st, cats, anim_override=name):
+            self._enter_acts(sprite, st, cats)
+            return False
         return True
 
     def state_of(self, sprite) -> str | None:
@@ -182,8 +215,8 @@ class BehaviorController:
         else:
             action = STATE_MOVE
         if action == STATE_MOVE:
-            if not self._plan_move(sprite, st, cats):
-                # 移动失败回退动作池（window.py:2735 语义，acts 空则回退待机）
+            if self.no_move or not self._plan_move(sprite, st, cats):
+                # 不移动/移动失败回退动作池（window.py:2735 语义，acts 空回待机）
                 self._enter_acts(sprite, st, cats)
             return
         # 朝向闸门（window.py:2735-2745）：需要纠正朝向时一律播转向；
@@ -242,8 +275,10 @@ class BehaviorController:
         sprite.set_velocity(QPointF(0, 0))
         sprite.bind_clip(name)
 
-    def _plan_move(self, sprite, st: _SpriteState, cats: dict) -> bool:
-        """排定一次移动（window.py _try_move 语义）；返回 False = 未建立计划。"""
+    def _plan_move(self, sprite, st: _SpriteState, cats: dict,
+                   anim_override: str | None = None) -> bool:
+        """排定一次移动（window.py _try_move 语义）；返回 False = 未建立计划。
+        anim_override：菜单「移动」类指定素材（trigger_move），None = 掷骰随机。"""
         moves = cats["moves"]
         if not moves:
             return False
@@ -258,7 +293,7 @@ class BehaviorController:
         if far < self.min_distance:
             return False
         distance = self.rng.randint(self.min_distance, far)
-        name = self._pick(moves)
+        name = anim_override if anim_override is not None else self._pick(moves)
         if name is None:
             return False
         lib = sprite.library

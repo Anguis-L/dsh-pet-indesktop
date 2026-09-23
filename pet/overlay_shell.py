@@ -93,6 +93,20 @@ class ShellOverlayWindow(OverlayWindow):
             if callable(cb):
                 cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        """4.1c：有全量菜单建造器（产品壳）走 facade 菜单，否则基类最小集。"""
+        builder = getattr(self, "_full_menu_builder", None)
+        if builder is None:
+            super().contextMenuEvent(event)
+            return
+        target = self.sprite_at(event.pos())
+        if target is None:
+            event.ignore()
+            return
+        menu = builder()
+        menu.exec(event.globalPos())
+        event.accept()
+
 
 class OverlayShell(QObject):
     """overlay 拓扑产品壳：主屏 overlay + 主 sprite + 进程级三控制器。
@@ -139,6 +153,9 @@ class OverlayShell(QObject):
         self.overlay = ShellOverlayWindow(self._screen, self._advance_controllers)
         self.overlay.behavior = self.behavior
         self.overlay.click_feedback = self._sound.on_click
+        # 4.1c 全量右键菜单（facade 适配旧 context_menus 建造器）
+        from .sprite_menu_facade import build_sprite_full_menu
+        self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
         self.lib = self._create_main_library()
         scale = float(self._config.get("scale") or catalog.DEFAULT_SCALE)
         self.sprite = self._sprite_factory(self.lib, QPointF(0, 0), scale)
@@ -384,18 +401,50 @@ class OverlayShell(QObject):
         except Exception:
             logging.debug("overlay: 删 runtime 标记失败", exc_info=True)
 
-    def _toggle_pet_visible(self) -> None:
-        """托盘显隐（app.py toggle_visible 等价）+ 岛状态同步。"""
-        if self.overlay.isVisible():
-            self.overlay.hide()
-        else:
+    def set_pet_visible(self, visible: bool) -> None:
+        """显隐切换（app.py toggle_visible 等价）+ 岛状态同步。"""
+        if visible:
             self.overlay.show()
+        else:
+            self.overlay.hide()
         island = getattr(getattr(self._instance, "shell", None), "island", None)
         if island is not None:
             try:
-                island.set_pet_visible(self.overlay.isVisible())
+                island.set_pet_visible(bool(visible))
             except Exception:
                 pass
+
+    def _toggle_pet_visible(self) -> None:
+        self.set_pet_visible(not self.overlay.isVisible())
+
+    def switch_character(self, character_id: str) -> None:
+        """切换角色（4.1c）：换 per-pet 库 + 行为状态重置 + 配置持久化。
+
+        per-pet 库是 T3 定论：新建库给主 sprite，旧库 shutdown 收尾 clip；
+        行为状态机 forget 后下个 tick 自动接管 bind（防旧 clip 跨库残留）。
+        """
+        current = str(self._config.get("character", catalog.DEFAULT_CHARACTER))
+        if not character_id or character_id == current:
+            return
+        try:
+            new_lib = self._instance._create_library(character_id)
+        except Exception:
+            logging.exception("overlay: 切换角色建库失败 %s", character_id)
+            return
+        self._config.set("character", character_id)
+        save = getattr(self._config, "save", None)
+        if callable(save):
+            save()
+        old_lib = self.lib
+        self.lib = new_lib
+        self.sprite.library = new_lib
+        self.behavior.forget(self.sprite)
+        shutdown = getattr(old_lib, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                logging.exception("overlay: 旧素材库收尾失败")
 
     # ---------------------------------------------------------------- 屏事件
     def _wire_screen_signals(self) -> None:

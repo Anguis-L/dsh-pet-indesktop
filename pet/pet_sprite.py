@@ -94,6 +94,10 @@ class PetSprite(QObject):
         # 甩出速度软上限（px/s，对应旧架构 throw_strength 档位）：由集成层
         # 按设置写入，松手初速过 physics.soft_clamp_speed 时以此为渐近值
         self.throw_speed_cap = physics_mod.MAX_THROW_SPEED
+        # 播放速率（菜单「播放速率」写入口）：bind_clip 起播时应用到新 clip
+        self.playback_speed = 1.0
+        # 拖动物理开关（菜单「拖动物理」）：False 时松手原地放下（不抛掷）
+        self.drag_physics = True
         # 见模块顶部 INTERACTION_* 常量：跨模块协调协议的唯一权威字段
         self.interaction_state = INTERACTION_NORMAL
 
@@ -331,6 +335,9 @@ class PetSprite(QObject):
         self._pixmap = None
         self._hit_image = None
         self._frame_dirty = True
+        setter = getattr(self._clip, "set_playback_speed", None)
+        if callable(setter):
+            setter(self.playback_speed)
         start = getattr(self._clip, "start", None)
         if callable(start):
             start()
@@ -487,6 +494,8 @@ class PetSprite(QObject):
         rvx, rvy = physics_mod.estimate_release_velocity(
             self._drag_trail, self._clock(), cap=self.throw_speed_cap)
         self._drag_trail = []
+        if not self.drag_physics:
+            rvx, rvy = 0.0, 0.0  # 拖动物理关：原地放下（window.py 同语义）
         if math.hypot(rvx, rvy) < physics_mod.DEAD_ZONE_SPEED:
             self.velocity = QPointF(0, 0)
             self.interaction_state = INTERACTION_NORMAL
