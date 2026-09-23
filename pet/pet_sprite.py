@@ -73,6 +73,7 @@ class PetSprite(QObject):
         # 记"上次上报给 overlay 的 rect"，advance 据此捕获 tick 之外
         # （物理控制器/拖拽事件）发生的位移。
         self._dirty_cb = None
+        self._kinetic_cb = None  # M-1：运动信号回调（overlay 挂接）
         self._last_reported_rect: QRect | None = None
         self.pos = QPointF(0, 0)
         self.set_pos(pos if pos is not None else QPointF(0, 0))
@@ -276,6 +277,11 @@ class PetSprite(QObject):
 
     def set_velocity(self, velocity: QPointF) -> None:
         self.velocity = QPointF(velocity)
+        # M-1：非零速度 = 运动信号，同步唤醒 tick 档位——行为掷骰起步、
+        # 碰撞写回、松手甩出都不等下一个（可能已降档的）tick
+        cb = self._kinetic_cb
+        if cb is not None and not self.velocity.isNull():
+            cb()
 
     def close(self) -> None:
         """释放 clip 所有权（V-8）：断开信号 + 停解码 + 清帧缓存。
@@ -299,6 +305,7 @@ class PetSprite(QObject):
         self._pixmap = None
         self._hit_image = None
         self._dirty_cb = None
+        self._kinetic_cb = None
         self._last_reported_rect = None
 
     # ---------------------------------------------------------------- clip 绑定

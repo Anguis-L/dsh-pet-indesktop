@@ -19,12 +19,21 @@ Phase 3b：sprite 位置监听（add_position_listener）——sprite 不产生 
 from __future__ import annotations
 
 import sys
+import time
 
 from PySide6.QtCore import QElapsedTimer, QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QCursor, QPainter, QRegion, QScreen
 from PySide6.QtWidgets import QApplication, QWidget
 
+from .pet_sprite import INTERACTION_NORMAL
 from .sprite_menu import build_sprite_menu
+from .tick_governor import (
+    ANIMATING_WINDOW_S,
+    TIER_ACTIVE,
+    TIER_INTERVAL_MS,
+    TIER_OCCLUDED,
+    TickGovernor,
+)
 
 if sys.platform == "win32":
     from .platform_win import WindowsPerPixelInputController, _set_windows_no_activate
@@ -62,6 +71,10 @@ class OverlayWindow(QWidget):
         self._input_controller = None
         # sprite 移除通知（V-9）：行为控制器状态表等外部簿记的注销挂点
         self._sprite_removed_listeners: list = []
+        # M-1 闲置降档：governor 决策 + 最近帧到达时间（"动画在播"判定）
+        self._governor = TickGovernor()
+        self._applied_tier = TIER_ACTIVE
+        self._last_frame_notify: float | None = None
 
         self._elapsed = QElapsedTimer()
         self._tick_count = 0
@@ -86,15 +99,63 @@ class OverlayWindow(QWidget):
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
         self._elapsed.start()
+        self._governor.notify_kinetic()  # 启动即 T0（首段仿真全速）
+        self._sync_tier()
         self._timer.start()
 
     def stop(self) -> None:
         self._timer.stop()
 
+    # ---------------------------------------------------------------- M-1 闲置降档
+    @staticmethod
+    def _sprite_in_motion(sprite) -> bool:
+        """sprite 是否在运动（velocity≠0 或 interaction_state≠normal）。"""
+        v = getattr(sprite, "velocity", None)
+        is_null = getattr(v, "isNull", None)
+        if callable(is_null):
+            if not is_null():
+                return True
+        elif v:
+            return True
+        return getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL
+
+    def _sync_tier(self) -> None:
+        """评估目标档位并在变化时应用（升档在 evaluate 内即生效）。"""
+        animating = (
+            self._last_frame_notify is not None
+            and time.monotonic() - self._last_frame_notify < ANIMATING_WINDOW_S
+        )
+        tier = self._governor.evaluate(
+            any_motion=any(self._sprite_in_motion(s) for s in self.sprites),
+            animating=animating,
+            visible=self.isVisible(),
+        )
+        if tier != self._applied_tier:
+            self._apply_tier(tier)
+
+    def _apply_tier(self, tier: int) -> None:
+        """把档位应用到 QTimer：T0 按刷新率 + Precise，其余固定间隔 + Coarse。"""
+        self._applied_tier = tier
+        if tier == TIER_ACTIVE:
+            self._refresh_tick_interval()  # 切入 T0 必重读 rr（电池 DRR）
+            self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        else:
+            self._timer.setInterval(TIER_INTERVAL_MS[tier])
+            self._timer.setTimerType(Qt.TimerType.CoarseTimer)
+        # 切档后首 tick 不吃历史流逝（防 dt 突变一步跨出大位移）
+        self._elapsed.restart()
+
+    def _note_kinetic(self) -> None:
+        """运动/输入信号：升档同步立即，不等下一个 tick（M-1 硬指标——
+        高刷体验只在真正闲置时让位，任何活动瞬间回全速）。"""
+        self._governor.notify_kinetic()
+        self._sync_tier()
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._refresh_tick_interval()  # V-6：显示时重读刷新率（电池 DRR）
         self._feed_dpr()               # V-11：DPR 由 overlay 统一喂
+        self._note_kinetic()           # M-1：可见即回 T0（从 T3 唤醒）
         if sys.platform == "win32" and self._input_controller is None:
             # 逐像素穿透：未命中任何 sprite 的屏幕区域点击直达下层应用——
             # 全屏 overlay 不抢占桌面交互（硬指标"体验不回退"的底线）。
@@ -120,7 +181,18 @@ class OverlayWindow(QWidget):
         if sprite in self.sprites:
             return
         self.sprites.append(sprite)
-        sprite._dirty_cb = lambda old, new: self.update(QRegion(old) | QRegion(new))
+
+        def _on_sprite_dirty(old, new):
+            if old != new:
+                # 位移 = 运动信号（M-1）：物理/拖拽/行为位移同步升档
+                self._note_kinetic()
+            else:
+                # 纯帧通知：记录动画活性（"动画在播"判定的输入）
+                self._last_frame_notify = time.monotonic()
+            self.update(QRegion(old) | QRegion(new))
+
+        sprite._dirty_cb = _on_sprite_dirty
+        sprite._kinetic_cb = self._note_kinetic  # set_velocity 直报（M-1）
         # V-11：DPR 由 overlay 统一按所在屏喂（此前靠调用方记得，demo 从没
         # 喂过）；取 QScreen 而非 widget 的 devicePixelRatioF——窗口未
         # realize 前后者不可信（offscreen/壳层构建期恒 1.0）
@@ -151,6 +223,7 @@ class OverlayWindow(QWidget):
         self.sprites.remove(sprite)
         self._position_listeners.pop(sprite, None)
         sprite._dirty_cb = None
+        sprite._kinetic_cb = None
         if release_clip:
             close = getattr(sprite, "close", None)
             if callable(close):
@@ -195,11 +268,18 @@ class OverlayWindow(QWidget):
         """
 
     def _on_tick(self, dt: float | None = None) -> None:
+        if self._applied_tier == TIER_OCCLUDED:
+            # T3 心跳：不跑仿真，只复查档位（可见性/刷新率变化经 showEvent
+            # 与本路径恢复）
+            self._elapsed.restart()
+            self._sync_tier()
+            return
         if dt is None:
-            # 首 tick 没有已流逝时间，按定时器间隔计；后续按实测流逝，封顶
-            # 50ms 防卡顿后位置跳变（语义同 Phase 0 探针）。
             if self._tick_count:
-                dt = min(0.05, self._elapsed.nsecsElapsed() / 1e9)
+                # dt 上限按档钳：T0 50ms，低档放宽到 2× 档间隔——切档瞬间
+                # 不吃历史流逝造成的位置跳变
+                cap = max(2.0 * self._timer.interval() / 1000.0, 0.05)
+                dt = min(cap, self._elapsed.nsecsElapsed() / 1e9)
             else:
                 dt = self._timer.interval() / 1000.0
             self._elapsed.restart()
@@ -222,6 +302,7 @@ class OverlayWindow(QWidget):
                 cb(sprite)
         if not dirty.isEmpty():
             self.update(dirty)
+        self._sync_tier()  # M-1：tick 末评估降档（升档在事件/回调侧同步完成）
 
     # ---------------------------------------------------------------- 合成
     def paintEvent(self, event) -> None:
@@ -256,6 +337,7 @@ class OverlayWindow(QWidget):
 
     def contextMenuEvent(self, event) -> None:
         """右键菜单（Phase 3a）：命中 sprite 弹最小集菜单；未命中忽略。"""
+        self._note_kinetic()  # M-1：输入事件同步升档
         target = self.sprite_at(event.pos())
         if target is None:
             event.ignore()  # 未命中：不弹菜单（Windows 穿透轮询会把右键让给下层）
@@ -266,6 +348,7 @@ class OverlayWindow(QWidget):
         event.accept()
 
     def mousePressEvent(self, event) -> None:
+        self._note_kinetic()  # M-1：输入事件同步升档
         if event.button() != Qt.MouseButton.LeftButton:
             # V-13：左键拖拽中被其它键打断——先合成 release 收尾，否则
             # sprite 卡 drag 态（behavior 跳过、velocity 已清零）直到下次按下
@@ -291,11 +374,13 @@ class OverlayWindow(QWidget):
         if self._mouse_grab is None:
             event.ignore()
             return
+        self._note_kinetic()  # M-1：拖拽移动保持 T0
         # grab 期间事件直达被按住的 sprite（光标移出/落到别的 sprite 上不换手）
         self._mouse_grab.on_move(event.position())
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
+        self._note_kinetic()  # M-1：松手（甩出判定）同步升档
         grab = self._mouse_grab
         self._finish_grab(event.position())
         if grab is None:
