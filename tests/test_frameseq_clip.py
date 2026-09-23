@@ -172,8 +172,8 @@ def test_decode_layer_compat_noops(tmp_path):
         clip.warm_first_frame()
         assert clip.currentImage() is not None  # warm 装载第 0 帧
         clip.cancel_first_frame_warm()
-        assert clip.decode_throttle_divisor() == 1
-        assert clip.decode_pace_external() is False
+        assert clip.decode_throttle_divisor == 1  # property（与 WebMClip 同形）
+        assert clip.decode_pace_external is False
         clip.set_decode_pace_external(True)
         clip.set_decode_throttle(2)
         clip.set_recycle_minutes(5)
@@ -248,5 +248,5 @@ def test_decode_layer_attrs_are_properties():
     """decode_throttle_divisor/decode_pace_external 必须与 WebMClip 同形
     （property 只读）——window.py:2646/decode_fanout.py:329 按属性读，
     普通方法会在 FrameSeqClip 路径 TypeError（4.4b 评审实测）。"""
-    assert isinstance(type(FrameSeqClip).__dict__["decode_throttle_divisor"], property)
-    assert isinstance(type(FrameSeqClip).__dict__["decode_pace_external"], property)
+    assert isinstance(FrameSeqClip.__dict__["decode_throttle_divisor"], property)
+    assert isinstance(FrameSeqClip.__dict__["decode_pace_external"], property)
