@@ -90,6 +90,9 @@ class ShellOverlayWindow(OverlayWindow):
         threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
         if (event.position() - press).manhattanLength() < threshold:
             self.behavior.on_sprite_clicked(grab)
+            squash = getattr(grab, "squash", None)
+            if callable(squash):
+                squash()  # 4.1c 点击 Q 弹（window.py:3473 语义）
             cb = getattr(self, "click_feedback", None)
             if callable(cb):
                 cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
@@ -168,6 +171,8 @@ class OverlayShell(QObject):
         # 4.1c 音效：点击 + 碰撞（click_sound 默认包，静默降级）
         self._sound = SpriteSoundPlayer(self._config, self.collision)
         self.collision.add_collision_listener(self._sound.on_collision)
+        # 4.1c 碰撞 Q 弹：真撞击量级 → 双方 sprite 挤压
+        self.collision.add_collision_listener(self._on_collision_squash)
         self.overlay = ShellOverlayWindow(self._screen, self._advance_controllers)
         self.overlay.behavior = self.behavior
         self.overlay.click_feedback = self._sound.on_click
@@ -460,6 +465,18 @@ class OverlayShell(QObject):
 
     def _toggle_pet_visible(self) -> None:
         self.set_pet_visible(not self.overlay.isVisible())
+
+    def _on_collision_squash(self, event) -> None:
+        """碰撞 Q 弹（collision_client._start_squash 语义）：真撞击量级时
+        双方 sprite 各压一次。runtime_id 反查 sprite（成员少，线性即可）。"""
+        if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
+            return
+        from .sprite_collision import SpriteCollisionWorld
+        for sprite in self.overlay.sprites:
+            if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
+                squash = getattr(sprite, "squash", None)
+                if callable(squash):
+                    squash()
 
     def _say_feeding_bubble(self, files: int, folders: int,
                             total_bytes: int, stats: dict) -> None:

@@ -277,3 +277,32 @@ def test_clamp_when_body_wider_than_bounds(body_box):
 def test_home_screen_placeholder():
     sprite = PetSprite(FakeLibrary(FakeClip()), scale=0.5)
     assert sprite.home_screen is None                  # T2 多屏占位字段
+
+
+# ---------------------------------------------------------------- 4.1c squash
+def test_squash_geometry_matches_window_formula():
+    """Q 弹矩形 = window.py:198 _squash_geometry 同式（底中锚定）。"""
+    import math
+    sprite = _clamped_sprite(None)
+    sprite.set_pos(QPointF(100, 200))
+    sprite._squash_progress = 0.5
+    r = sprite.rect()
+    pulse = math.sin(math.pi * 0.5)
+    w = max(1, int(round(r.width() * (1.0 + 0.10 * pulse))))
+    h = max(1, int(round(r.height() * (1.0 - 0.15 * pulse))))
+    expected = QRect(r.x() + int(round((r.width() - w) / 2)),
+                     r.y() + (r.height() - h), w, h)
+    assert sprite._squashed_rect() == expected
+
+
+def test_squash_progresses_and_reports_dirty():
+    sprite = _clamped_sprite(None)
+    sprite.squash()
+    assert sprite._squash_progress == 0.0
+    seen = sprite.advance(0.1)          # 220ms 周期内：进度推进且报脏
+    assert seen is not None
+    assert 0.0 < sprite._squash_progress < 1.0
+    seen2 = sprite.advance(0.2)         # 过收势：清场但仍报一次脏（回正帧）
+    assert seen2 is not None
+    assert sprite._squash_progress is None
+    assert sprite.advance(0.016) is None  # 结束：恢复按需刷新

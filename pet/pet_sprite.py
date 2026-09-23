@@ -38,6 +38,9 @@ INTERACTION_NORMAL = "normal"
 INTERACTION_DRAG = "drag"
 INTERACTION_THROWN = "thrown"
 
+# Q 弹挤压时长（口径源 window.py:665 _squash_duration_ms）
+SQUASH_DURATION_MS = 220
+
 
 class PetSprite(QObject):
     """单个宠物 sprite：位置/朝向/缩放 + 当前 clip 帧的合成、命中与拖拽。"""
@@ -96,6 +99,9 @@ class PetSprite(QObject):
         self.throw_speed_cap = physics_mod.MAX_THROW_SPEED
         # 播放速率（菜单「播放速率」写入口）：bind_clip 起播时应用到新 clip
         self.playback_speed = 1.0
+        # Q 弹挤压（点击/碰撞反馈，window.py _squash_geometry 语义）：
+        # None = 未激活；否则 0..1 进度，advance 按 220ms 推进
+        self._squash_progress: float | None = None
         # 拖动物理开关（菜单「拖动物理」）：False 时松手原地放下（不抛掷）
         self.drag_physics = True
         # 见模块顶部 INTERACTION_* 常量：跨模块协调协议的唯一权威字段
@@ -369,8 +375,14 @@ class PetSprite(QObject):
                if self._last_reported_rect is not None else self.rect())
         if self.interaction_state == INTERACTION_NORMAL and not self.velocity.isNull():
             self.set_pos(self.pos + self.velocity * dt)  # 积分也过 body_box 钳制
+        squashing = False
+        if self._squash_progress is not None:
+            self._squash_progress += dt / (SQUASH_DURATION_MS / 1000.0)
+            if self._squash_progress >= 1.0:
+                self._squash_progress = None
+            squashing = True  # 收势帧也要再画一次（回正）
         new = self.rect()
-        if new != old or self._frame_dirty:
+        if new != old or self._frame_dirty or self._squash_progress is not None or squashing:
             self._frame_dirty = False
             self._last_reported_rect = new
             return (old, new)
@@ -425,11 +437,32 @@ class PetSprite(QObject):
         self._frame_sig = sig
         return True
 
+    def squash(self) -> None:
+        """启动 Q 弹挤压（点击/真碰撞反馈，window.py _start_squash 语义）。"""
+        self._squash_progress = 0.0
+        rect = self.rect()
+        self._notify_dirty(rect, rect)
+
+    def _squashed_rect(self) -> QRect:
+        """Q 弹帧的目标矩形（window.py:198 _squash_geometry 同式：
+        pulse=sin(π·progress)，sy=1-0.15·pulse，sx=1+0.10·pulse，底中锚定）。"""
+        r = self.rect()
+        progress = max(0.0, min(1.0, float(self._squash_progress or 0.0)))
+        pulse = math.sin(math.pi * progress)
+        w = max(1, int(round(r.width() * (1.0 + 0.10 * pulse))))
+        h = max(1, int(round(r.height() * (1.0 - 0.15 * pulse))))
+        x = r.x() + int(round((r.width() - w) / 2))
+        y = r.y() + (r.height() - h)
+        return QRect(x, y, w, h)
+
     def paint(self, painter: QPainter) -> None:
         """把当前帧画到 overlay 的 painter 上（pos 即 overlay 局部坐标）。"""
         self._rebuild_pixmap()
         if self._pixmap is not None:
-            painter.drawPixmap(self.pos, self._pixmap)
+            if self._squash_progress is not None:
+                painter.drawPixmap(self._squashed_rect(), self._pixmap)
+            else:
+                painter.drawPixmap(self.pos, self._pixmap)
 
     def alpha_at(self, local: QPoint | QPointF) -> int:
         """sprite 局部**逻辑**坐标处的 alpha（0-255）。镜像已烘焙进缓存帧，无需再翻转。
