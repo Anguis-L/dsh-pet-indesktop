@@ -101,15 +101,30 @@ def _make_shell(tmp_path, config_values=None):
     return shell, lib
 
 
+def _recursive_labels(container) -> set:
+    """递归枚举菜单文本：模板感知后条目可能落在分组子菜单里（modern 模板）。"""
+    labels = set()
+    for action in container.actions():
+        if action.isSeparator():
+            continue
+        labels.add(action.text())
+        if action.menu() is not None:
+            labels |= _recursive_labels(action.menu())
+    return labels
+
+
 def test_full_menu_builds_with_capability_items(tmp_path):
+    """两种模板下窗口能力条目都在（结构由 context_menus 建造器决定）。"""
     shell, _ = _make_shell(tmp_path)
     try:
-        menu = build_sprite_full_menu(shell)
-        titles = [a.text() for a in menu.actions()]
-        for expected in ("回到右下角", "窗口置顶", "不移动", "鼠标穿透",
-                         "开机自启", "隐藏桌宠", "桌宠设置", "退出"):
-            assert expected in titles, f"菜单缺项: {expected}"
-        assert menu._facade is not None  # F5 保活
+        for template in ("legacy", "modern"):
+            shell._config.set("context_menu_template", template)
+            menu = build_sprite_full_menu(shell)
+            labels = _recursive_labels(menu)
+            for expected in ("回到右下角", "窗口置顶", "不移动", "鼠标穿透",
+                             "开机自启", "隐藏桌宠", "桌宠设置", "退出"):
+                assert expected in labels, f"{template} 菜单缺项: {expected}"
+            assert menu._facade is not None  # F5 保活
     finally:
         shell._delete_runtime_marker()
 

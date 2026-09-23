@@ -30,6 +30,18 @@ from pet.sprite_menu_facade import build_sprite_full_menu
 app = QApplication.instance() or QApplication([])
 
 
+def _recursive_labels(container) -> set:
+    """递归枚举菜单文本（模板感知后条目可能落在分组子菜单里）。"""
+    labels = set()
+    for action in container.actions():
+        if action.isSeparator():
+            continue
+        labels.add(action.text())
+        if action.menu() is not None:
+            labels |= _recursive_labels(action.menu())
+    return labels
+
+
 def _make_persistent_shell(base, values=None):
     """真 Config（config.json 落盘）+ 真 PetSprite 的壳。
 
@@ -169,9 +181,9 @@ def test_menu_has_spawn_entries(tmp_path):
     shell, _ = fac._make_shell(tmp_path)
     try:
         menu = build_sprite_full_menu(shell)
-        titles = [a.text() for a in menu.actions()]
-        assert "生小肥鱼" in titles
-        assert "退出子肥鱼" in titles
+        labels = _recursive_labels(menu)
+        assert "生小肥鱼" in labels
+        assert "退出子肥鱼" in labels
     finally:
         shell._delete_runtime_marker()
 

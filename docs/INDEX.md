@@ -133,6 +133,7 @@
 
 | 文档 | 一句话内容 | 何时必读 |
 |---|---|---|
+| [`PR-REPORT-OVERLAY-MENU-PARITY-2026-09-24.md`](PR-REPORT-OVERLAY-MENU-PARITY-2026-09-24.md) | overlay 右键菜单完整 parity：facade 改为按 `context_menu_template` 分发 legacy/modern 建造器（修「设置说新版、右键出旧版」）、缺失条目逐项补齐（AI 对话/黄金回旋/音乐子菜单/边缘探头/大小/Harness/主动识屏/Agent 联动/模板切换…）+ 顺带修复 `close_on_trigger` 命令不派发（整类条目点不动）；含真实配置树导出、真实 PetWindow 机器比对与性能实测。 | 改 overlay 右键菜单/facade 方法面、`context_menu_template` 分流、菜单条目增删（模板感知）、或再遇「菜单点不动」「新版设置出旧菜单」时；改 overlay 音乐/看屏/黄金回旋宿主时也读。 |
 | [`PR-REPORT-PHASE4-4-RETIRE-MULTIPROCESS-2026-09-23.md`](PR-REPORT-PHASE4-4-RETIRE-MULTIPROCESS-2026-09-23.md) | Phase 4.4a/4.4b 多进程多宠退役层（停用 → 删除）报告：T6 清单逐条处置（碰撞 IPC/codec/client、instance_launcher、slot 锁、child_pet_cleanup、岛远端墙、spawn 开关键）、机器化守卫（文件不存在 + 全树零 import）、导入期 A/B 实测、两条拓扑真进程冒烟与既存 frameseq 缺陷。 | 改碰撞/多宠生命周期、`slot_manager`、`multi_window_shared`、runtime 标记、`PET_RENDER_TOPOLOGY` 分流时；或需要「为什么多进程多宠层被删、还剩什么」的权威口径时。 |
 | [`PR-REPORT-ISLAND-HIDDEN-CHAT-DEADLOCK-2026-09-23.md`](PR-REPORT-ISLAND-HIDDEN-CHAT-DEADLOCK-2026-09-23.md) | 纯桌宠版岛隐藏死锁修复：无聊天构建 hidden_chat 单击路由回退展开卡片（岛能力开关 + 设置页开关按构建变体隐藏）。 | 改灵动岛单击路由 / hidden_chat 设置 / 打包变体（无 pet.chat）行为时。 |
 | [`PR-REPORT-TEMPLATE.md`](PR-REPORT-TEMPLATE.md) | PR 报告模板：三份交付证据（修改文件说明 / 性能分析 / 实机运行记录）的逐节骨架与判定标准。 | **开新 PR 写报告前必读并整份复制**；2026-09-22 起三份证据是硬要求（`AGENTS.md` Delivery evidence discipline），由 `tests/test_pr_report_discipline.py` 机器化校验。 |

@@ -61,11 +61,14 @@ None，扇出集合为空等于联动/自说自话静默缺失（D0 的另一半
 
 from __future__ import annotations
 
+import copy
 import logging
+import threading
 import time
 from collections import deque
 
-from PySide6.QtCore import QObject, QPointF, QRect, QTimer, Qt
+import shiboken6
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QTimer, Qt, Signal
 from PySide6.QtWidgets import QMenu, QStyle, QSystemTrayIcon
 
 from . import catalog
@@ -293,6 +296,12 @@ class ShellOverlayWindow(OverlayWindow):
 
         D13：把**被点中的 sprite** 透传给建造器——菜单里的设置入口要按它自己的
         config 身份打开（否则右击子肥鱼的「桌宠设置」会静默打开主宠配置）。
+
+        close_on_trigger 动作在菜单可见时会被 ``connect_action`` 挂起
+        （``shared.defer_menu_callback`` → 根菜单 ``_deferred_callbacks``），
+        window.py 在 ``menu.exec()`` 返回后统一派发；overlay 此前没人派发 →
+        所有 close_on_trigger 条目（AI 对话/桌宠设置/隐藏桌宠/退出…）点下去
+        静默无反应。这里补上同一条收口。
         """
         builder = getattr(self, "_full_menu_builder", None)
         if builder is None:
@@ -304,7 +313,50 @@ class ShellOverlayWindow(OverlayWindow):
             return
         menu = builder(target)
         menu.exec(event.globalPos())
+        self._dispatch_deferred_menu_callbacks(menu)
         event.accept()
+
+    def _dispatch_deferred_menu_callbacks(self, menu) -> None:
+        """菜单关闭后派发挂起命令（window.py ``_show_context_menu`` 尾部等价物）。
+
+        定时器 context 绑**本窗**（长寿命）而不是菜单：菜单在事件返回后即无
+        Python 引用，绑定菜单会让 0ms 定时器随对象一起消失、命令永远不执行。
+        """
+        from .context_menus.shared import take_deferred_menu_callbacks
+
+        callbacks = take_deferred_menu_callbacks(menu)
+        if not callbacks:
+            return
+
+        def dispatch() -> None:
+            for callback in callbacks:
+                callback()
+
+        QTimer.singleShot(0, self, dispatch)
+
+    def reopen_context_menu(self, menu) -> None:
+        """按原位置重开右键菜单（模板切换立即生效；window.py 同名方法等价物）。
+
+        QMenu 会把请求点挪到不出屏的位置，沿用用户实际看到的坐标（同
+        window.py ``reopen_context_menu`` 的 ``_context_menu_anchor`` 口径）。
+        """
+        if menu is None:
+            return
+        global_pos = QPoint(menu.pos())
+        menu.close()
+        QTimer.singleShot(
+            10, self, lambda: self._exec_full_menu_at(global_pos))
+
+    def _exec_full_menu_at(self, global_pos: QPoint) -> None:
+        builder = getattr(self, "_full_menu_builder", None)
+        if builder is None:
+            return
+        target = self.sprite_at(self.mapFromGlobal(global_pos))
+        if target is None:
+            return
+        menu = builder(target)
+        menu.exec(global_pos)
+        self._dispatch_deferred_menu_callbacks(menu)
 
 
 class OverlayShell(QObject):
@@ -318,7 +370,15 @@ class OverlayShell(QObject):
     扇出目标——``agent_link_manager`` / ``proactive_watcher`` 由 AppShell 在
     拓扑分支处注入（等价 PetWindow 的构造参数）。注入失败=None 时全部呈现面
     静默空转，绝不阻断启动。
+
+    4.3 收口（菜单 parity 配套）：本壳同时承担 PetWindow 的两处**服务宿主**——
+    音乐（歌词）控制器（``install_music_lyric`` 四件套）与「看看屏幕」worker
+    （``look_at_screen`` + ``look_done`` 信号），以及 sprite 版「黄金回旋」。
+    overlay 拓扑下 PetWindow 不再存在，这三项功能没有别的落点。
     """
+
+    # 「看看屏幕」worker → GUI 线程（wire 口径同 PetWindow.look_done）
+    look_done = Signal(str, str, bool)
 
     def __init__(self, app, instance, *, screen=None, sprite_factory=None,
                  agent_link_manager=None, proactive_watcher=None) -> None:
@@ -350,6 +410,15 @@ class OverlayShell(QObject):
         self._spawned: list = []
         self._spawned_libs: dict = {}
         self._spawned_slots: dict = {}
+        # 音乐（歌词）宿主：懒建（window_optional_services 同款生命周期）
+        self._music_lyric = None
+        # 「看看屏幕」限流/忙碌状态（window.py 同名口径）
+        self._look_busy = False
+        self._last_look_ts = 0.0
+        self.look_done.connect(self._on_look_done)
+        # 黄金回旋：一条表现用 QTimer（不进 tick 关键路径）
+        self._golden_spin_timer: QTimer | None = None
+        self._golden_spin_started = 0.0
         # 4.3 后半：共享子系统注入（等价 PetWindow 的构造参数；None = 惰性空转）
         self.agent_link_manager = agent_link_manager
         self.proactive_watcher = proactive_watcher
@@ -555,6 +624,16 @@ class OverlayShell(QObject):
         return getattr(getattr(self, "_bubble_follower", None), "bubble", None)
 
     @property
+    def cfg(self):
+        """PetWindow 同名的配置面。
+
+        host 形消费者（``MusicLyricController`` / ``window_alerts`` 的若干分支）
+        直接读 ``win.cfg``；本壳内部用 ``_config``，这里补一个只读别名，避免
+        为了别名去改那些共享实现。
+        """
+        return self._config
+
+    @property
     def scale(self) -> float:
         """主 sprite 缩放（气泡字号/锚点的 pet_scale 来源）。"""
         return float(getattr(self.sprite, "scale", 1.0) or 1.0)
@@ -737,6 +816,140 @@ class OverlayShell(QObject):
         self._sticky_text = ""
         self._sticky_subtitle = ""
         self._sticky_buttons = None
+
+    # ---- 音乐（歌词）宿主（window_optional_services 四件套的 sprite 等价物）----
+    def install_music_lyric(self):
+        """安装歌词控制器（幂等）。
+
+        overlay 拓扑下 PetWindow 不存在，而右键菜单「音乐」子菜单与设置页
+        ``music_lyric_enabled`` 都需要一个控制器宿主。控制器只消费
+        ``cfg / isVisible / show_bubble / hold_bubble`` 四面，本壳全部具备，
+        故逐行对齐 ``window_optional_services.install_music_lyric``。
+        """
+        if self._music_lyric is None:
+            from .music_lyric_controller import MusicLyricController
+
+            self._music_lyric = MusicLyricController(self)
+        return self._music_lyric
+
+    def sync_music_lyric(self) -> None:
+        """按配置启停歌词显示（不再启用且从未装过 → 不白养定时器）。"""
+        enabled = bool(self._config.get("music_lyric_enabled", False))
+        if not enabled and self._music_lyric is None:
+            return
+        controller = self.install_music_lyric()
+        controller.apply_lead()
+        controller.sync_enabled(enabled)
+
+    def pause_music_lyric(self) -> None:
+        controller = getattr(self, "_music_lyric", None)
+        if controller is not None:
+            controller.pause()
+
+    def shutdown_music_lyric(self) -> None:
+        controller = getattr(self, "_music_lyric", None)
+        if controller is not None:
+            controller.shutdown()
+
+    # ---- 看看屏幕（window.py look_at_screen 的 sprite 等价物）----
+    def look_at_screen(self) -> None:
+        """截屏 → 视觉问答 → 气泡答复（限流口径逐点对齐 window.py）。"""
+        if self._look_busy:
+            self.show_bubble("上一张还没看完呢…")
+            return
+        now = time.monotonic()
+        if now - self._last_look_ts < 4.0:
+            self.show_bubble("喘口气嘛，刚看过啦…")
+            return
+        self._last_look_ts = now
+        self._look_busy = True
+        self.show_bubble("让我看看…", 6000)
+        # 主线程解析快照，后台 worker 只做网络/识图（同 window.py 的线程纪律）
+        settings = self._config.chat_settings()
+        provider = copy.copy(settings.active_config)
+        provider.api_key = self._config.resolve_api_key(provider)
+        system_prompt = settings.default_system_prompt
+        pet_name = self._config.character_display_name(
+            str(self._config.get("character", catalog.DEFAULT_CHARACTER)))
+        threading.Thread(
+            target=self._look_worker,
+            args=(provider, system_prompt, pet_name),
+            daemon=True,
+            name="overlay-look-screen",
+        ).start()
+
+    def _look_worker(self, provider, system_prompt, pet_name: str = "") -> None:
+        from . import vision as vision_mod
+
+        try:
+            shot = vision_mod.capture_screen_bytes()
+            app_info = vision_mod.foreground_app_info()
+            reply = vision_mod.ask_about_screen(
+                shot, app_info, system_prompt, provider, pet_name=pet_name)
+            if shiboken6.isValid(self) is False:
+                return  # 壳已销毁：不再触碰信号
+            user_text = f"[看看屏幕] 前台窗口：{app_info}" if app_info else "[看看屏幕]"
+            self.look_done.emit(reply, user_text, False)
+        except Exception as exc:
+            logging.exception("看看屏幕失败")
+            if shiboken6.isValid(self) is False:
+                return
+            self.look_done.emit(str(exc), "", True)
+
+    def _on_look_done(self, text: str, user_text: str, is_error: bool) -> None:
+        self._look_busy = False
+        if is_error:
+            self.show_bubble(f"看不清啊…{text[:60]}", 5000)
+            return
+        self.show_bubble(text, max(4000, min(12000, len(text) * 150)))
+        sync = self.on_look_synced
+        if callable(sync):
+            sync(user_text, text)
+
+    # ---- 黄金回旋（golden_spin.GoldenSpinController 的 sprite 等价物）----
+    def trigger_golden_spin(self) -> None:
+        """让主 sprite 原地逆时针转一圈。
+
+        sprite 世界的整帧旋转通道与抛掷彩蛋共用（``set_throw_rotation``），因此
+        探头激活 / 彩蛋会话在跑时让路——与 PetWindow「边缘探头激活时不叠加」
+        同一纪律。角度常量与缓动直接复用 ``golden_spin`` / ``window_effects``，
+        杜绝第二套数值。
+        """
+        sprite = self.sprite
+        if sprite is None or not callable(getattr(sprite, "set_throw_rotation", None)):
+            return
+        if getattr(self._probe, "active", False) or self._throw_egg.active:
+            return
+        timer = self._golden_spin_timer
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(16)
+            timer.timeout.connect(self._advance_golden_spin)
+            self._golden_spin_timer = timer
+        self._golden_spin_started = time.monotonic()
+        sprite.set_throw_rotation(0.0)
+        timer.start()
+
+    def _advance_golden_spin(self) -> None:
+        from .golden_spin import GOLDEN_SPIN_DURATION_MS, GOLDEN_SPIN_END_ANGLE
+        from .window_effects import eased_progress
+
+        timer = self._golden_spin_timer
+        sprite = self.sprite
+        if timer is None or sprite is None:
+            return
+        elapsed_ms = (time.monotonic() - self._golden_spin_started) * 1000.0
+        if elapsed_ms >= GOLDEN_SPIN_DURATION_MS:
+            timer.stop()
+            clear = getattr(sprite, "clear_throw_rotation", None)
+            if callable(clear):
+                clear()
+            else:
+                sprite.set_throw_rotation(0.0)
+            return
+        angle = GOLDEN_SPIN_END_ANGLE * eased_progress(
+            elapsed_ms, GOLDEN_SPIN_DURATION_MS)
+        sprite.set_throw_rotation(angle)
 
     # ---- 联动动作（agent_link 的 request_link_* 落点）----
     def _link_anim_busy(self) -> bool:
@@ -976,6 +1189,8 @@ class OverlayShell(QObject):
         self.app.installEventFilter(self)  # Esc 全局兜底（弹弓取消）
         if self.tray is not None:
             self.tray.show()
+        # 音乐（歌词）：配置开着才装/启（默认关 → 一行不跑，与 legacy 同纪律）
+        self.sync_music_lyric()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt 命名)
         """应用级 Esc 兜底：overlay 是防抢焦点窗（WS_EX_NOACTIVATE），
@@ -996,6 +1211,7 @@ class OverlayShell(QObject):
         self._started = False
         self.app.removeEventFilter(self)
         self._teardown_settings_command_watch()
+        self.shutdown_music_lyric()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
             bridge.close()
@@ -1016,6 +1232,7 @@ class OverlayShell(QObject):
         self._teardown_settings_command_watch()
         self._delete_runtime_marker()
         self._close_quick_chat()
+        self.shutdown_music_lyric()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
             bridge.close()
@@ -1143,6 +1360,7 @@ class OverlayShell(QObject):
     def refresh_settings(self) -> None:
         """外部配置变更应用点（AppShell._apply_external_config_change 扇出）。"""
         self._apply_window_capabilities()
+        self.sync_music_lyric()
 
     def _apply_window_capabilities(self) -> None:
         """按当前配置应用窗口能力（4.1b parity）：on_top / 穿透复合 /

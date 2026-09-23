@@ -520,6 +520,17 @@ def add_edge_probe(menu: QMenu, pet, *, icons: bool = True):
     return action
 
 
+def _dialog_parent(pet):
+    """模态对话框的父窗口。
+
+    ``pet`` 在窗口路径下就是 QWidget（PetWindow）；在 sprite 路径下是
+    ``SpriteMenuFacade`` 这样的 duck-typed 宿主，不能当 QMessageBox 的 parent，
+    此时用宿主自报的 ``dialog_parent``（overlay 窗）。PetWindow 没有该属性 →
+    原样返回自己，窗口路径逐位不变。
+    """
+    return getattr(pet, "dialog_parent", None) or pet
+
+
 def add_harness(menu: QMenu, pet, *, icons: bool = True):
     """DeepSeek Harness 子菜单：启动 / 重启 / 停止。
 
@@ -532,19 +543,25 @@ def add_harness(menu: QMenu, pet, *, icons: bool = True):
     """
     start_icon = "harness" if icons else None
     submenu = add_submenu(menu, "DeepSeek Harness", start_icon)
+
+    def _launch(action: str = "start") -> None:
+        # 父窗口在**点击时**解析：宿主（facade）可能在菜单关闭后被回收，
+        # 这里只读它自报的 dialog_parent 面，不缓存对象。
+        launch_harness_gui(_dialog_parent(pet), action=action)
+
     # 三个动作都 close_on_trigger：菜单先关闭、回调延迟到菜单关闭后执行——
     # 重启/停止的确认框是模态框，macOS 原生菜单跟踪会话中弹模态框会被
     # AppKit 抑制（与设置对话框首次点击无反应同源）。
-    add_action(submenu, "启动并打开页面", start_icon, lambda: launch_harness_gui(pet),
+    add_action(submenu, "启动并打开页面", start_icon, _launch,
                close_on_trigger=True)
     add_action(
         submenu, "重启服务", "play" if icons else None,
-        lambda: launch_harness_gui(pet, action="restart"),
+        lambda: _launch("restart"),
         close_on_trigger=True,
     )
     add_action(
         submenu, "停止服务", "quit" if icons else None,
-        lambda: launch_harness_gui(pet, action="stop"),
+        lambda: _launch("stop"),
         close_on_trigger=True,
     )
     return submenu
