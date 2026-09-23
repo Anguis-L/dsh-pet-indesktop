@@ -47,6 +47,12 @@ SQUASH_DURATION_MS = 220
 class PetSprite(QObject):
     """单个宠物 sprite：位置/朝向/缩放 + 当前 clip 帧的合成、命中与拖拽。"""
 
+    # 抛掷头部跟随角（度；pet/sprite_throw_egg 彩蛋）的惰性实例字段 + 类级默认。
+    # 纯加法（并行改动纪律：不进 __init__，首次写入才落到实例 __dict__）；类级
+    # 默认让绘制/命中热路径读成一次普通属性访问——角度 0（未激活彩蛋）时
+    # 不产生任何变换、不分配对象，与改造前路径同成本。
+    _throw_angle = 0.0
+
     def __init__(
         self,
         library: MovieLibrary,
@@ -388,6 +394,17 @@ class PetSprite(QObject):
         overlay.paintEvent 的 ``region.intersects(sprite.rect())`` 闸门不会
         漏画。角度 0 时无额外计算成本。
         """
+        # 热路径直接读惰性字段（一次属性访问，省去 property 调用；见
+        # set_throw_rotation）：抛掷角为 0 时与改造前路径同成本。
+        throw = self._throw_angle
+        if abs(throw) >= 1e-6:
+            # 抛掷旋转（pet/sprite_throw_egg 彩蛋，纯加法通道）：与探头旋转同轴
+            # （同一旋转中心 = 帧绘制矩形中心），两次同轴旋转的合成就是角度
+            # 相加，故投影外接矩形直接按 (探头角 + 抛掷角) 算。抛掷角为 0 时
+            # 不进本分支，下面保持改造前的零成本路径。
+            rect = self.rect()
+            return rotated_region_bounds(
+                rect, rect, self._probe_angle + throw).united(rect)
         rect = self.rect()
         if abs(self._probe_angle) < 1e-6:
             return rect
@@ -423,6 +440,44 @@ class PetSprite(QObject):
         self._probe_exposure = 1.0
         self.set_pos(self.pos)  # 常规钳制钳回屏内（位置没变时不重复报脏）
         self._notify_dirty(old, self.paint_bounds())
+
+    # ---------------------------------------------------------------- 抛掷旋转（throw_egg 彩蛋）
+    @property
+    def throw_rotation(self) -> float:
+        """抛掷头部跟随角（度；0.0 = 无抛掷旋转，绘制路径零成本）。
+
+        纯加法通道（并行改动纪律：实例字段不进 __init__，类级默认 0.0，首次
+        写入才落到实例 __dict__），与探头姿态（_probe_angle/_probe_exposure）
+        完全独立——set/clear 本通道绝不改探头姿态。
+        """
+        return float(self._throw_angle)
+
+    def set_throw_rotation(self, angle_deg: float) -> None:
+        """写入抛掷旋转角（度，绕帧绘制矩形中心），走既有脏矩形上报通道。
+
+        与探头姿态在绘制路径合成：抛掷旋转先入栈（外层）、探头旋转在内层，
+        同一旋转中心 → 合成等价于「探头角 + 抛掷角」（paint_bounds 用同一
+        口径算投影外接矩形，alpha_at 用同一口径做逆变换）。角度未变时 no-op
+        （彩蛋每 tick 调用它）；0.0 = 回正（clear_throw_rotation 的等价物）。
+        """
+        angle = float(angle_deg)
+        if angle == self._throw_angle:
+            return
+        old = self.paint_bounds()
+        self._throw_angle = angle
+        self._notify_dirty(old, self.paint_bounds())
+
+    def clear_throw_rotation(self) -> None:
+        """清抛掷旋转（回正）；未激活时 no-op（幂等）。"""
+        self.set_throw_rotation(0.0)
+
+    def _begin_throw_rotation(self, painter: QPainter, angle_deg: float) -> None:
+        """抛掷旋转入栈（paint 的纯加法挂载点；角度 0 时调用方不会进来）。"""
+        begin_rotation(painter, self.rect(), angle_deg)
+
+    def _end_throw_rotation(self, painter: QPainter, angle_deg: float) -> None:
+        """与 _begin_throw_rotation 配对出栈（同一角度，paint 内不会中途变化）。"""
+        end_rotation(painter, angle_deg)
 
     def close(self) -> None:
         """释放 clip 所有权（V-8）：断开信号 + 停解码 + 清帧缓存。
@@ -599,6 +654,13 @@ class PetSprite(QObject):
         self._rebuild_pixmap()
         if self._pixmap is None:
             return
+        # 抛掷旋转（pet/sprite_throw_egg 彩蛋）：先入栈（外层），原有探头旋转
+        # 在内层；同一旋转中心 → 合成等价于「探头角 + 抛掷角」（paint_bounds
+        # 同口径）。角度 0（非彩蛋稳态）只多一次惰性字段读取、不进任何变换，
+        # 改造前路径保持零成本。
+        throw_angle = self._throw_angle
+        if abs(throw_angle) >= 1e-6:
+            self._begin_throw_rotation(painter, throw_angle)
         angle = self._probe_angle
         begin_rotation(painter, self.rect(), angle)
         try:
@@ -608,6 +670,8 @@ class PetSprite(QObject):
                 painter.drawPixmap(self.pos, self._pixmap)
         finally:
             end_rotation(painter, angle)
+        if abs(throw_angle) >= 1e-6:  # 与上面的 begin 配对出栈
+            self._end_throw_rotation(painter, throw_angle)
 
     def alpha_at(self, local: QPoint | QPointF) -> int:
         """sprite 局部**逻辑**坐标处的 alpha（0-255）。镜像已烘焙进缓存帧，无需再翻转。
@@ -622,6 +686,16 @@ class PetSprite(QObject):
         四舍五入取整，逻辑末列 ×dpr 可能越界误判穿透；按图实际比例换算
         则整幅逻辑矩形恰好覆盖整幅命中图。负数坐标 floor 到图外返回 0。
         """
+        # 热路径直接读惰性字段（一次属性访问，省去 property 调用；见
+        # set_throw_rotation）：抛掷角为 0 时与改造前路径同成本。
+        throw = self._throw_angle
+        if abs(throw) >= 1e-6:
+            # 抛掷角参与命中逆变换（旧机 _effects_untransform 同口径：画在哪 =
+            # 能点到哪）。绘制外层是抛掷旋转、内层是探头旋转且同中心，逆变换
+            # 必须先撤外层（本步），再由下面的既有分支撤探头角——同轴逆旋转
+            # 叠加，与「逆旋转 (探头角 + 抛掷角)」等价。
+            lw0, lh0 = self._logical_size()
+            local = unrotate_point(QPointF(local), QRect(0, 0, lw0, lh0), throw)
         img = self._hit_image
         if img is None:
             return 0
