@@ -219,3 +219,26 @@ def test_library_without_frameseq_keeps_webm_path(tmp_path):
     clip = lib.movie("x")
     from pet.webm_clip import WebMClip
     assert isinstance(clip, WebMClip)       # 现路径逐行不变
+
+
+def test_shared_prefetch_thread_shutdown_and_recreate(tmp_path):
+    """退出收口：aboutToQuit 停共享预取线程（防解释器退出 0xC0000409），
+    且收口后可懒重建（测试/会话内 QApplication 反复生灭）。"""
+    from pet import frameseq_clip
+
+    _make_frames(tmp_path, count=2)
+    clip = FrameSeqClip(tmp_path)
+    thread = frameseq_clip._shared_thread
+    assert thread is not None and thread.isRunning()
+    frameseq_clip._shutdown_shared_prefetch()
+    assert frameseq_clip._shared_thread is None
+    assert not thread.isRunning()
+    # 重建：新 clip 照常拿到运行中的线程并能播
+    clip2 = FrameSeqClip(tmp_path)
+    thread2 = frameseq_clip._shared_thread
+    assert thread2 is not None and thread2.isRunning()
+    assert clip2.start()
+    _pump_until(lambda: clip2.currentImage() is not None)
+    clip2.stop()
+    clip2.close()
+    clip.close()

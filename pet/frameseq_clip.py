@@ -25,10 +25,12 @@ worker 常驻下一帧预取。内存只驻留当前帧 + 1~2 帧预取（+OS �
 """
 from __future__ import annotations
 
+import atexit
 import json
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QCoreApplication,
     QMetaObject,
     QObject,
     Qt,
@@ -47,13 +49,37 @@ DEFAULT_FPS = 24.0
 _shared_thread: QThread | None = None
 
 
+def _shutdown_shared_prefetch() -> None:
+    """进程/应用退出收口：停掉共享预取线程。
+
+    不收口则解释器退出时 QApplication 先于运行中的 QThread 销毁，
+    Windows 上直接 0xC0000409 fail-fast（pytest 进程尾崩实测）。幂等：
+    收口后可由 _shared_prefetch_thread() 重建（测试反复建 QApplication）。
+    """
+    global _shared_thread
+    thread, _shared_thread = _shared_thread, None
+    if thread is not None and thread.isRunning():
+        thread.quit()
+        thread.wait(2000)
+
+
 def _shared_prefetch_thread() -> QThread:
     """懒建进程级预取线程（clip 只挂 worker，不拥有线程）。"""
     global _shared_thread
+    if _shared_thread is not None and not _shared_thread.isRunning():
+        _shared_thread = None  # 已被退出收口：按懒建语义重建
     if _shared_thread is None:
         _shared_thread = QThread()
         _shared_thread.setObjectName("frameseq-prefetch-shared")
         _shared_thread.start()
+        app = QCoreApplication.instance()
+        if app is not None:
+            # 生产路径：exec() 退出时 aboutToQuit 收口
+            app.aboutToQuit.connect(
+                _shutdown_shared_prefetch, Qt.ConnectionType.UniqueConnection)
+        # 兜底：无 exec() 的上下文（pytest/脚本——QApplication 析构不发
+        # aboutToQuit），atexit 在模块拆除前收口（幂等，注册一次即安）
+        atexit.register(_shutdown_shared_prefetch)
     return _shared_thread
 
 
