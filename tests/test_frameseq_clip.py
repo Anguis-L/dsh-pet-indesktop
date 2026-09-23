@@ -242,3 +242,11 @@ def test_shared_prefetch_thread_shutdown_and_recreate(tmp_path):
     clip2.stop()
     clip2.close()
     clip.close()
+
+
+def test_decode_layer_attrs_are_properties():
+    """decode_throttle_divisor/decode_pace_external 必须与 WebMClip 同形
+    （property 只读）——window.py:2646/decode_fanout.py:329 按属性读，
+    普通方法会在 FrameSeqClip 路径 TypeError（4.4b 评审实测）。"""
+    assert isinstance(type(FrameSeqClip).__dict__["decode_throttle_divisor"], property)
+    assert isinstance(type(FrameSeqClip).__dict__["decode_pace_external"], property)

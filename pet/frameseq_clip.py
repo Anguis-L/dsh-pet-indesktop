@@ -236,9 +236,13 @@ class FrameSeqClip(QObject):
     def cancel_first_frame_warm(self) -> None:
         return
 
+    @property
     def decode_throttle_divisor(self) -> int:
+        """与 WebMClip 同形的只读属性——window/decode_fanout 按属性读
+        （普通方法会在该路径 TypeError，4.4b 评审实测 484~546 次/45s）。"""
         return 1
 
+    @property
     def decode_pace_external(self) -> bool:
         return False
 
