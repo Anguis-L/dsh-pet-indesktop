@@ -81,10 +81,16 @@ class ShellOverlayWindow(OverlayWindow):
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         self._press_pos = event.position()
         super().mousePressEvent(event)
-        if self._mouse_grab is not None and self.edge_probe is not None:
+        if (self._mouse_grab is not None and self.edge_probe is not None
+                and not self.slingshot.aiming):
             self.edge_probe.on_sprite_drag_started(self._mouse_grab)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if self.slingshot.aiming:
+            # 弹弓瞄准中的左键松手 = 发射（基类已消费），不进单击/拖拽判别
+            self._press_pos = None
+            super().mouseReleaseEvent(event)
+            return
         grab = self._mouse_grab
         press, self._press_pos = self._press_pos, None
         super().mouseReleaseEvent(event)
@@ -205,6 +211,9 @@ class OverlayShell(QObject):
         self.overlay.behavior = self.behavior
         self.overlay.edge_probe = self._probe
         self.overlay.click_feedback = self._sound.on_click
+        # 4.1c 弹弓：controller 由 OverlayWindow 自持，这里只接 config
+        # （slingshot_enabled 热读，设置页即改即生效）
+        self.overlay.slingshot.config = self._config
         # 4.1c 全量右键菜单（facade 适配旧 context_menus 建造器）
         from .sprite_menu_facade import build_sprite_full_menu
         self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
@@ -277,6 +286,23 @@ class OverlayShell(QObject):
         return QPointF(bounds.x() + bounds.width() - 1 - rect.width() - catalog.CORNER_MARGIN,
                        bounds.y() + bounds.height() - 1 - rect.height())
 
+    # ---------------------------------------------------------------- 灵动岛碰撞桥（4.3）
+    def attach_island(self, island) -> None:
+        """岛创建/重建/启停后接线（AppShell._sync_dynamic_island 调用）。
+
+        幂等可重复调；island=None 即摘桥。world 必须是进程级 self.collision、
+        overlay 必须是当前 overlay（原点来源）——否则墙挂到另一个世界/错位。
+        """
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            bridge.close()
+            self.island_bridge = None
+        if island is None:
+            return
+        from .island_bridge import IslandWindowBridge
+        self.island_bridge = IslandWindowBridge(
+            island, self.collision, self.overlay, sound=self._sound)
+
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
         if self._started:
@@ -285,14 +311,32 @@ class OverlayShell(QObject):
         self.overlay.show()
         self.overlay.start()
         self._sync_runtime_marker()  # D7：设置进程避让
+        self.app.installEventFilter(self)  # Esc 全局兜底（弹弓取消）
         if self.tray is not None:
             self.tray.show()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt 命名)
+        """应用级 Esc 兜底：overlay 是防抢焦点窗（WS_EX_NOACTIVATE），
+        keyPressEvent 只在确有焦点时收到 Esc；弹弓瞄准中按 Esc 全局取消。"""
+        from PySide6.QtCore import QEvent
+        if (event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape):
+            overlay = getattr(self, "overlay", None)
+            if overlay is not None and overlay.slingshot.aiming:
+                overlay._cancel_slingshot(resume_drag=False)
+                return True
+        return super().eventFilter(watched, event)
 
     def stop(self) -> None:
         """幂等：重复 stop 是 no-op。"""
         if not self._started:
             return
         self._started = False
+        self.app.removeEventFilter(self)
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            bridge.close()
+            self.island_bridge = None
         self._watcher.stop()
         self._delete_runtime_marker()
         if getattr(self, "_bubble_follower", None) is not None:
@@ -306,6 +350,10 @@ class OverlayShell(QObject):
         """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。"""
         self._watcher.stop()
         self._delete_runtime_marker()
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            bridge.close()
+            self.island_bridge = None
         self.save_position()  # 4.2a：退出持久化（rx/ry/facing/scale）
         if self.overlay is not None:
             self.overlay.stop()
@@ -748,6 +796,9 @@ class OverlayShell(QObject):
         # 迁移后接线恢复（原 _build 挂在 overlay 上的能力一并重挂，否则
         # 屏迁移后点击音效/全量菜单/投喂/穿透回调/拖拽收尾全部静默丢失）
         self.overlay.click_feedback = self._sound.on_click
+        # 4.1c 弹弓：controller 由 OverlayWindow 自持，这里只接 config
+        # （slingshot_enabled 热读，设置页即改即生效）
+        self.overlay.slingshot.config = self._config
         from .sprite_menu_facade import build_sprite_full_menu
         self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
         self.overlay._through_changed = self._on_user_through_changed
@@ -774,6 +825,10 @@ class OverlayShell(QObject):
             self._bubble_follower.close()
             from .sprite_bubble import SpriteBubbleFollower
             self._bubble_follower = SpriteBubbleFollower(self.overlay, self.sprite)
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            # 屏迁移：岛墙局部坐标按新 overlay 原点重算（气泡跟随器同款）
+            bridge.set_origin(self.overlay.geometry().topLeft())
         if was_started:
             self.overlay.show()
             self.overlay.start()

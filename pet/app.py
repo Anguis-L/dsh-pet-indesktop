@@ -2156,6 +2156,10 @@ class AppShell:
         if not enabled:
             if getattr(self, "island", None) is not None:
                 self.island.hide()
+            # 4.3：overlay 拓扑摘岛桥（岛停用即撤墙）
+            overlay_shell = getattr(self, "_overlay_shell", None)
+            if overlay_shell is not None:
+                overlay_shell.attach_island(None)
             body = getattr(self, "island_collision", None)
             if body is not None and body.has_local_island:
                 body.stop()
@@ -2199,6 +2203,10 @@ class AppShell:
         # 批5.2a：灵动岛按**聚合**可见态同步（任一窗可见 = 可见），替代只看主窗。
         self.island.set_pet_visible(self._aggregate_pet_visible())
         self.island.show()
+        # 4.3：overlay 拓扑下岛墙由 sprite 碰撞世界的岛桥接管（attach 幂等）
+        overlay_shell = getattr(self, "_overlay_shell", None)
+        if overlay_shell is not None:
+            overlay_shell.attach_island(self.island)
         self._sync_island_collision(island_cfg)
 
     def _sync_island_collision(self, island_cfg) -> None:
@@ -2215,6 +2223,12 @@ class AppShell:
         """
         enabled = bool(island_cfg.get("collision_enabled", True)) \
             if isinstance(island_cfg, dict) else True
+        # 4.3：overlay 拓扑下旧果冻墙整体让路——墙已由 sprite 碰撞世界的
+        # 岛桥（pet/island_bridge.py，attach_island 接线）接管；旧 body 的
+        # pets_provider 只认 PetWindow（overlay 无窗），且 on_geometry_changed
+        # 是单槽，被它抢占后岛桥几何断更
+        if getattr(self, "_overlay_shell", None) is not None:
+            return
         body = getattr(self, "island_collision", None)
         if not enabled:
             if body is not None:

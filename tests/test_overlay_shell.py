@@ -495,3 +495,27 @@ def test_shell_wires_throw_egg_world():
     new_bounds = QRect(0, 0, 1280, 720)
     shell._apply_bounds(new_bounds)
     assert egg.bounds == new_bounds
+
+
+def test_shell_wires_slingshot_config():
+    """弹弓接线：overlay.slingshot 接 shell 的 config（slingshot_enabled 热读）。"""
+    shell, _, _ = _make_shell()
+    assert shell.overlay.slingshot.config is shell._config
+
+
+def test_shell_attach_island_bridge():
+    """岛桥接线：attach_island 幂等可重复调；桥挂进程级 collision 世界；
+    None 摘桥；stop() 收口。"""
+    from tests.test_island_bridge import StubIsland
+    shell, _, _ = _make_shell()
+    island = StubIsland()
+    shell.attach_island(island)
+    bridge = shell.island_bridge
+    assert bridge is not None and bridge.attached
+    shell.attach_island(island)  # 重复调：旧桥收口换新桥，不叠加
+    assert shell.island_bridge is not bridge
+    shell.attach_island(None)
+    assert shell.island_bridge is None
+    shell.attach_island(island)
+    shell._on_about_to_quit()  # 退出收口（stop 只服务已 start 的壳）
+    assert shell.island_bridge is None
