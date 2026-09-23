@@ -63,8 +63,11 @@ _SLOT_INSTANCE_RE = re.compile(r"^slot-(\d+)$")
 
 
 def is_overlay_topology() -> bool:
-    """当前进程是否 overlay 拓扑（T5：唯一 env 读取实现）。"""
-    return os.environ.get(ENV_TOPOLOGY, "").strip().lower() == TOPOLOGY_OVERLAY
+    """当前进程是否 overlay 拓扑（T5：唯一 env 读取实现）。
+
+    T5 默认化：默认 overlay；``PET_RENDER_TOPOLOGY=legacy`` 为 dev 逃生门
+    （不进 Config/设置页/schema，启动时定死不做运行时切换）。"""
+    return os.environ.get(ENV_TOPOLOGY, "").strip().lower() != "legacy"
 
 
 def slot_from_instance_id(instance_id) -> int | None:

@@ -227,7 +227,7 @@ def test_topology_check_forwards_to_overlay_shell(monkeypatch):
 
 def test_legacy_topology_has_no_gate(tmp_path, monkeypatch):
     """legacy 拓扑无门：入口返回 None，连锁文件/留痕都不建（零副作用）。"""
-    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")
     assert gate_mod.is_required() is False
     assert gate_mod.acquire_overlay_instance_gate(tmp_path) is None
     assert list(tmp_path.iterdir()) == []
@@ -283,7 +283,7 @@ def test_main_legacy_topology_skips_gate_and_does_not_take_slot_lock(
     from pet import app as app_mod
     from pet.config import Config as RealConfig
 
-    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")
     monkeypatch.delenv("DSH_PET_INSTANCE", raising=False)
     monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
     monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)

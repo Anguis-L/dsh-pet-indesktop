@@ -465,6 +465,7 @@ def test_about_to_quit_stops_voice_chime_service(tmp_path, monkeypatch):
     它的无主 QTimer 被 Qt C++ 侧强引用，退出期仍在跑 20s tick，且合成线程
     可能在窗口析构后回 GUI 线程回放。
     """
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")  # PetWindow 路径测试
     import pet.app as app_mod
     from pet.app import AppShell
 

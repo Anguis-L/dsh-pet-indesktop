@@ -158,14 +158,15 @@ def _make_shell(screen=None, instance=None):
 
 # ---------------------------------------------------------------- env flag 契约
 def test_is_overlay_topology_env_contract(monkeypatch):
+    # T5 默认化：默认 overlay；PET_RENDER_TOPOLOGY=legacy 是唯一逃生门
     monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
-    assert is_overlay_topology() is False
+    assert is_overlay_topology() is True
     monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
     assert is_overlay_topology() is True
     monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")
     assert is_overlay_topology() is False
     monkeypatch.setenv("PET_RENDER_TOPOLOGY", "")
-    assert is_overlay_topology() is False
+    assert is_overlay_topology() is True
 
 
 # ---------------------------------------------------------------- 构建期：dpr/bounds/右下角
@@ -368,7 +369,8 @@ def _stub_shell_start(shell, monkeypatch):
 
 
 def test_app_start_default_path_does_not_touch_overlay_shell(tmp_path, monkeypatch):
-    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    # legacy 逃生门路径不构造 OverlayShell（默认路径见下方 overlay 用例）
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")
     constructed = []
     monkeypatch.setattr(overlay_shell_mod, "OverlayShell",
                         lambda *a, **kw: constructed.append((a, kw)))

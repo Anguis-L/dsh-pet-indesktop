@@ -26,16 +26,19 @@ def _now() -> float:
 
 # ---------------------------------------------------------------- 拓扑门
 def test_is_overlay_topology_env_contract(monkeypatch):
+    # T5 默认化：默认 overlay；legacy 为唯一逃生门（大小写/空白不敏感）
     monkeypatch.delenv(cmd.ENV_TOPOLOGY, raising=False)
-    assert cmd.is_overlay_topology() is False
+    assert cmd.is_overlay_topology() is True
     monkeypatch.setenv(cmd.ENV_TOPOLOGY, "overlay")
     assert cmd.is_overlay_topology() is True
     monkeypatch.setenv(cmd.ENV_TOPOLOGY, " OVERLAY ")
     assert cmd.is_overlay_topology() is True
     monkeypatch.setenv(cmd.ENV_TOPOLOGY, "legacy")
     assert cmd.is_overlay_topology() is False
-    monkeypatch.setenv(cmd.ENV_TOPOLOGY, "")
+    monkeypatch.setenv(cmd.ENV_TOPOLOGY, " LEGACY ")
     assert cmd.is_overlay_topology() is False
+    monkeypatch.setenv(cmd.ENV_TOPOLOGY, "")
+    assert cmd.is_overlay_topology() is True
 
 
 def test_slot_from_instance_id():

@@ -2830,6 +2830,7 @@ def test_macos_dock_icon_policy_tracks_the_saved_visibility_setting():
 
 def test_pet_app_binds_about_to_quit_once_to_current_window(tmp_path, monkeypatch):
     """aboutToQuit 只绑定一次，且触发时保存「当前」有效窗口位置（非已销毁的旧窗口）。"""
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")  # PetWindow 路径测试
     from PySide6.QtWidgets import QApplication
 
     import pet.app as app_mod
