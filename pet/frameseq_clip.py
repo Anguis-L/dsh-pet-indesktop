@@ -42,6 +42,20 @@ from PySide6.QtGui import QImage, QPixmap
 
 DEFAULT_FPS = 24.0
 
+# 预取线程进程级共享（每 clip 一个 QThread 的方案被实机否决：clip 销毁时
+# 运行中的 QThread 触发 access violation——tests/test_move_sync.py 实崩）。
+_shared_thread: QThread | None = None
+
+
+def _shared_prefetch_thread() -> QThread:
+    """懒建进程级预取线程（clip 只挂 worker，不拥有线程）。"""
+    global _shared_thread
+    if _shared_thread is None:
+        _shared_thread = QThread()
+        _shared_thread.setObjectName("frameseq-prefetch-shared")
+        _shared_thread.start()
+    return _shared_thread
+
 
 class _PrefetchWorker(QObject):
     """后台预取：按路径加载帧（~2.5ms/帧）移出 GUI 线程。
@@ -90,17 +104,15 @@ class FrameSeqClip(QObject):
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._advance)
         # 异步预取（GUI 零解码）：pending = 已到货未上屏，wanted = 在途请求，
-        # awaiting = 播放位置在等的帧号（到货即上屏）
+        # awaiting = 播放位置在等的帧号（到货即上屏）；线程进程级共享，
+        # clip 只挂 worker（销毁经 close()→deleteLater，无线程寿命问题）
         self._pending: dict[int, QImage] = {}
         self._wanted = -1
         self._awaiting = -1
-        self._prefetch_thread = QThread(self)
-        self._prefetch_thread.setObjectName("frameseq-prefetch")
         self._worker = _PrefetchWorker(self._frames)
-        self._worker.moveToThread(self._prefetch_thread)
+        self._worker.moveToThread(_shared_prefetch_thread())
         self._worker.loaded.connect(self._on_loaded,
                                     Qt.ConnectionType.QueuedConnection)
-        self._prefetch_thread.start()
 
     # ---------------------------------------------------------------- 元信息
     def frameCount(self) -> int:
@@ -160,11 +172,12 @@ class FrameSeqClip(QObject):
         self._timer.stop()
 
     def close(self) -> None:
-        """停止播放并退出预取线程（MovieLibrary.shutdown/收尾调用）。"""
+        """停止播放并回收预取 worker（MovieLibrary.shutdown/收尾调用）。
+
+        线程是进程级共享的（不随 clip 生灭）；worker 挂 deleteLater 由
+        共享线程事件循环回收。"""
         self.stop()
-        if self._prefetch_thread.isRunning():
-            self._prefetch_thread.quit()
-            self._prefetch_thread.wait(2000)
+        self._worker.deleteLater()
 
     def jumpToFrame(self, frame_index: int) -> bool:
         if not self._frames:
