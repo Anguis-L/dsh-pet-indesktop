@@ -36,7 +36,6 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from . import autostart as autostart_mod
-from . import balance as balance_mod
 from . import catalog
 from . import click_sound
 from . import overlay_instance_gate as overlay_gate_mod
@@ -54,7 +53,6 @@ from .fun_image_popup import restore_ojingjing_windows
 from .runtime_cleanup import cleanup_stale_runtime_dirs
 from .session_watcher import install_session_watcher
 from .decode_fanout import DecodeFanoutHub
-from .festival_service import FestivalReminderService
 from .todo_reminder import TodoReminderService
 from .voice_chime_service import VoiceChimeService
 from .dsh_state import DshStateTracker
@@ -152,7 +150,14 @@ def _show_balance_payload(win, payload) -> None:
 
     网络查询、内存缓存、文件缓存三条路径统一走这里，避免缓存命中时
     没有副标题/不播动画导致的行为不一致。
+
+    pet.balance 按需导入（内存瘦身第二刀）：该模块自带整套档位文案/价格提示
+    表，实测独占 4.75MB Python 堆（tools/import_cost.py），而余额查询在
+    默认配置下从不发生（balance_refresh_minutes=0 且用户没点"看余额"）——
+    启动就不该为它付这份常驻。函数内 import 只在真正要显示余额时才付。
     """
+    from . import balance as balance_mod
+
     if win is None or not shiboken6.isValid(win):
         return
     if isinstance(payload, dict):
@@ -1356,8 +1361,16 @@ class AppShell:
         return bool(self.config.get("festival_reminder_enabled", False))
 
     def _ensure_festival_service(self):
-        """懒创建节日提醒服务（仅在开启提醒/手动触发时创建）。"""
+        """懒创建节日提醒服务（仅在开启提醒/手动触发时创建）。
+
+        pet.festival_service 连带 festival/festival_calendar/festival_data 与
+        五份节日文案表，实测 2.95MB Python 堆（tools/import_cost.py）。总开关
+        默认关闭（主动打扰型功能），关闭时整套文案表都不该常驻——import 收到
+        构造点，开启/试听时按需付一次。
+        """
         if getattr(self, "festival_service", None) is None:
+            from .festival_service import FestivalReminderService
+
             self.festival_service = FestivalReminderService(self)
         return self.festival_service
 
@@ -2449,7 +2462,13 @@ class AppShell:
         return None
 
     def _island_tier_hint(self) -> str:
-        """灵动岛余额峰谷提示文案（与 _update_island_balance / 静默查询共用）。"""
+        """灵动岛余额峰谷提示文案（与 _update_island_balance / 静默查询共用）。
+
+        pet.balance 按需导入：本函数只在"岛卡片展开 / 余额查询返回"时才被调用，
+        启动路径（_sync_dynamic_island）不碰它（见 _show_balance_payload）。
+        """
+        from . import balance as balance_mod
+
         peak_label, idle_label = balance_mod.resolve_tier_labels(
             str(self.config.get("balance_tier_labels_mode", "default") or "default"),
             str(self.config.get("balance_tier_label_peak", "") or ""),
@@ -2579,6 +2598,7 @@ class AppShell:
             QTimer.singleShot(0, lambda message=error_message: bridge.done.emit(False, message))
 
     def _balance_worker(self, bridge, base_url: str, api_key: str, verify_ssl: bool, provider_key: str = '', *, quiet: bool = False) -> None:
+        from . import balance as balance_mod  # 按需导入（见 _show_balance_payload）
         try:
             info = balance_mod.fetch_balance(base_url, api_key, verify_ssl=verify_ssl)
             text = balance_mod.format_balance(info)
