@@ -329,6 +329,18 @@ class MovieLibrary(QObject):
             raise FileNotFoundError("缺少素材文件: " + ", ".join(missing))
 
         self._paths = resolved
+        # 帧序列化 B 档（热集）：assets/characters/<id>/frameseq/<folder>/<stem>/
+        # 存在即优先走 FrameSeqClip（无损 WebP 帧序列，与 webm 解码 bit-exact，
+        # 见 .scratch/frame-seq-feasibility/FEASIBILITY.md）；不存在 = 现 webm
+        # 路径逐行不变。按 _manifest 的相对路径同名定位，素材包不带 frameseq
+        # 目录时本映射为空、零行为变化
+        self._frameseq_dirs: dict[str, Path] = {}
+        frameseq_root = self._asset_dir.parent / 'frameseq'
+        if frameseq_root.is_dir():
+            for name, fname in self._manifest.items():
+                candidate = frameseq_root / Path(fname).with_suffix('')
+                if candidate.is_dir() and any(candidate.glob('f_*.webp')):
+                    self._frameseq_dirs[name] = candidate
 
         # 高优先级 clip 必须在主线程创建（QObject 线程亲和），再交给后台线程预热；
         # 低优先级由 QTimer 在主线程触发 _warm_low_priority_background 创建。
@@ -833,6 +845,12 @@ class MovieLibrary(QObject):
         随机动作池由 _warm_low_priority_background 在启动后 2s 补全。
         """
         if name not in self._movies:
+            frameseq_dir = self._frameseq_dirs.get(name)
+            if frameseq_dir is not None:
+                # 热集帧序列：无 ffmpeg 进程/spawn 冷启动/看门狗（B 档）
+                from .frameseq_clip import FrameSeqClip
+                self._movies[name] = FrameSeqClip(frameseq_dir, parent=self)
+                return self._movies[name]
             path = self._paths[name]
             if path.suffix.lower() == '.gif':
                 self._movies[name] = GifClip(path, parent=self)
