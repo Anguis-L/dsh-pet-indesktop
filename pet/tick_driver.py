@@ -29,11 +29,18 @@ tick 刷新率取全部成员所在屏里最高者（单 overlay 等价于原
 
 零 Qt 时钟可注入：offscreen 测试同步直调 ``on_tick(dt=...)``，不启动真实
 QTimer、不 sleep 赌时序（AGENTS.md 时序测试纪律）。
+
+tick 仪表（归因"偶发卡顿"）与电源感知（AC 下 T1 满速）见 ``TickMetrics`` /
+``TickGovernor.on_ac_power``：仪表默认开、``PET_TICK_METRICS=0`` 全关；
+电源感知只在 T1 的有效间隔上体现，T0/T2/T3 与降档滞回语义不变。
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import time
+from array import array
 
 from PySide6.QtCore import QElapsedTimer, QObject, Qt, QTimer
 
@@ -41,10 +48,95 @@ from .pet_sprite import INTERACTION_NORMAL
 from .tick_governor import (
     ANIMATING_WINDOW_S,
     TIER_ACTIVE,
+    TIER_IDLE_ANIM,
     TIER_INTERVAL_MS,
     TIER_OCCLUDED,
     TickGovernor,
 )
+
+logger = logging.getLogger(__name__)
+
+#: tick 仪表总开关：``PET_TICK_METRICS=0`` 关（默认开）。导入期读一次，
+#: 热路径只剩一次模块级 bool 判断（关闭 = 零分配零调用）。
+TICK_METRICS_ENABLED = (
+    (os.environ.get("PET_TICK_METRICS") or "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+#: 间隔分位统计输出周期（s）：每周期打一行 p50/p99/max + 当前档
+TICK_METRICS_REPORT_S = 60.0
+#: 滚动窗口样本数（170Hz ≈ 24s；24fps ≈ 2.8min；64KB 定长缓冲）
+TICK_METRICS_WINDOW = 4096
+#: 单次 tick_sim + advance 超时阈值（ms）：超它记 WARNING（含耗时与档）
+TICK_SLOW_MS = 50.0
+
+
+class TickMetrics:
+    """tick 仪表：慢帧告警 / 档位迁移 / 间隔分位（归因"偶发卡顿"）。
+
+    热路径零分配：间隔样本写进**预分配**的 ``array('d')`` 环形缓冲（定长，
+    写入即下标赋值，不新建对象）；分位排序只在 60s 一行时做一次（``n`` 个
+    浮点的 sorted() —— 4096 样本实测量级 ~0.3ms/分钟，见交付报告）。
+
+    全程由 ``TICK_METRICS_ENABLED`` 门控（调用方判断，关闭时本类零调用）；
+    时钟可注入，测试用假钟推进到 60s 边界，不 sleep。
+    """
+
+    def __init__(self, *, clock=time.monotonic,
+                 window: int = TICK_METRICS_WINDOW) -> None:
+        self._clock = clock
+        self._window = max(1, int(window))
+        self._buf = array("d", bytes(8 * self._window))  # 定长环形缓冲（预分配）
+        self._pos = 0
+        self._filled = 0
+        self._last_tick_at: float | None = None
+        self._since_report = clock()
+
+    def note_tick_start(self) -> float | None:
+        """记一次 tick 起点，返回距上次的间隔（ms）；首次返回 ``None``。
+
+        这是"tick 是否按档位间隔准时醒来"的原始读数（实际唤醒间隔，不是
+        标称间隔），偶发卡顿会先在 p99/max 上露头。
+        """
+        now = self._clock()
+        last, self._last_tick_at = self._last_tick_at, now
+        if last is None:
+            return None
+        return (now - last) * 1000.0
+
+    def note_interval(self, ms: float) -> None:
+        """写入一个间隔样本（环形覆盖，无分配）。"""
+        self._buf[self._pos] = ms
+        self._pos = (self._pos + 1) % self._window
+        if self._filled < self._window:
+            self._filled += 1
+
+    def skip_tick_baseline(self) -> None:
+        """丢弃间隔基线（T3 心跳期不采样：跨档的长间隔不是卡顿信号）。"""
+        self._last_tick_at = None
+
+    def note_slow_tick(self, ms: float, tier: int) -> None:
+        """单次 tick 的仿真+推进耗时超 ``TICK_SLOW_MS`` → WARNING（含耗时与档）。"""
+        if ms > TICK_SLOW_MS:
+            logger.warning("tick 慢帧 %.1fms（阈值 %.0fms）tier=T%d",
+                           ms, TICK_SLOW_MS, tier)
+
+    def maybe_report(self, tier: int, nominal_ms: int) -> None:
+        """每 ``TICK_METRICS_REPORT_S`` 打一行窗口分位（p50/p99/max + 当前档）。
+
+        标称间隔一起打：p99 与标称的比值就是"tick 被拖慢"的直接证据。
+        """
+        if not self._filled:
+            return
+        now = self._clock()
+        if now - self._since_report < TICK_METRICS_REPORT_S:
+            return
+        self._since_report = now
+        samples = sorted(self._buf[: self._filled])
+        n = len(samples)
+        p50 = samples[min(n - 1, int(n * 0.50))]
+        p99 = samples[min(n - 1, int(n * 0.99))]
+        logger.info("tick 间隔 p50=%.1fms p99=%.1fms max=%.1fms tier=T%d 标称=%dms n=%d",
+                    p50, p99, samples[-1], tier, nominal_ms, n)
 
 
 class TickDriver(QObject):
@@ -64,9 +156,14 @@ class TickDriver(QObject):
         # M-1 闲置降档：governor 决策 + 最近帧到达时间（"动画在播"判定）
         self._governor = TickGovernor(clock)
         self._applied_tier = TIER_ACTIVE
+        # 当前 QTimer 是否按"满速"应用（PreciseTimer + T0 间隔公式）：
+        # T0 恒 True；AC 下的 T1 也 True（电源感知）；电池 T1 / T2 / T3 False
+        self._applied_full_speed = True
         self._last_frame_notify: float | None = None
         self._elapsed = QElapsedTimer()
         self._tick_count = 0
+        # tick 仪表（PET_TICK_METRICS=0 时不建实例；门控在调用点）
+        self._metrics = TickMetrics(clock=clock) if TICK_METRICS_ENABLED else None
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(self.tick_interval_ms(None))
@@ -111,6 +208,11 @@ class TickDriver(QObject):
     def applied_tier(self) -> int:
         """当前已应用到 QTimer 的 M-1 档位。"""
         return self._applied_tier
+
+    @property
+    def metrics(self) -> TickMetrics | None:
+        """tick 仪表实例（``PET_TICK_METRICS=0`` 时为 None）。"""
+        return self._metrics
 
     def attach(self, overlay) -> None:
         """挂载 overlay：其 sprites 进入仿真快照，并收到推进+重绘段。幂等。"""
@@ -162,13 +264,36 @@ class TickDriver(QObject):
         return best
 
     def refresh_tick_interval(self) -> None:
-        """重读刷新率并刷新 T0 间隔（V-6：电池 DRR 在 170/60Hz 间动态切换）。
+        """重读刷新率并刷新**满速档**（T0；AC 下的 T1）的间隔。
 
-        M-1 语义：只改 T0 的间隔——低档位的间隔由 ``_apply_tier`` 独占，
-        屏事件/几何变化重读时不得把降档间隔（42/250/1000ms）打回全速。
+        M-1 语义：只改满速档——电池下 T1 的 42ms / T2 的 250ms / T3 的 1000ms
+        由 ``_apply_tier`` 独占，屏事件/几何变化重读时不得把它们打回全速。
         """
-        if self._applied_tier == TIER_ACTIVE:
+        if self._applied_full_speed:
             self._timer.setInterval(self.tick_interval_ms(self._refresh_rate()))
+
+    def _full_speed(self, tier: int) -> bool:
+        """该档是否按满速（刷新率）跑：T0 恒是；AC 供电时 T1 也是（M-1 补刀）。
+
+        T2/T3 短路返回 False，不触发电源查询；只有 T1 每 tick 问一次 5s 缓存
+        的电源状态（一次时钟比较，无系统调用）。
+        """
+        if tier == TIER_ACTIVE:
+            return True
+        return tier == TIER_IDLE_ANIM and self._governor.on_ac_power()
+
+    def _tier_reason(self, *, any_motion: bool, animating: bool,
+                     visible: bool) -> str:
+        """档位触发因（归因日志用）：与 governor 判定分支一一对应。"""
+        if any_motion:
+            return "motion"
+        if self._governor.kinetic_tail:
+            return "kinetic_tail"
+        if not visible:
+            return "hidden"
+        if animating:
+            return "animating"
+        return "quiet"
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
@@ -206,23 +331,41 @@ class TickDriver(QObject):
             self._last_frame_notify is not None
             and time.monotonic() - self._last_frame_notify < ANIMATING_WINDOW_S
         )
+        any_motion = any(self._sprite_in_motion(s) for s in self._all_sprites())
+        visible = any(o.isVisible() for o in self._overlays)
         tier = self._governor.evaluate(
-            any_motion=any(self._sprite_in_motion(s) for s in self._all_sprites()),
-            animating=animating,
-            visible=any(o.isVisible() for o in self._overlays),
-        )
+            any_motion=any_motion, animating=animating, visible=visible)
         if tier != self._applied_tier:
-            self._apply_tier(tier)
+            self._apply_tier(tier, reason=self._tier_reason(
+                any_motion=any_motion, animating=animating, visible=visible))
+        elif self._full_speed(tier) != self._applied_full_speed:
+            # 电源切换（AC↔电池）不改档位，但 T1 的有效间隔/定时器类型要跟着切
+            # （on_ac_power 自带 5s 缓存，切换感知延迟 ≤5s）
+            self._apply_tier(tier, reason="power")
 
-    def _apply_tier(self, tier: int) -> None:
-        """把档位应用到 QTimer：T0 按刷新率 + Precise，其余固定间隔 + Coarse。"""
+    def _apply_tier(self, tier: int, reason: str = "") -> None:
+        """把档位应用到 QTimer：满速档（T0；AC 下 T1）按刷新率 + Precise，
+        其余固定间隔 + Coarse。"""
+        old_tier = self._applied_tier
+        old_full_speed = self._applied_full_speed
+        full_speed = self._full_speed(tier)
         self._applied_tier = tier
-        if tier == TIER_ACTIVE:
+        self._applied_full_speed = full_speed
+        if full_speed:
             self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-            self.refresh_tick_interval()  # 切入 T0 必重读 rr（电池 DRR）
+            self._timer.setInterval(self.tick_interval_ms(self._refresh_rate()))
         else:
             self._timer.setInterval(TIER_INTERVAL_MS[tier])
             self._timer.setTimerType(Qt.TimerType.CoarseTimer)
+        if TICK_METRICS_ENABLED and (tier != old_tier or full_speed != old_full_speed):
+            if tier != old_tier:
+                logger.info("tick 档位 T%d→T%d 触发因=%s interval=%dms（%s）",
+                            old_tier, tier, reason or "-", self._timer.interval(),
+                            "满速" if full_speed else "降载")
+            else:
+                logger.info("tick 电源切换：T%d interval=%dms 电源=%s（触发因=power）",
+                            tier, self._timer.interval(),
+                            "AC" if full_speed else "电池")
         # 切档后首 tick 不吃历史流逝（防 dt 突变一步跨出大位移）
         self._elapsed.restart()
 
@@ -243,12 +386,19 @@ class TickDriver(QObject):
         ``dt=None`` 时自算（首 tick 取档位间隔；其后取实测流逝并按档钳上限，
         切档瞬间不吃历史流逝）。
         """
+        metrics = self._metrics if TICK_METRICS_ENABLED else None
         if self._applied_tier == TIER_OCCLUDED:
             # T3 心跳：不跑仿真，只复查档位（可见性/刷新率变化经 showEvent
-            # 与本路径恢复）
+            # 与本路径恢复）；1000ms 的刻意见隔不进分位窗口（不是卡顿信号）
+            if metrics is not None:
+                metrics.skip_tick_baseline()
             self._elapsed.restart()
             self._sync_tier()
             return
+        if metrics is not None:
+            gap_ms = metrics.note_tick_start()
+            if gap_ms is not None:
+                metrics.note_interval(gap_ms)
         if dt is None:
             if self._tick_count:
                 # dt 上限按档钳：T0 50ms，低档放宽到 2× 档间隔
@@ -260,8 +410,15 @@ class TickDriver(QObject):
         self._tick_count += 1
         for overlay in list(self._overlays):
             overlay._check_stale_press()  # V-7：tick 路径同样兜底卡死的拖拽
+        work_start = time.perf_counter() if metrics is not None else 0.0
         self.tick_sim(dt)
         self.advance_overlays(dt)
+        if metrics is not None:
+            metrics.note_slow_tick((time.perf_counter() - work_start) * 1000.0,
+                                   self._applied_tier)
+            # 分位行在档位复评之前打：窗口样本是"本 tick 所在档"的读数，
+            # 不能拿 tick 末尾刚降下去的档去标注（归因会指错方向）
+            metrics.maybe_report(self._applied_tier, self._timer.interval())
         self._sync_tier()  # M-1：tick 末评估降档（升档在事件/回调侧同步完成）
 
     def tick_sim(self, dt: float) -> None:

@@ -69,6 +69,7 @@ from collections import deque
 
 import shiboken6
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QTimer, Qt, Signal
+from PySide6.QtGui import QBitmap, QIcon, QPixmap, QRegion
 from PySide6.QtWidgets import QMenu, QStyle, QSystemTrayIcon
 
 from . import catalog
@@ -220,6 +221,38 @@ def _screen_name(screen) -> str:
         return str(screen.name())
     except Exception:
         return "?"
+
+
+def _sprite_current_pixmap(sprite):
+    """sprite 已渲染帧 → 当前 clip 的 ``currentImage()`` → ``None``（帧未就绪）。
+
+    取图链与 ``sprite_menu_facade.icon_pixmap`` 同口径：先读 sprite 上已渲染的
+    ``_pixmap``，没有才回退当前 clip 的当前帧；两处都空 = 真的没有帧。
+    """
+    pm = getattr(sprite, "_pixmap", None)
+    if pm is not None and not pm.isNull():
+        return QPixmap(pm)
+    clip = getattr(sprite, "_clip", None)
+    current = getattr(clip, "currentImage", None)
+    image = current() if callable(current) else None
+    if image is None or image.isNull():
+        return None
+    return QPixmap.fromImage(image)
+
+
+def _crop_icon_pixmap(pm: QPixmap, size: int) -> QPixmap:
+    """裁掉帧的透明留白后等比缩放到 ``size``（旧 ``PetWindow._crop_icon_pixmap`` 同口径）。
+
+    动画帧是整张视频画布，直接缩放会把角色缩成几个像素（``context_menus/icons``
+    记录了同一个坑）；托盘与灵动岛头像共用这一份裁剪语义，不另造第二套。
+    """
+    image = pm.toImage()
+    bounds = QRegion(QBitmap.fromImage(image.createAlphaMask())).boundingRect()
+    if bounds.isValid() and not bounds.isEmpty():
+        pm = QPixmap.fromImage(image.copy(bounds))
+    return pm.scaled(size, size,
+                     Qt.AspectRatioMode.KeepAspectRatio,
+                     Qt.TransformationMode.SmoothTransformation)
 
 
 class ShellOverlayWindow(OverlayWindow):
@@ -1340,21 +1373,48 @@ class OverlayShell(QObject):
             follower.hide()
 
     def _tray_icon(self):
-        """托盘图标尽力取鱼本体 idle 首帧（裁剪/精修是 4.1b 的事）；
-        取不到回退系统标准图标。"""
-        from PySide6.QtGui import QIcon
+        """托盘图标取鱼本体当前帧（idle 首帧兜底）；取不到回退系统标准图标。"""
+        pm = self.icon_pixmap(64)
+        if pm is not None:
+            return QIcon(pm)
+        return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
 
+    # ---------------------------------------------------------------- 图标面
+    def _idle_first_frame_pixmap(self):
+        """idle 首帧位图（``_tray_icon`` 原有取图链）；取不到返回 ``None``。
+
+        ``lib.movie()`` 惰性建 clip：未起播的 clip ``currentPixmap()`` 为空 →
+        ``None``，由调用方决定兜底（托盘回退系统图标 / 岛稍后重试）。
+        """
         try:
             cats = catalog.build_categories(
                 self.lib.names(), self.lib.manifest,
                 self.lib.folder_map, self.lib.folder_files)
             idle = cats["idles"][0] if cats["idles"] else None
             pm = self.lib.movie(idle).currentPixmap() if idle else None
-            if pm is not None and not pm.isNull():
-                return QIcon(pm)
         except Exception:
-            pass
-        return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            return None
+        if pm is None or pm.isNull():
+            return None
+        return QPixmap(pm)
+
+    def icon_pixmap(self, size: int = 64):
+        """主 sprite 当前帧图标（裁透明留白 + 缩放）；帧未就绪返回 ``None``。
+
+        窗口版 ``PetWindow.icon_pixmap`` 的 sprite 等价物，两个消费方共用：
+
+        - 灵动岛头像 provider（app.py ``_island_icon_pixmap``）：``None`` = 帧未
+          就绪，岛侧按 ``dynamic_island._icon_pixmap`` 的契约稍后重试（不缓存 None）；
+        - 托盘图标 ``_tray_icon``：拿不到才回退系统标准图标。
+
+        取图顺序：sprite 当前帧 → idle 首帧（``_tray_icon`` 旧逻辑原样保留）。
+        """
+        pm = _sprite_current_pixmap(self.sprite)
+        if pm is None:
+            pm = self._idle_first_frame_pixmap()
+        if pm is None:
+            return None
+        return _crop_icon_pixmap(pm, size)
 
     # ---------------------------------------------------------------- 4.1b 窗口能力
     def refresh_settings(self) -> None:

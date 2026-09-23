@@ -22,11 +22,20 @@ GUI 定时器里，3 宠待机循环时 GUI 线程被吃掉 ~18%/核——直接
 worker 常驻下一帧预取。内存只驻留当前帧 + 1~2 帧预取（+OS 页缓存），
 无 reader 线程级队列。jumpToFrame/warm_first_frame 这类低频同步路径
 允许一次 ~2.5ms 的同步加载（调用方期望立即生效）。
+
+预取看门狗（"画面经常卡住不动"的用户实测根因）：worker 所在共享线程失能
+时，``_request`` 的 queued 调用永远不被处理，``_advance`` 会停在 ``_awaiting``
+上无限等待。``_advance`` 每 tick 复查等待时长：超 ``PREFETCH_STALL_MS``
+重发请求 + WARNING（含目录名/帧号/wanted/pending 大小），连续
+``PREFETCH_STALL_LIMIT`` 次仍无帧则同步加载兜底（播放链不断）；线程已死
+则重建共享线程并换挂新 worker。到货即清零，恢复后静默。
 """
 from __future__ import annotations
 
 import atexit
 import json
+import logging
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -42,7 +51,21 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QImage, QPixmap
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_FPS = 24.0
+
+#: 预取看门狗阈值（ms）：播放位置停在 ``_awaiting`` 上超过它即判定预取失能
+#: （worker/共享线程事件循环停摆），重发请求并记 WARNING。
+PREFETCH_STALL_MS = 500.0
+#: 连续超时次数达到它 → 降级同步加载兜底（保证播放链不断，不跳帧不冻结）。
+PREFETCH_STALL_LIMIT = 3
+
+
+def _now() -> float:
+    """看门狗时钟（模块属性可替换：测试注入假钟，不 sleep 赌时序）。"""
+    return time.monotonic()
+
 
 # 预取线程进程级共享（每 clip 一个 QThread 的方案被实机否决：clip 销毁时
 # 运行中的 QThread 触发 access violation——tests/test_move_sync.py 实崩）。
@@ -135,8 +158,15 @@ class FrameSeqClip(QObject):
         self._pending: dict[int, QImage] = {}
         self._wanted = -1
         self._awaiting = -1
+        # 预取看门狗状态：awaiting 起点（monotonic；None = 不在等）+ 连续超时次数
+        self._awaiting_since: float | None = None
+        self._stall_count = 0
+        # 已退役 worker（共享线程死亡后换新 worker，旧对象的线程亲和性留在死
+        # 线程上——不能 deleteLater（没人处理），只能保留引用不跨线程销毁）
+        self._retired_workers: list[_PrefetchWorker] = []
         self._worker = _PrefetchWorker(self._frames)
-        self._worker.moveToThread(_shared_prefetch_thread())
+        self._prefetch_thread = _shared_prefetch_thread()
+        self._worker.moveToThread(self._prefetch_thread)
         self._worker.loaded.connect(self._on_loaded,
                                     Qt.ConnectionType.QueuedConnection)
 
@@ -179,7 +209,7 @@ class FrameSeqClip(QObject):
             return False
         self._timer.stop()
         self._cur = 0
-        self._awaiting = -1
+        self._clear_awaiting()
         img = self._pending.pop(0, None)
         if img is not None:
             self._apply(img)
@@ -187,7 +217,7 @@ class FrameSeqClip(QObject):
         else:
             self._img = None
             self._pm = None
-            self._awaiting = 0
+            self._set_awaiting(0)
             self._request(0)
         self._running = True
         self._timer.start(self._interval_ms())
@@ -213,7 +243,7 @@ class FrameSeqClip(QObject):
         img = QImage(str(self._frames[frame_index]))
         if not img.isNull():
             self._cur = frame_index
-            self._awaiting = -1
+            self._clear_awaiting()
             self._apply(img)
         self.frameChanged.emit(frame_index)
         return True
@@ -279,7 +309,7 @@ class FrameSeqClip(QObject):
             return  # 坏帧：保持现状，不崩播放链
         if self._running and idx == self._awaiting:
             self._cur = idx
-            self._awaiting = -1
+            self._clear_awaiting()  # 到货 = 恢复：看门狗状态清零，此后不再告警
             self._apply(img)
             self.frameChanged.emit(idx)
             self._request(idx + 1)  # 链式预取下一帧
@@ -302,5 +332,111 @@ class FrameSeqClip(QObject):
             self._request(nxt + 1)
         else:
             # 未到货：等待不跳帧（同 WebMClip 空转语义），并向 worker 催取
-            self._awaiting = nxt
+            self._set_awaiting(nxt)
             self._request(nxt)
+            self._check_prefetch_watchdog()
+
+    # ---------------------------------------------------------------- 预取看门狗
+    def _set_awaiting(self, idx: int) -> None:
+        """登记"播放位置在等 idx"；帧号变化 = 新一轮等待（超时计数清零）。
+
+        同一帧的重复调用不改起点——否则每次 ``_advance`` 都会把计时推后，
+        看门狗永远不会到点（挂死检测失效）。
+        """
+        if self._awaiting != idx or self._awaiting_since is None:
+            self._stall_count = 0
+            self._awaiting_since = _now()
+        self._awaiting = idx
+
+    def _clear_awaiting(self) -> None:
+        """到货/跳帧收口：清等待态与超时计数（恢复后保持静默）。"""
+        self._awaiting = -1
+        self._awaiting_since = None
+        self._stall_count = 0
+
+    def _check_prefetch_watchdog(self) -> None:
+        """预取看门狗：awaiting 挂死超时 → 重发请求；连续超时 → 同步加载兜底。
+
+        worker/共享线程失能（退出收口后的孤儿 worker、线程事件循环停摆）时，
+        ``_request`` 的 queued 调用永远不被处理，``_advance`` 就一直等不到帧——
+        用户可见表现即"画面卡住不动"。这里按墙钟兜底：到点重发 + WARNING（含
+        clip 目录名/帧号/wanted/pending 大小），连续 ``PREFETCH_STALL_LIMIT``
+        次仍无帧就同步读一帧顶上，保证播放链不断。
+        """
+        since = self._awaiting_since
+        if since is None or self._awaiting < 0:
+            return
+        now = _now()
+        waited_ms = (now - since) * 1000.0
+        if waited_ms < PREFETCH_STALL_MS:
+            return
+        # 到点即重置计时：下一次判定在又一个阈值之后（不刷屏），超时计数累加
+        self._awaiting_since = now
+        self._stall_count += 1
+        idx = self._awaiting
+        thread_alive = self._prefetch_thread_alive()
+        if self._stall_count < PREFETCH_STALL_LIMIT:
+            logger.warning(
+                "frameseq 预取超时 %.0fms：clip=%s frame=%d wanted=%d pending=%d "
+                "thread_alive=%s（重发预取请求）",
+                waited_ms, self._dir.name, idx, self._wanted, len(self._pending),
+                thread_alive)
+            if not thread_alive:
+                self._revive_prefetch_worker()
+            self._wanted = -1  # 清在途标记，让 _request 的重发不被去重拦下
+            self._request(idx)
+            return
+        logger.warning(
+            "frameseq 预取连续 %d 次超时（本次等待 %.0fms）：clip=%s frame=%d "
+            "wanted=%d pending=%d thread_alive=%s，降级同步加载",
+            self._stall_count, waited_ms, self._dir.name, idx, self._wanted,
+            len(self._pending), thread_alive)
+        self._stall_count = 0
+        img = QImage(str(self._frames[idx]))
+        if img.isNull():
+            return  # 坏帧：保持现状，下个 tick 重新走看门狗
+        if not self._running:
+            return
+        self._cur = idx
+        self._clear_awaiting()
+        self._apply(img)
+        self.frameChanged.emit(idx)
+        self._request(idx + 1)  # 同步兜底后仍续链式预取（worker 恢复即接回异步）
+
+    def _prefetch_thread_alive(self) -> bool:
+        """共享预取线程复查：线程对象失效/已停 = 死（异常一律按死处理）。
+
+        ``_prefetch_thread`` 是本 clip 对共享线程的强引用：``_shared_thread``
+        重建时旧线程若被 GC，``worker.thread()`` 会变悬垂指针，故不直接回查。
+        """
+        thread = self._prefetch_thread
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except RuntimeError:
+            return False
+
+    def _revive_prefetch_worker(self) -> None:
+        """共享线程已死 → 重建线程并换新 worker（``_shared_prefetch_thread`` 有懒建语义）。
+
+        ``moveToThread`` 只能由对象所属线程调用（GUI 线程调会被 Qt 拒绝），而旧
+        worker 的亲和性绑在已停线程上，因此这里换一个新 worker；旧 worker 只留
+        引用不删——跨线程销毁才是真风险（见 ``_retired_workers`` 注释）。
+        """
+        old = self._worker
+        try:
+            old.loaded.disconnect(self._on_loaded)
+        except (RuntimeError, TypeError):
+            pass
+        self._retired_workers.append(old)
+        if len(self._retired_workers) > 4:
+            # 只保留最近几次：复活是异常路径，正常生命周期内一次都不会走到
+            del self._retired_workers[0]
+        self._worker = _PrefetchWorker(self._frames)
+        self._prefetch_thread = _shared_prefetch_thread()
+        self._worker.moveToThread(self._prefetch_thread)
+        self._worker.loaded.connect(self._on_loaded,
+                                    Qt.ConnectionType.QueuedConnection)
+        logger.warning("frameseq 共享预取线程失能：已重建并换挂新 worker（clip=%s）",
+                       self._dir.name)

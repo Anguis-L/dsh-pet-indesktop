@@ -2428,13 +2428,24 @@ class AppShell:
             self._balance_timer.start(minutes * 60000)
 
     def _island_icon_pixmap(self):
-        """灵动岛"鱼本体头像"：取首个桌宠窗的当前帧图标；无窗/无帧返回 None（岛侧会重试）。"""
+        """灵动岛"鱼本体头像"：取首个桌宠窗的当前帧图标；无窗/无帧返回 None（岛侧会重试）。
+
+        4.4a overlay 拓扑：``instances[].win`` 恒为 None（单合成窗，桌宠在
+        OverlayShell 里），图标改从壳的主 sprite 当前帧取（``OverlayShell.icon_pixmap``
+        与旧 ``PetWindow.icon_pixmap`` 同款裁剪/缩放）；两处都取不到才返回 None，
+        岛侧按 provider 契约（dynamic_island._icon_pixmap 不缓存 None）稍后重试。
+        """
         for inst in getattr(self, "_instances", []):
             win = getattr(inst, "win", None)
             if win is not None:
                 pm = win.icon_pixmap(64)
                 if pm is not None and not pm.isNull():
                     return pm
+        overlay_shell = getattr(self, "_overlay_shell", None)
+        if overlay_shell is not None:
+            pm = overlay_shell.icon_pixmap(64)
+            if pm is not None and not pm.isNull():
+                return pm
         return None
 
     def _island_tier_hint(self) -> str:
