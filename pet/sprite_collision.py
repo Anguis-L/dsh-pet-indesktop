@@ -46,6 +46,33 @@ INTERACTION_NORMAL = "normal"
 INTERACTION_DRAG = "drag"
 INTERACTION_THROWN = "thrown"
 
+# 岛胶囊视觉高度（口径源 island_collision._CAPSULE_HEIGHT=44，两边必须同步——
+# 体育场碰撞体的高度上限：展开卡片时只覆盖胶囊本体，卡片区域不设幽灵墙）
+ISLAND_CAPSULE_HEIGHT = 44
+
+
+def capsule_circles(left: float, top: float, width: float, height: float,
+                    *, height_cap: float = ISLAND_CAPSULE_HEIGHT) -> list[list[float]]:
+    """体育场（胶囊）等效圆链：对齐旧架构 island_collision._island_stadium。
+
+    高度先按 height_cap 截断（展开卡片时卡片区域不设墙），半径 r=h/2，
+    轴线 y=top+r、x∈[left+r, left+width-r]，圆沿轴线以 ≤r 间距铺满——
+    circles_from_rect 的内切三圆在宽扁矩形（如岛 400×80）上两端圆心
+    间距可达 3r 以上，胶囊中段会出现可穿入的空档；本函数的圆链连续
+    覆盖整条轴线，与旧 stadium 钳制的几何口径一致。
+    """
+    h = min(float(height), float(height_cap))
+    r = h / 2.0
+    axis_y = float(top) + r
+    x0 = float(left) + r
+    x1 = float(left) + float(width) - r
+    if x1 <= x0:
+        return [[float(left) + float(width) / 2.0, axis_y, r]]
+    span = x1 - x0
+    n = max(2, int(math.ceil(span / r)) + 1)
+    step = span / (n - 1)
+    return [[x0 + i * step, axis_y, r] for i in range(n)]
+
 # 真撞击阈值（语义对齐现架构 window.py:147-150 / collision_client.py:373-381）
 HIT_MIN_DV = 300.0          # COLLISION_HIT_MIN_DV：普通对 |dv| 阈值 (px/s)
 STATIC_HIT_MIN_DV = 60.0    # 撞静态布景放宽（岛的语义就是"撞上去会弹"）
@@ -110,6 +137,8 @@ class SpriteCollisionWorld:
         # 静态成员（灵动岛预留）：member_id -> (left, top, width, height)
         self._static_members: Dict[str, Tuple[float, float, float, float]] = {}
         self._listeners: List[Callable[[CollisionEvent], None]] = []
+        # 静态成员自定义圆链（岛 stadium 口径，member_id -> circles）
+        self._static_member_circles: Dict[str, list] = {}
         # 静止豁免（P1/③-1）：上 tick 的运动签名 + 静态成员脏标记。
         # 签名一致且无未结清交互时，求解结果可证不变，整 tick 跳过
         self._last_motion_sig: tuple | None = None
@@ -117,19 +146,27 @@ class SpriteCollisionWorld:
 
     # ---------------------------------------------------------------- 静态成员（灵动岛预留 API）
     def add_static_member(self, member_id: str, left: float, top: float,
-                          width: float, height: float) -> None:
+                          width: float, height: float,
+                          *, circles: Sequence[Sequence[float]] | None = None) -> None:
         """注册静态碰撞成员（FLAG_STATIC 语义的矩形障碍/体育场）。
 
-        本阶段只留 API：灵动岛接入时由岛的几何变更回调维护注册。无限质量
-        且保留 STATIC_RESTITUTION 果冻墙弹性（collision.py 内部分支）。
+        默认碰撞体 = circles_from_rect 内切三圆；岛等宽扁胶囊应经
+        circles=capsule_circles(...) 传入体育场等效圆链（D9 stadium 口径）。
+        无限质量且保留 STATIC_RESTITUTION 果冻墙弹性（collision.py 内部分支）。
         """
         self._static_members[str(member_id)] = (
             float(left), float(top), float(width), float(height))
+        if circles is not None:
+            self._static_member_circles[str(member_id)] = [
+                [float(c[0]), float(c[1]), float(c[2])] for c in circles]
+        else:
+            self._static_member_circles.pop(str(member_id), None)
         self._static_dirty = True
 
     def remove_static_member(self, member_id: str) -> None:
         """注销静态成员；未注册过是 no-op。"""
         self._static_members.pop(str(member_id), None)
+        self._static_member_circles.pop(str(member_id), None)
         self._prev_circles.pop(str(member_id), None)
         self._static_dirty = True
 
@@ -290,7 +327,8 @@ class SpriteCollisionWorld:
                    | collision.FLAG_STATIC),
             w=w,
             h=h,
-            circles=collision.circles_from_rect(left, top, w, h),
+            circles=(self._static_member_circles.get(member_id)
+                     or collision.circles_from_rect(left, top, w, h)),
         )
 
     # ---------------------------------------------------------------- 内部：扫掠

@@ -335,3 +335,36 @@ def test_world_wakes_on_motion_and_static_change(monkeypatch):
     world.add_static_member("island", 100, 100, 200, 80)  # 静态变更 → 唤醒
     world.tick([a, b], 0.016)
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------- D9：岛 stadium（胶囊圆链）
+def test_capsule_circles_geometry():
+    from pet.sprite_collision import capsule_circles
+    # 宽扁岛 600×90：高度截到 44（island_collision._CAPSULE_HEIGHT 口径），
+    # r=22，轴线 y=top+22，x∈[left+22, left+578]，圆间距 ≤ r 连续覆盖
+    circles = capsule_circles(100, 200, 600, 90)
+    r = 22.0
+    assert all(c[2] == r for c in circles)
+    assert circles[0][0] == 100 + r and circles[-1][0] == 100 + 600 - r
+    assert all(c[1] == 200 + r for c in circles)
+    gaps = [circles[i + 1][0] - circles[i][0] for i in range(len(circles) - 1)]
+    assert all(g <= r + 1e-9 for g in gaps)      # 连续覆盖无空档
+    # 窄于高度上限的岛：高度不截断
+    small = capsule_circles(0, 0, 200, 30)
+    assert small[0][2] == 15.0
+
+
+def test_static_member_capsule_covers_axis_midpoint():
+    """胶囊中段的碰撞（内切三圆口径会漏——两端圆心距 278px，中段是空档）。"""
+    from pet.sprite_collision import capsule_circles
+    world = SpriteCollisionWorld()
+    # 岛 400×80 @ (100,100)：rect 三圆圆心在 122/300/478（r=44→截 44,r=22 口径不同，
+    # 但即便同口径三圆也只覆盖两端+中心），胶囊圆链连续
+    world.add_static_member("island", 100, 100, 400, 80,
+                            circles=capsule_circles(100, 100, 400, 80))
+    # sprite 落在胶囊中段边缘（x=210，两端圆都够不着的位置），与岛相触
+    s = FakeSprite(180, 80, w=60, h=60, collision_id="fish")
+    events = []
+    world.add_collision_listener(events.append)
+    world.tick([s], 0.016)
+    assert events or s.pos.y() != 80 or s.velocity.y() != 0.0  # 发生碰撞结算
