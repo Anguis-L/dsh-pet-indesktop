@@ -40,6 +40,7 @@ from .session_watcher import install_session_watcher
 from .sprite_behavior import BehaviorController
 from .sprite_collision import SpriteCollisionWorld
 from .sprite_physics import ThrowPhysicsController
+from .sprite_sound import SpriteSoundPlayer
 
 ENV_TOPOLOGY = "PET_RENDER_TOPOLOGY"
 TOPOLOGY_OVERLAY = "overlay"
@@ -88,6 +89,9 @@ class ShellOverlayWindow(OverlayWindow):
         threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
         if (event.position() - press).manhattanLength() < threshold:
             self.behavior.on_sprite_clicked(grab)
+            cb = getattr(self, "click_feedback", None)
+            if callable(cb):
+                cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
 
 
 class OverlayShell(QObject):
@@ -129,8 +133,12 @@ class OverlayShell(QObject):
         self.behavior = BehaviorController(self._bounds)
         self.collision = SpriteCollisionWorld()
         self.physics = ThrowPhysicsController(self._bounds)
+        # 4.1c 音效：点击 + 碰撞（click_sound 默认包，静默降级）
+        self._sound = SpriteSoundPlayer(self._config, self.collision)
+        self.collision.add_collision_listener(self._sound.on_collision)
         self.overlay = ShellOverlayWindow(self._screen, self._advance_controllers)
         self.overlay.behavior = self.behavior
+        self.overlay.click_feedback = self._sound.on_click
         self.lib = self._create_main_library()
         scale = float(self._config.get("scale") or catalog.DEFAULT_SCALE)
         self.sprite = self._sprite_factory(self.lib, QPointF(0, 0), scale)

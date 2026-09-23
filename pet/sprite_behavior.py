@@ -14,7 +14,8 @@ bind_clip）；drag/thrown 直接跳过——拖拽由鼠标路由、抛掷由�
 
 与旧窗口路径（pet/window.py，仅语义参考、禁止 import）的对应关系：
 - 掷骰节奏沿用 catalog 概率：30% 待机 / 10% 转向 / 20% 移动；40% 随机
-  动作池（acts）本阶段未实现，概率并入待机（掷中 acts 桶 = 继续待机）；
+  动作池（acts）：40% 概率桶已移植（池空回退待机，语义同 window.py
+  _pick_next 的 acts 分支）；
 - 转向闸门沿用 inward_facing 中线滞回：掷中转向但无需纠正（带内或已朝
   内）降级待机；掷中待机但朝外且有转向素材时改播转向
   （window.py:2735-2745 语义）；
@@ -46,6 +47,7 @@ STATE_IDLE = "idle"
 STATE_MOVE = "move"
 STATE_TURN = "turn"
 STATE_CLICK = "click"
+STATE_ACTS = "acts"
 
 
 class _SpriteState:
@@ -162,6 +164,9 @@ class BehaviorController:
                     self._start_move(sprite, st, pending)
                 else:
                     self._enter_idle(sprite, st, self._categories(sprite.library))
+        elif st.state == STATE_ACTS:
+            if st.elapsed >= st.duration:
+                self._roll_next(sprite, st)
         elif st.state == STATE_CLICK:
             if st.elapsed >= st.duration:
                 self._enter_idle(sprite, st, self._categories(sprite.library))
@@ -173,12 +178,13 @@ class BehaviorController:
         if roll < catalog.P_TURN:  # P_IDLE 与 P_TURN 是累计阈值（<0.3 待机，<0.4 转向）
             action = STATE_IDLE if roll < catalog.P_IDLE else STATE_TURN
         elif roll < catalog.P_ACTS:
-            action = STATE_IDLE  # 随机动作池本阶段未实现：概率并入待机
+            action = STATE_ACTS  # 40% 随机动作池（acts 为空时 enter 内回退待机）
         else:
             action = STATE_MOVE
         if action == STATE_MOVE:
             if not self._plan_move(sprite, st, cats):
-                self._enter_idle(sprite, st, cats)  # 边缘可达性不足/无素材：回退待机
+                # 移动失败回退动作池（window.py:2735 语义，acts 空则回退待机）
+                self._enter_acts(sprite, st, cats)
             return
         # 朝向闸门（window.py:2735-2745）：需要纠正朝向时一律播转向；
         # 掷中转向但无需纠正 → 降级待机。朝向绝不由随机数凭空翻转。
@@ -186,7 +192,9 @@ class BehaviorController:
         cx, left, right = movement.body_reach(
             self.bounds.left(), self.bounds.right(), sprite.pos.x() + off_x, bw, self.margin)
         want = movement.inward_facing(cx, left, right)
-        if want is not None and want != sprite.facing and cats["turns"]:
+        if action == STATE_ACTS:
+            self._enter_acts(sprite, st, cats)
+        elif want is not None and want != sprite.facing and cats["turns"]:
             self._enter_turn(sprite, st, cats)
         else:
             self._enter_idle(sprite, st, cats)
@@ -203,6 +211,22 @@ class BehaviorController:
         st.duration = self._clip_duration(sprite.library, name) if name else 0.0
         if name is not None:
             sprite.bind_clip(name)
+
+    def _enter_acts(self, sprite, st: _SpriteState, cats: dict) -> None:
+        """随机动作（40% acts 桶）：acts 池随机一段，播完回掷骰
+        （window.py _pick_next 的 acts 分支语义）；池空回退待机。"""
+        name = self._pick(cats["acts"], exclude=st.anim)
+        if name is None:
+            self._enter_idle(sprite, st, cats)
+            return
+        st.state = STATE_ACTS
+        st.pending_move = None
+        st.move_target = None
+        sprite.set_velocity(QPointF(0, 0))
+        st.elapsed = 0.0
+        st.anim = name
+        st.duration = self._clip_duration(sprite.library, name)
+        sprite.bind_clip(name)
 
     def _enter_turn(self, sprite, st: _SpriteState, cats: dict, pending_move: dict | None = None) -> None:
         name = self._pick(cats["turns"], exclude=st.anim)
@@ -317,9 +341,9 @@ class BehaviorController:
                 raw = catalog.build_categories(
                     names(), getattr(lib, "manifest", None),
                     getattr(lib, "folder_map", None), getattr(lib, "folder_files", None))
-                cats = {k: list(raw[k]) for k in ("idles", "turns", "moves", "clicks")}
+                cats = {k: list(raw[k]) for k in ("idles", "turns", "moves", "clicks", "acts")}
             else:
-                cats = {k: list(getattr(lib, k, None) or []) for k in ("idles", "turns", "moves", "clicks")}
+                cats = {k: list(getattr(lib, k, None) or []) for k in ("idles", "turns", "moves", "clicks", "acts")}
             self._cats_cache[lib] = cats
         return cats
 

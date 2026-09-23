@@ -383,3 +383,44 @@ def test_clamp_into_bounds_body_box_pulls_back_only_overflow(monkeypatch):
     c._clamp_into_bounds(sprite)
 
     assert sprite.pos == QPointF(600, 435)       # 钳到身体框贴边即停
+
+
+# ---------------------------------------------------------------- D9：acts 随机动作池
+def _library_with_acts():
+    lib = _make_library()
+    lib.acts = ["act1", "act2"]
+    for name in lib.acts:
+        lib._clips[name] = FakeClip(name, 18)
+    return lib
+
+
+def test_acts_bucket_binds_acts_clip():
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))
+    _run(c, sprite, lib.duration("idle1") + 0.1)   # 待机播完掷骰 → 0.5 ∈ acts 桶
+    assert c.state_of(sprite) == "acts"
+    assert sprite._clip_name in ("act1", "act2")
+    # acts 播完回掷骰（默认 roll 0.0 → 回待机）
+    _run(c, sprite, lib.duration(sprite._clip_name) + 0.1)
+    assert c.state_of(sprite) == "idle"
+
+
+def test_acts_bucket_falls_back_to_idle_when_pool_empty():
+    lib = _make_library()  # 无 acts
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))
+    _run(c, sprite, lib.duration("idle1") + 0.1)
+    assert c.state_of(sprite) == "idle"     # acts 空：40% 桶回退待机
+    assert lib.clip("idle1").start_count == 2
+
+
+def test_move_failure_falls_back_to_acts():
+    # 窄边界 + 高 roll（>=0.8 移动桶）→ 移动计划失败 → 回退动作池（非待机）
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib, pos=(20, 400))
+    c = BehaviorController(QRect(0, 0, 400, 1000), rng=ScriptedRng(rolls=(0.99,)))
+    _roll_into_move(c, sprite, lib, rolls=())
+    assert c.state_of(sprite) == "acts"
+    assert sprite._clip_name in ("act1", "act2")
+    assert sprite.velocity == QPointF(0, 0)
