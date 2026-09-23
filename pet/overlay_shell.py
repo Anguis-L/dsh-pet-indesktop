@@ -7,9 +7,11 @@
 - 主屏 OverlayWindow + 主 sprite（MovieLibrary 经主 PetInstance._create_library
   创建——per-pet 库是 T3 定论，禁止跨 sprite 共享 clip 对象）；
 - 进程级一组三控制器（BehaviorController/SpriteCollisionWorld/
-  ThrowPhysicsController），tick 顺序协议：行为 → 碰撞 → 抛掷物理
-  （挂 OverlayWindow.before_sprites_advance，接线口径同
-  .scratch/single-overlay-window/run_overlay_demo.py）；
+  ThrowPhysicsController），挂在**统一 tick 驱动器**（tick_driver.TickDriver，
+  M-2/T2）上：驱动器持有控制器与 tick 时钟，调
+  ``tick_sim(全部 overlays 的 sprites, dt)``，tick 顺序协议语义不变
+  （行为 → 碰撞 → 抛掷物理）；overlay 只负责 advance+paint/脏矩形。
+  接线口径同 .scratch/single-overlay-window/run_overlay_demo.py；
 - 屏事件：screenAdded/screenRemoved/primaryScreenChanged/geometryChanged →
   overlay 重建或几何同步，sprite 位置按 rx/ry（中心相对可用区比例）语义
   迁移；主屏 DPR 变化重喂 sprite.set_dpr；拖拽中拔屏先收尾拖拽再迁移；
@@ -41,6 +43,7 @@ from .sprite_behavior import BehaviorController
 from .sprite_collision import SpriteCollisionWorld
 from .sprite_physics import ThrowPhysicsController
 from .sprite_sound import SpriteSoundPlayer
+from .tick_driver import TickDriver
 
 ENV_TOPOLOGY = "PET_RENDER_TOPOLOGY"
 TOPOLOGY_OVERLAY = "overlay"
@@ -59,23 +62,20 @@ def _screen_name(screen) -> str:
 
 
 class ShellOverlayWindow(OverlayWindow):
-    """4.1a 产品 overlay：三控制器 tick 钩子 + 单击/拖拽区分。
+    """4.1a 产品 overlay：挂进程级驱动器 + 单击/拖拽区分。
 
-    before_sprites_advance 转发给 OverlayShell 注入的回调（tick 顺序协议
-    在壳层固化，子类不持有控制器）；behavior 属性由壳层挂载，
-    contextMenuEvent（基类）查表读它。点击 vs 拖拽的阈值判定口径同
-    run_overlay_demo.py：按下位移小于 DRAG_THRESHOLD*scale 视为单击。
+    仿真段不再经本类（M-2：驱动器独立持有控制器，tick 顺序协议在
+    tick_driver.TickDriver.tick_sim 固化）；overlay 只把 advance+paint 段
+    与鼠标路由做完。behavior 属性由壳层挂载，contextMenuEvent（基类）查表
+    读它。点击 vs 拖拽的阈值判定口径同 run_overlay_demo.py：按下位移小于
+    DRAG_THRESHOLD*scale 视为单击。
     """
 
-    def __init__(self, screen, on_advance) -> None:
-        super().__init__(screen=screen)
-        self._on_advance = on_advance
+    def __init__(self, screen, *, driver: TickDriver | None = None) -> None:
+        super().__init__(screen=screen, driver=driver)
         self._press_pos = None
         self.behavior = None  # OverlayShell 挂载；contextMenuEvent 查表读它
         self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
-
-    def before_sprites_advance(self, dt: float) -> None:
-        self._on_advance(dt)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         self._press_pos = event.position()
@@ -150,6 +150,7 @@ class OverlayShell(QObject):
         self.behavior: BehaviorController | None = None
         self.collision: SpriteCollisionWorld | None = None
         self.physics: ThrowPhysicsController | None = None
+        self.driver: TickDriver | None = None
         self.overlay: ShellOverlayWindow | None = None
         self.sprite = None
         self.lib = None
@@ -173,7 +174,11 @@ class OverlayShell(QObject):
         self.collision.add_collision_listener(self._sound.on_collision)
         # 4.1c 碰撞 Q 弹：真撞击量级 → 双方 sprite 挤压
         self.collision.add_collision_listener(self._on_collision_squash)
-        self.overlay = ShellOverlayWindow(self._screen, self._advance_controllers)
+        # M-2 统一 tick 驱动器（T2）：进程级一组控制器挂在驱动器上，overlay
+        # 只做 advance+paint；屏迁移重建 overlay 时复用同一驱动器（成员替换）。
+        self.driver = TickDriver(self)
+        self.driver.set_controllers(self.behavior, self.collision, self.physics)
+        self.overlay = ShellOverlayWindow(self._screen, driver=self.driver)
         self.overlay.behavior = self.behavior
         self.overlay.click_feedback = self._sound.on_click
         # 4.1c 全量右键菜单（facade 适配旧 context_menus 建造器）
@@ -245,14 +250,6 @@ class OverlayShell(QObject):
         右缘留 CORNER_MARGIN、底贴可用区底）。"""
         return QPointF(bounds.x() + bounds.width() - 1 - rect.width() - catalog.CORNER_MARGIN,
                        bounds.y() + bounds.height() - 1 - rect.height())
-
-    # ---------------------------------------------------------------- tick 顺序协议
-    def _advance_controllers(self, dt: float) -> None:
-        """tick 顺序协议：行为 → 碰撞 → 抛掷物理（集成约定，固化成测试）。"""
-        sprites = self.overlay.sprites
-        self.behavior.tick(sprites, dt)
-        self.collision.tick(sprites, dt)
-        self.physics.tick(sprites, dt)
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
@@ -686,7 +683,7 @@ class OverlayShell(QObject):
         self._disconnect_screen(self._screen)
         self._screen = new_screen
         new_bounds = self._local_bounds(new_screen)
-        self.overlay = ShellOverlayWindow(new_screen, self._advance_controllers)
+        self.overlay = ShellOverlayWindow(new_screen, driver=self.driver)
         self.overlay.behavior = self.behavior
         old_overlay.remove_sprite(self.sprite, release_clip=False)  # 迁移保留 clip
         self.overlay.add_sprite(self.sprite)
@@ -696,7 +693,8 @@ class OverlayShell(QObject):
         self._apply_bounds(new_bounds)
         self._connect_screen(new_screen)
         was_started = self._started
-        old_overlay.stop()
+        # M-2：驱动器为进程级共享（新 overlay 已在构造时挂上）——不再停旧表
+        # 再起新表（那会在多 overlay 下停掉整组 tick）；旧 overlay 关闭即摘除。
         if getattr(self, "_bubble_follower", None) is not None:
             self._bubble_follower.close()
             from .sprite_bubble import SpriteBubbleFollower

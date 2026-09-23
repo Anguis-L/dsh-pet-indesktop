@@ -206,7 +206,21 @@ def test_shell_library_character_fallback():
     assert shell.lib is not None
 
 
-# ---------------------------------------------------------------- tick 顺序协议
+# ---------------------------------------------------------------- tick 装配与顺序协议（M-2）
+def test_shell_assembles_process_level_tick_driver():
+    """M-2/T2：驱动器独立持有三控制器，overlay 只被驱动（不再挂 tick 钩子）。"""
+    shell, _, _ = _make_shell()
+    driver = shell.driver
+    assert driver is not None
+    assert shell.overlay.tick_driver is driver          # 同一驱动器驱动本 overlay
+    assert driver.overlays == [shell.overlay]
+    assert driver.behavior is shell.behavior
+    assert driver.collision is shell.collision
+    assert driver.physics is shell.physics
+    # 产品 overlay 不再覆写兼容钩子（仿真段唯一入口 = 驱动器 tick_sim）
+    assert "before_sprites_advance" not in type(shell.overlay).__dict__
+
+
 def test_tick_order_behavior_collision_physics():
     shell, _, _ = _make_shell()
     calls = []
@@ -218,9 +232,9 @@ def test_tick_order_behavior_collision_physics():
         def tick(self, sprites, dt):
             calls.append((self.name, list(sprites), dt))
 
-    shell.behavior = Recorder("behavior")
-    shell.collision = Recorder("collision")
-    shell.physics = Recorder("physics")
+    # M-2 后控制器由驱动器持有：替换点从 shell 属性面移到驱动器装配点
+    shell.driver.set_controllers(Recorder("behavior"), Recorder("collision"),
+                                 Recorder("physics"))
     shell.overlay._on_tick(dt=0.016)  # 同步直调，不跑真 QTimer
 
     assert [c[0] for c in calls] == ["behavior", "collision", "physics"]

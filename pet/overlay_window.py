@@ -17,26 +17,24 @@ Phase 3b：sprite 位置监听（add_position_listener）——sprite 不产生 
 Phase 4 D2/HiDPI：DPR 由 overlay 统一按所在屏喂给**全部** sprite
 （add_sprite/showEvent/屏事件），屏幕 DPR 变化（显示缩放、跨屏、几何变化）
 即重喂并按新 DPR 重建——对齐旧路径 window.py:2129-2218 的信号驱动语义。
+Phase 4 M-2：仿真推进（行为/碰撞/抛掷物理）与 tick 时钟、M-1 档位状态机整体
+移交给统一驱动器 ``tick_driver.TickDriver``（T2：驱动器独立持有控制器，调
+``world.tick(全部 overlays 的 sprites, dt)``）；overlay 只保留职责范围内的
+「advance → 脏矩形 → 位置监听 fanout → update」段（``tick_advance``）与
+绘制/命中/鼠标路由。``start``/``stop``/``_on_tick``/``_note_kinetic`` 等旧属性面
+保留为转发（deprecation shim，见各自 docstring）。
 """
 
 from __future__ import annotations
 
 import sys
-import time
 
-from PySide6.QtCore import QElapsedTimer, QPoint, QPointF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QCursor, QPainter, QRegion, QScreen
 from PySide6.QtWidgets import QApplication, QWidget
 
-from .pet_sprite import INTERACTION_NORMAL
 from .sprite_menu import build_sprite_menu
-from .tick_governor import (
-    ANIMATING_WINDOW_S,
-    TIER_ACTIVE,
-    TIER_INTERVAL_MS,
-    TIER_OCCLUDED,
-    TickGovernor,
-)
+from .tick_driver import TickDriver
 
 if sys.platform == "win32":
     from .platform_win import WindowsPerPixelInputController, _set_windows_no_activate
@@ -48,7 +46,8 @@ ALPHA_HIT_THRESHOLD = 16
 class OverlayWindow(QWidget):
     """全屏透明合成窗：sprites 有序列表即 z-order（尾部最上）。"""
 
-    def __init__(self, screen: QScreen | None = None, parent: QWidget | None = None) -> None:
+    def __init__(self, screen: QScreen | None = None, parent: QWidget | None = None,
+                 *, driver: TickDriver | None = None) -> None:
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.Tool
@@ -74,90 +73,60 @@ class OverlayWindow(QWidget):
         self._input_controller = None
         # sprite 移除通知（V-9）：行为控制器状态表等外部簿记的注销挂点
         self._sprite_removed_listeners: list = []
-        # M-1 闲置降档：governor 决策 + 最近帧到达时间（"动画在播"判定）
-        self._governor = TickGovernor()
-        self._applied_tier = TIER_ACTIVE
-        self._last_frame_notify: float | None = None
         # D2/P1：Qt 信号驱动 DPR 变化（QWindow.screenChanged + 所在屏
         # logical/physicalDotsPerInchChanged；Qt 6.11 无 devicePixelRatioChanged），
         # 与 geometryChanged 一起重喂 sprite。showEvent 接线，closeEvent 摘线。
         self._dpr_watch_window = None
         self._dpr_watch_screen = None
 
-        self._elapsed = QElapsedTimer()
-        self._tick_count = 0
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(self._tick_interval_ms(self._screen.refreshRate()))
-        self._timer.timeout.connect(self._on_tick)
+        # M-2 统一 tick 驱动器（T2）：仿真段 + tick 时钟 + M-1 档位全归驱动器
+        # （tick_driver.TickDriver），overlay 只提供推进+重绘段（tick_advance）。
+        # 未注入 driver 时自建私有驱动器——裸 overlay / demo 装配照旧可用；
+        # 产品壳（overlay_shell）建一个进程级驱动器，挂全部屏的 overlay。
+        self._driver = driver if driver is not None else TickDriver(self)
+        self._driver.attach(self)
+        # 旧属性面（deprecation）：overlay._timer 即驱动器时钟，供旧调用点
+        # （测试同步驱动/间隔断言）沿用；新代码请走 tick_driver。
+        self._timer = self._driver.timer
 
     @staticmethod
     def _tick_interval_ms(refresh_rate: float) -> int:
-        """tick 间隔：rr<75 或无读数 → 16ms；其余按刷新率取整（封顶 16ms，
-        170Hz→6ms，90Hz→11ms——旧边界把 90Hz 错打成 16ms，V-6）。"""
-        if not refresh_rate or refresh_rate < 75.0:
-            return 16
-        return max(1, min(16, round(1000.0 / refresh_rate)))
+        """tick 间隔公式（V-6）：实现已随 M-2 迁到 TickDriver，本处保留旧入口
+        （旧调用点/测试的静态引用面），语义逐位相同。"""
+        return TickDriver.tick_interval_ms(refresh_rate)
+
+    @property
+    def screen(self) -> QScreen | None:
+        """所在屏（只读）：M-2 后驱动器按它取刷新率（多 overlay 取最高者）。"""
+        return self._screen
+
+    @property
+    def tick_driver(self) -> TickDriver:
+        """统一 tick 驱动器（M-2）：持有控制器 / tick 时钟 / M-1 档位。"""
+        return self._driver
 
     def _refresh_tick_interval(self) -> None:
         """重读屏幕刷新率并刷新 tick 间隔（V-6：电池 DRR 会在 170/60Hz
-        间动态切换，构造时的一次性读数会变陈旧）。"""
-        self._timer.setInterval(self._tick_interval_ms(self._screen.refreshRate()))
+        间动态切换，构造时的一次性读数会变陈旧）；M-2 后委托驱动器。"""
+        self._driver.refresh_tick_interval()
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
-        self._elapsed.start()
-        self._governor.notify_kinetic()  # 启动即 T0（首段仿真全速）
-        self._sync_tier()
-        self._timer.start()
+        # attach 幂等：stop()（会 close/detach）后重启仍被驱动器驱动
+        self._driver.attach(self)
+        self._driver.start()
 
     def stop(self) -> None:
-        self._timer.stop()
+        self._driver.stop()
 
-    # ---------------------------------------------------------------- M-1 闲置降档
-    @staticmethod
-    def _sprite_in_motion(sprite) -> bool:
-        """sprite 是否在运动（velocity≠0 或 interaction_state≠normal）。"""
-        v = getattr(sprite, "velocity", None)
-        is_null = getattr(v, "isNull", None)
-        if callable(is_null):
-            if not is_null():
-                return True
-        elif v:
-            return True
-        return getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL
-
-    def _sync_tier(self) -> None:
-        """评估目标档位并在变化时应用（升档在 evaluate 内即生效）。"""
-        animating = (
-            self._last_frame_notify is not None
-            and time.monotonic() - self._last_frame_notify < ANIMATING_WINDOW_S
-        )
-        tier = self._governor.evaluate(
-            any_motion=any(self._sprite_in_motion(s) for s in self.sprites),
-            animating=animating,
-            visible=self.isVisible(),
-        )
-        if tier != self._applied_tier:
-            self._apply_tier(tier)
-
-    def _apply_tier(self, tier: int) -> None:
-        """把档位应用到 QTimer：T0 按刷新率 + Precise，其余固定间隔 + Coarse。"""
-        self._applied_tier = tier
-        if tier == TIER_ACTIVE:
-            self._refresh_tick_interval()  # 切入 T0 必重读 rr（电池 DRR）
-            self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        else:
-            self._timer.setInterval(TIER_INTERVAL_MS[tier])
-            self._timer.setTimerType(Qt.TimerType.CoarseTimer)
-        # 切档后首 tick 不吃历史流逝（防 dt 突变一步跨出大位移）
-        self._elapsed.restart()
-
+    # ---------------------------------------------------------------- M-1 闲置降档（挂点）
     def _note_kinetic(self) -> None:
-        """运动/输入信号：升档同步立即，不等下一个 tick（M-1 硬指标——
-        高刷体验只在真正闲置时让位，任何活动瞬间回全速）。"""
-        self._governor.notify_kinetic()
-        self._sync_tier()
+        """运动/输入信号（M-1：升档同步立即，不等下一个 tick）。
+
+        M-2 后档位状态机、四档降档与 QTimer 应用整体在 TickDriver；overlay
+        只把事件侧信号转发进去——鼠标事件与 sprite 位移回调都走这里。
+        """
+        self._driver.note_kinetic()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -173,7 +142,9 @@ class OverlayWindow(QWidget):
             _set_windows_no_activate(int(self.winId()))
 
     def closeEvent(self, event) -> None:
-        self._timer.stop()  # V-12：关窗即停 tick，不再 170Hz 空转
+        # V-12：关窗即停 tick（M-2：从驱动器摘除本 overlay；最后一个摘除时
+        # 驱动器停表——多 overlay 场景其余成员继续被驱动）
+        self._driver.detach(self)
         self._disarm_dpr_change_watch()  # D2/P1：摘线，与 showEvent arm 对称
         if self._input_controller is not None:
             self._input_controller.stop()
@@ -198,7 +169,7 @@ class OverlayWindow(QWidget):
                 self._note_kinetic()
             else:
                 # 纯帧通知：记录动画活性（"动画在播"判定的输入）
-                self._last_frame_notify = time.monotonic()
+                self._driver.note_frame()
             self.update(QRegion(old) | QRegion(new))
 
         sprite._dirty_cb = _on_sprite_dirty
@@ -396,31 +367,23 @@ class OverlayWindow(QWidget):
 
     # ---------------------------------------------------------------- 统一 tick
     def before_sprites_advance(self, dt: float) -> None:
-        """行为层钩子（默认空实现）：每个 tick 在 sprite.advance 之前调用。
+        """行为层钩子（**deprecation**）：仅由"未挂控制器"的驱动器调用。
 
-        Phase 2 的进程内碰撞世界、demo 的边界反弹/碰撞物理挂在这里——
-        钩子只改各 sprite 的 velocity/pos，位置积分仍由 advance 统一完成。
+        M-2 之前这是唯一的仿真段挂点（demo / Phase 2 装配把碰撞世界与物理
+        挂在这里）；M-2 之后产品路径的仿真段由 ``TickDriver.tick_sim`` 持有
+        三控制器完成（T2：驱动器独立，不挂在主 overlay 上），本钩子只在
+        "驱动器未挂控制器"的兼容分支被调用——避免"驱动器 + 钩子"双份仿真。
+        新装配请用 ``TickDriver.set_controllers(...)``；本方法保留一个发布
+        周期供旧装配迁移，随 4.4 退役刀删除。
         """
 
-    def _on_tick(self, dt: float | None = None) -> None:
-        if self._applied_tier == TIER_OCCLUDED:
-            # T3 心跳：不跑仿真，只复查档位（可见性/刷新率变化经 showEvent
-            # 与本路径恢复）
-            self._elapsed.restart()
-            self._sync_tier()
-            return
-        if dt is None:
-            if self._tick_count:
-                # dt 上限按档钳：T0 50ms，低档放宽到 2× 档间隔——切档瞬间
-                # 不吃历史流逝造成的位置跳变
-                cap = max(2.0 * self._timer.interval() / 1000.0, 0.05)
-                dt = min(cap, self._elapsed.nsecsElapsed() / 1e9)
-            else:
-                dt = self._timer.interval() / 1000.0
-            self._elapsed.restart()
-        self._tick_count += 1
-        self._check_stale_press()  # V-7：tick 路径同样兜底卡死的拖拽
-        self.before_sprites_advance(dt)
+    def tick_advance(self, dt: float) -> None:
+        """推进+重绘段（M-2 拆分的下半段，驱动器每 tick 调用一次）。
+
+        advance → 脏矩形 → 位置监听 fanout → update。V-3/V-4 语义不变：脏区
+        取 advance 上报的旧|新 rect；帧到达直驱重绘另行由 sprite 的
+        ``_dirty_cb``（见 add_sprite）保证，不依赖本段。
+        """
         dirty = QRegion()
         moved = []
         for sprite in list(self.sprites):
@@ -437,7 +400,16 @@ class OverlayWindow(QWidget):
                 cb(sprite)
         if not dirty.isEmpty():
             self.update(dirty)
-        self._sync_tier()  # M-1：tick 末评估降档（升档在事件/回调侧同步完成）
+
+    def _on_tick(self, dt: float | None = None) -> None:
+        """兼容 shim（**deprecation**）：转发给驱动器的一次 tick。
+
+        M-2 之前 tick 循环（dt 钳制 / M-1 档位 / 仿真段 / advance）在本类；
+        拆分后循环归 ``TickDriver.on_tick``，本方法只转发，供旧调用点（demo、
+        既有测试）同步驱动。新代码请用 ``overlay.tick_driver``（或直接
+        ``driver.on_tick``）。
+        """
+        self._driver.on_tick(dt)
 
     # ---------------------------------------------------------------- 合成
     def paintEvent(self, event) -> None:

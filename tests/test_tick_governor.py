@@ -6,9 +6,13 @@
 - 升档同步立即、降档 800ms 滞回（连续静默才降）；
 - overlay 集成：静默后 QTimer 间隔/TimerType 随档切换；set_velocity 与
   位移经 sprite 回调同步唤醒回 T0；切档后首 tick 不吃历史流逝；
-- T3 心跳不跑仿真（before_sprites_advance 不被调用）。
+- T3 心跳不跑仿真（仿真段钩子不被调用）。
 
-纪律（AGENTS.md 时序测试）：governor 用注入假钟；overlay 侧同步直调
+注（M-2）：档位状态机随 tick 时钟迁到统一驱动器
+（``pet.tick_driver.TickDriver``），集成断言的挂点从 overlay 内部属性面
+平移到 ``overlay.tick_driver``——语义逐条等价。
+
+纪律（AGENTS.md 时序测试）：governor 用注入假钟；驱动器侧同步直调
 _on_tick/_sync_tier，不启动真实 QTimer、不固定 sleep。
 """
 from __future__ import annotations
@@ -115,7 +119,7 @@ def test_downgrade_hold_resets_on_activity():
     assert g.evaluate(any_motion=False, animating=False, visible=True) == TIER_ACTIVE
 
 
-# ---------------------------------------------------------------- overlay 集成
+# ---------------------------------------------------------------- 驱动器集成（M-2 拆分的挂点）
 class FakeClip(QObject):
     frameChanged = Signal(int)
 
@@ -158,68 +162,76 @@ def _make_overlay_with_sprite():
     return overlay, sprite
 
 
-def _quiesce_to_tier(overlay, clock, tier):
-    """把 overlay 静默推进到目标档：先越过活动尾巴 → 启动静默计时 →
+def _quiesce_to_tier(driver, clock, tier):
+    """把驱动器静默推进到目标档：先越过活动尾巴 → 启动静默计时 →
     越过降档滞回期 → 再评估。"""
     clock.advance(ACTIVE_HOLD_MS / 1000.0 + 0.1)
-    overlay._sync_tier()
+    driver._sync_tier()
     clock.advance(DOWNGRADE_HOLD_MS / 1000.0 + 0.1)
-    overlay._sync_tier()
-    assert overlay._applied_tier == tier
+    driver._sync_tier()
+    assert driver.applied_tier == tier
 
 
-def test_overlay_downshifts_after_quiet(monkeypatch):
+def test_driver_downshifts_after_quiet(monkeypatch):
+    """M-1 档位应用到 QTimer：静默后间隔/TimerType 随档切换。
+
+    M-2 后档位状态机随 tick 时钟迁到统一驱动器（overlay.tick_driver），
+    断言点从 overlay 内部属性面平移到驱动器（语义等价）。
+    """
     overlay, _sprite = _make_overlay_with_sprite()
+    driver = overlay.tick_driver
     # 注入假钟：governor 时间快进越过滞回期；offscreen 未 show → 补可见
     clock = FakeClock()
-    monkeypatch.setattr(overlay._governor, "_clock", clock)
+    monkeypatch.setattr(driver._governor, "_clock", clock)
     monkeypatch.setattr(overlay, "isVisible", lambda: True)
-    overlay._last_frame_notify = None     # 无动画活性 → 目标 T2
-    overlay._governor.notify_kinetic()
-    overlay._sync_tier()
-    assert overlay._applied_tier == TIER_ACTIVE
-    precise = overlay._timer.timerType()
-    assert precise == Qt.TimerType.PreciseTimer
+    driver._last_frame_notify = None      # 无动画活性 → 目标 T2
+    driver._governor.notify_kinetic()
+    driver._sync_tier()
+    assert driver.applied_tier == TIER_ACTIVE
+    assert driver.timer.timerType() == Qt.TimerType.PreciseTimer
 
-    _quiesce_to_tier(overlay, clock, TIER_IDLE_STILL)
-    assert overlay._timer.interval() == TIER_INTERVAL_MS[TIER_IDLE_STILL]
-    assert overlay._timer.timerType() == Qt.TimerType.CoarseTimer
+    _quiesce_to_tier(driver, clock, TIER_IDLE_STILL)
+    assert driver.timer.interval() == TIER_INTERVAL_MS[TIER_IDLE_STILL]
+    assert driver.timer.timerType() == Qt.TimerType.CoarseTimer
 
 
 def test_overlay_velocity_write_wakes_immediately(monkeypatch):
     overlay, sprite = _make_overlay_with_sprite()
+    driver = overlay.tick_driver
     clock = FakeClock()
-    monkeypatch.setattr(overlay._governor, "_clock", clock)
+    monkeypatch.setattr(driver._governor, "_clock", clock)
     monkeypatch.setattr(overlay, "isVisible", lambda: True)
-    overlay._last_frame_notify = None
-    _quiesce_to_tier(overlay, clock, TIER_IDLE_STILL)
+    driver._last_frame_notify = None
+    _quiesce_to_tier(driver, clock, TIER_IDLE_STILL)
 
     sprite.set_velocity(QPointF(120, 0))  # 行为掷骰起步 → 同步回 T0
 
-    assert overlay._applied_tier == TIER_ACTIVE
-    assert overlay._timer.timerType() == Qt.TimerType.PreciseTimer
+    assert driver.applied_tier == TIER_ACTIVE
+    assert driver.timer.timerType() == Qt.TimerType.PreciseTimer
 
 
 def test_overlay_set_pos_wakes_immediately(monkeypatch):
     overlay, sprite = _make_overlay_with_sprite()
+    driver = overlay.tick_driver
     clock = FakeClock()
-    monkeypatch.setattr(overlay._governor, "_clock", clock)
+    monkeypatch.setattr(driver._governor, "_clock", clock)
     monkeypatch.setattr(overlay, "isVisible", lambda: True)
-    overlay._last_frame_notify = None
-    _quiesce_to_tier(overlay, clock, TIER_IDLE_STILL)
+    driver._last_frame_notify = None
+    _quiesce_to_tier(driver, clock, TIER_IDLE_STILL)
 
     sprite.set_pos(sprite.pos + QPointF(30, 0))  # 物理/拖拽位移 → 同步回 T0
 
-    assert overlay._applied_tier == TIER_ACTIVE
+    assert driver.applied_tier == TIER_ACTIVE
 
 
 def test_occluded_heartbeat_skips_simulation(monkeypatch):
     overlay, _sprite = _make_overlay_with_sprite()
+    driver = overlay.tick_driver
     clock = FakeClock()
-    monkeypatch.setattr(overlay._governor, "_clock", clock)
-    overlay._last_frame_notify = None
+    monkeypatch.setattr(driver._governor, "_clock", clock)
+    driver._last_frame_notify = None
     monkeypatch.setattr(overlay, "isVisible", lambda: False)
-    _quiesce_to_tier(overlay, clock, TIER_OCCLUDED)  # 遮挡经滞回期降档
+    _quiesce_to_tier(driver, clock, TIER_OCCLUDED)  # 遮挡经滞回期降档
 
     calls = []
     overlay.before_sprites_advance = lambda dt: calls.append(dt)

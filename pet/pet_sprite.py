@@ -693,3 +693,37 @@ class PetSprite(QObject):
         else:
             self.velocity = QPointF(rvx, rvy)
             self.interaction_state = INTERACTION_THROWN
+
+    # ---------------------------------------------------------------- 稳定身份（GLM Q6 / M-2）
+    @property
+    def collision_id(self) -> str:
+        """碰撞世界成员稳定身份：进程内唯一、生命周期内稳定、**永不复用**。
+
+        起因（REVIEW_VERDICT §4 GLM C4 / Q6）：碰撞世界此前用 ``id(sprite)``
+        当 runtime_id，对象销毁后 CPython 复用地址 → 新 sprite 拿到老 id，
+        世界侧 ``_prev_circles`` / 去抖表把新成员当成老成员，产生"幽灵扫掠"
+        （对早已不存在的圆链做扫掠碰撞）。``SpriteCollisionWorld._member_id``
+        优先取本字段，没有才回退 ``id()``。
+
+        惰性分配（首次读取时才生成，不进构造路径）：本 property 与文件尾的
+        身份源都是**纯加法**，不改既有行（并行改动区隔）。
+        """
+        cid = self.__dict__.get("_collision_id")
+        if cid is None:
+            cid = _next_collision_id()
+            self.__dict__["_collision_id"] = cid
+        return cid
+
+
+def _make_collision_id_source():
+    """碰撞身份序号源：进程内单调递增，永不重复（含对象销毁/地址复用后）。"""
+    counter = [0]
+
+    def _next_id() -> str:
+        counter[0] += 1
+        return f"pet-sprite-{counter[0]}"
+
+    return _next_id
+
+
+_next_collision_id = _make_collision_id_source()
