@@ -21,7 +21,7 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QElapsedTimer, QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QPainter, QRegion, QScreen
+from PySide6.QtGui import QCursor, QPainter, QRegion, QScreen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .sprite_menu import build_sprite_menu
@@ -60,6 +60,8 @@ class OverlayWindow(QWidget):
         self.mouse_through = False
         self._press_global: QPoint | None = None
         self._input_controller = None
+        # sprite 移除通知（V-9）：行为控制器状态表等外部簿记的注销挂点
+        self._sprite_removed_listeners: list = []
 
         self._elapsed = QElapsedTimer()
         self._tick_count = 0
@@ -70,10 +72,16 @@ class OverlayWindow(QWidget):
 
     @staticmethod
     def _tick_interval_ms(refresh_rate: float) -> int:
-        """tick 间隔：高刷屏（>90Hz）按刷新率取整（170Hz→6ms），普通屏 16ms。"""
-        if refresh_rate > 90.0:
-            return max(1, round(1000.0 / refresh_rate))
-        return 16
+        """tick 间隔：rr<75 或无读数 → 16ms；其余按刷新率取整（封顶 16ms，
+        170Hz→6ms，90Hz→11ms——旧边界把 90Hz 错打成 16ms，V-6）。"""
+        if not refresh_rate or refresh_rate < 75.0:
+            return 16
+        return max(1, min(16, round(1000.0 / refresh_rate)))
+
+    def _refresh_tick_interval(self) -> None:
+        """重读屏幕刷新率并刷新 tick 间隔（V-6：电池 DRR 会在 170/60Hz
+        间动态切换，构造时的一次性读数会变陈旧）。"""
+        self._timer.setInterval(self._tick_interval_ms(self._screen.refreshRate()))
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> None:
@@ -85,6 +93,8 @@ class OverlayWindow(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._refresh_tick_interval()  # V-6：显示时重读刷新率（电池 DRR）
+        self._feed_dpr()               # V-11：DPR 由 overlay 统一喂
         if sys.platform == "win32" and self._input_controller is None:
             # 逐像素穿透：未命中任何 sprite 的屏幕区域点击直达下层应用——
             # 全屏 overlay 不抢占桌面交互（硬指标"体验不回退"的底线）。
@@ -93,6 +103,7 @@ class OverlayWindow(QWidget):
             _set_windows_no_activate(int(self.winId()))
 
     def closeEvent(self, event) -> None:
+        self._timer.stop()  # V-12：关窗即停 tick，不再 170Hz 空转
         if self._input_controller is not None:
             self._input_controller.stop()
             self._input_controller = None
@@ -110,17 +121,48 @@ class OverlayWindow(QWidget):
             return
         self.sprites.append(sprite)
         sprite._dirty_cb = lambda old, new: self.update(QRegion(old) | QRegion(new))
+        # V-11：DPR 由 overlay 统一按所在屏喂（此前靠调用方记得，demo 从没
+        # 喂过）；取 QScreen 而非 widget 的 devicePixelRatioF——窗口未
+        # realize 前后者不可信（offscreen/壳层构建期恒 1.0）
+        set_dpr = getattr(sprite, "set_dpr", None)
+        if callable(set_dpr):
+            set_dpr(float(self._screen.devicePixelRatio()))
         if self.isVisible():
             self.update(QRegion(sprite.rect()))
 
-    def remove_sprite(self, sprite) -> None:
-        """移除并按其矩形局部刷新（露出下层内容）。"""
+    def _feed_dpr(self) -> None:
+        """把所在屏 DPR 喂给全部 sprite（showEvent/屏变化时调用）。"""
+        dpr = float(self._screen.devicePixelRatio())
+        for sprite in self.sprites:
+            set_dpr = getattr(sprite, "set_dpr", None)
+            if callable(set_dpr):
+                set_dpr(dpr)
+
+    def remove_sprite(self, sprite, *, release_clip: bool = True) -> None:
+        """移除并按其矩形局部刷新（露出下层内容）。
+
+        release_clip=True（默认，V-8）：同时释放 sprite 的 clip 所有权
+        （disconnect+stop+清缓存），移除即停解码；屏迁移等保留 clip 的
+        场景传 False。移除后通知 _sprite_removed_listeners（V-9：行为
+        控制器状态表等外部簿记据此注销）。
+        """
         if sprite not in self.sprites:
             return
         self.sprites.remove(sprite)
         self._position_listeners.pop(sprite, None)
         sprite._dirty_cb = None
+        if release_clip:
+            close = getattr(sprite, "close", None)
+            if callable(close):
+                close()
+        for cb in list(self._sprite_removed_listeners):
+            cb(sprite)
         self.update(QRegion(sprite.rect()))
+
+    def add_sprite_removed_listener(self, cb) -> None:
+        """注册 sprite 移除通知（V-9 外部簿记注销挂点）；重复注册 no-op。"""
+        if cb not in self._sprite_removed_listeners:
+            self._sprite_removed_listeners.append(cb)
 
     # ---------------------------------------------------------------- 位置监听（Phase 3b）
     def add_position_listener(self, sprite, cb) -> None:
@@ -162,6 +204,7 @@ class OverlayWindow(QWidget):
                 dt = self._timer.interval() / 1000.0
             self._elapsed.restart()
         self._tick_count += 1
+        self._check_stale_press()  # V-7：tick 路径同样兜底卡死的拖拽
         self.before_sprites_advance(dt)
         dirty = QRegion()
         moved = []
@@ -208,6 +251,7 @@ class OverlayWindow(QWidget):
     def _is_transparent_at(self, local: QPoint | QPointF) -> bool:
         """逐像素联合穿透判据（WindowsPerPixelInputController 协议方法）：
         光标处没有任何 sprite 的不透明像素 = 该点穿透到下层应用。"""
+        self._check_stale_press()  # V-7：穿透轮询是恒开的，顺带兜底卡死的拖拽
         return self.sprite_at(local) is None
 
     def contextMenuEvent(self, event) -> None:
@@ -223,9 +267,12 @@ class OverlayWindow(QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
+            # V-13：左键拖拽中被其它键打断——先合成 release 收尾，否则
+            # sprite 卡 drag 态（behavior 跳过、velocity 已清零）直到下次按下
+            if self._mouse_grab is not None:
+                self._finish_grab(event.position())
             # 只有左键进拖拽 grab——右键语义是弹菜单（contextMenuEvent），
             # 若进 grab，松手会被当成一次"原地放下"的拖拽（PetWindow 旧语义）
-            self._mouse_grab = None
             event.ignore()
             return
         target = self.sprite_at(event.position())
@@ -249,12 +296,28 @@ class OverlayWindow(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
+        grab = self._mouse_grab
+        self._finish_grab(event.position())
+        if grab is None:
+            event.ignore()
+            return
+        event.accept()
+
+    def _finish_grab(self, position) -> None:
+        """收尾当前拖拽 grab（release/打断/看门狗共用）。"""
         grab, self._mouse_grab = self._mouse_grab, None
         self._press_global = None
         if self._input_controller is not None:
             self._input_controller.set_drag_active(False)
-        if grab is None:
-            event.ignore()
+        if grab is not None:
+            grab.on_release(position)
+
+    def _check_stale_press(self) -> None:
+        """V-7 拖拽看门狗：release 事件丢失（alt-tab/弹窗抢 grab/屏拔除）
+        时 _press_global 卡死 → should_click_through 永假 → 全屏吞点击。
+        穿透轮询与 tick 路径兜底：左键已不在按下态则强制收尾。"""
+        if self._press_global is None:
             return
-        grab.on_release(event.position())
-        event.accept()
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            return
+        self._finish_grab(QPointF(self.mapFromGlobal(QCursor.pos())))

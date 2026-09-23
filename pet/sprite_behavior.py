@@ -35,6 +35,7 @@ tick 的位移（亚像素）。
 from __future__ import annotations
 
 import random
+from weakref import WeakKeyDictionary
 
 from PySide6.QtCore import QPointF, QRect
 
@@ -85,7 +86,10 @@ class BehaviorController:
         self.min_distance = min_distance
         self.max_distance = max_distance
         self._states: dict = {}
-        self._cats_cache: dict = {}
+        # V-9：按库对象弱引用缓存——旧实现以 id(lib) 为键，库销毁后地址
+        # 被新库复用会命中陈旧分类池（换角色/多宠生灭时拿到错素材名），
+        # 且条目只增不减；弱键字典在库销毁时自动回收
+        self._cats_cache: WeakKeyDictionary = WeakKeyDictionary()
 
     # ---------------------------------------------------------------- 对外 API
     def tick(self, sprites, dt: float) -> None:
@@ -306,8 +310,7 @@ class BehaviorController:
         入口，folder_map/folder_files/manifest 全透传）；测试假库直接暴露
         idles/turns/moves/clicks 四个池属性。
         """
-        key = id(lib)
-        cats = self._cats_cache.get(key)
+        cats = self._cats_cache.get(lib)
         if cats is None:
             names = getattr(lib, "names", None)
             if callable(names):
@@ -317,7 +320,7 @@ class BehaviorController:
                 cats = {k: list(raw[k]) for k in ("idles", "turns", "moves", "clicks")}
             else:
                 cats = {k: list(getattr(lib, k, None) or []) for k in ("idles", "turns", "moves", "clicks")}
-            self._cats_cache[key] = cats
+            self._cats_cache[lib] = cats
         return cats
 
     def _body_geometry(self, sprite) -> tuple[float, float, float, float]:

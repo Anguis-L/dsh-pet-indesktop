@@ -55,7 +55,7 @@ class PetSprite(QObject):
         self.library = library
         self.velocity = QPointF(0, 0)
         self.facing = facing
-        self.scale = float(scale)
+        self._scale = float(scale)  # scale 为 property（V-10）：直写内部字段
         # D2：渲染 DPR（物理像素 = CANVAS*scale*dpr；逻辑几何不随它变）。
         # 由 overlay 按所在屏 QScreen.devicePixelRatio() 写入。
         self._dpr = 1.0
@@ -97,6 +97,30 @@ class PetSprite(QObject):
         self.interaction_state = INTERACTION_NORMAL
 
     # ---------------------------------------------------------------- 几何
+    @property
+    def scale(self) -> float:
+        """渲染/逻辑缩放（菜单"大小"档位写入口）。"""
+        return self._scale
+
+    @scale.setter
+    def scale(self, value: float) -> None:
+        """V-10：缩放变化必须置脏 + 按新身体框补钳 + 上报新旧矩形。
+
+        裸属性时期菜单改大小：不置 _frame_dirty、不重钳、advance 返回
+        None——静态素材下永远不重绘，且尺寸变大后可能滞留界外。
+        """
+        value = float(value)
+        if value <= 0:
+            raise ValueError(f"scale 必须为正: {value!r}")
+        if value == self._scale:
+            return
+        old_rect = self.rect()
+        self._scale = value
+        self._frame_sig = None    # 签名含 scale，显式作废（防御）
+        self._frame_dirty = True
+        self.set_pos(self.pos)    # 尺寸变化后按新身体框补钳（内部判变）
+        self._notify_dirty(old_rect, self.rect())
+
     def _logical_size(self) -> tuple[int, int]:
         """逻辑大小（CANVAS*scale）：rect/命中/碰撞坐标系的尺寸，与 DPR 无关。"""
         return (
@@ -160,6 +184,8 @@ class PetSprite(QObject):
             return
         self._dpr = dpr
         self._frame_sig = None   # 命中图是物理像素，必须随 dpr 重建
+        self._hit_image = None   # 同步清命中图：重建窗口期内 alpha_at 按
+                                 # 新 dpr 索引旧（更小）图会越界误判穿透
         self._frame_dirty = True
 
     # ---------------------------------------------------------------- 钳制（D3）
@@ -250,6 +276,30 @@ class PetSprite(QObject):
 
     def set_velocity(self, velocity: QPointF) -> None:
         self.velocity = QPointF(velocity)
+
+    def close(self) -> None:
+        """释放 clip 所有权（V-8）：断开信号 + 停解码 + 清帧缓存。
+
+        overlay.remove_sprite（release_clip=True，默认）调用——sprite 移除
+        即停解码，不再靠库 shutdown() 兜底。屏迁移等需要保留 clip 的
+        场景走 remove_sprite(release_clip=False)。
+        """
+        clip = self._clip
+        if clip is not None:
+            try:
+                clip.frameChanged.disconnect(self._on_frame_changed)
+            except (TypeError, RuntimeError):
+                pass  # 未连接过/对象已毁：忽略
+            stop = getattr(clip, "stop", None)
+            if callable(stop):
+                stop()
+        self._clip = None
+        self._clip_name = None
+        self._frame_sig = None
+        self._pixmap = None
+        self._hit_image = None
+        self._dirty_cb = None
+        self._last_reported_rect = None
 
     # ---------------------------------------------------------------- clip 绑定
     def bind_clip(self, name: str) -> None:
@@ -353,7 +403,11 @@ class PetSprite(QObject):
         pm = QPixmap.fromImage(img)
         pm.setDevicePixelRatio(self._dpr)
         self._pixmap = pm
-        self._hit_image = img
+        # V-15：显式深拷贝——convertToFormat（同格式）与 scaled（同尺寸）
+        # 都可能返回隐式共享副本，不拷贝则 _hit_image 会别名 clip 的活帧
+        # 缓冲（scale=1.0&dpr=1 时实测同指针），后台解码线程写缓冲时
+        # 命中图被跨线程改。一帧一次 memcpy，成本可忽略
+        self._hit_image = img.copy()
         self._frame_sig = sig
         return True
 

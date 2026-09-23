@@ -132,7 +132,7 @@ class OverlayShell(QObject):
         scale = float(self._config.get("scale") or catalog.DEFAULT_SCALE)
         self.sprite = self._sprite_factory(self.lib, QPointF(0, 0), scale)
         self.sprite.home_screen = self._screen
-        self.sprite.set_dpr(float(self._screen.devicePixelRatio()))
+        # DPR 由 overlay.add_sprite 按所在屏统一喂（V-11 收口，不再双喂）
         self.sprite.set_bounds(QRect(self._bounds))
         self.overlay.add_sprite(self.sprite)
         # 位置持久化是 4.2a 的事：本刀恒按 go_default_corner 语义落右下角
@@ -326,7 +326,7 @@ class OverlayShell(QObject):
         new_bounds = self._local_bounds(new_screen)
         self.overlay = ShellOverlayWindow(new_screen, self._advance_controllers)
         self.overlay.behavior = self.behavior
-        old_overlay.remove_sprite(self.sprite)
+        old_overlay.remove_sprite(self.sprite, release_clip=False)  # 迁移保留 clip
         self.overlay.add_sprite(self.sprite)
         self.sprite.home_screen = new_screen
         self.sprite.set_dpr(float(new_screen.devicePixelRatio()))

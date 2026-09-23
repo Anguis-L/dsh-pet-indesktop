@@ -157,10 +157,11 @@ def _make_overlay():
 
 # ---------------------------------------------------------------- OverlayWindow
 def test_tick_interval_from_refresh_rate():
-    # 高刷屏按刷新率取整；<=90Hz 固定 16ms
+    # >=75Hz 按刷新率取整（封顶 16ms）；<75Hz 或无读数固定 16ms（V-6：
+    # 旧边界把 90Hz 错打成 16ms，90Hz 屏动画每 3 帧才交付一次）
     assert OverlayWindow._tick_interval_ms(170.0) == 6
     assert OverlayWindow._tick_interval_ms(144.0) == 7
-    assert OverlayWindow._tick_interval_ms(90.0) == 16
+    assert OverlayWindow._tick_interval_ms(90.0) == 11
     assert OverlayWindow._tick_interval_ms(60.0) == 16
 
 
