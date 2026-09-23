@@ -270,3 +270,26 @@ def test_member_flags_match_coordinator_semantics():
     static = world._static_member_state("isle", world._static_members["isle"])
     assert static.flags & collision.FLAG_STATIC
     assert static.is_infinite_mass
+
+
+# ---------------------------------------------------------------- V-2：body_box 口径
+class BodyBoxSprite(FakeSprite):
+    """带稳定身体框的 sprite：身体 = 画布内缩 (10,20,60,50)。"""
+
+    def body_rect(self):
+        return FakeRect(self.pos.x() + 10, self.pos.y() + 20, 60.0, 50.0)
+
+
+def test_member_from_sprite_uses_body_rect():
+    """V-2：碰撞体口径 = 身体框（旧口径用整 canvas，含透明边会隔空弹开）。"""
+    world = SpriteCollisionWorld()
+    sprite = BodyBoxSprite(100, 100)
+    member = world._member_from_sprite(sprite)
+    assert member.x == 100 + 10 + 30.0     # 身体中心
+    assert member.y == 100 + 20 + 25.0
+    assert member.w == 60.0
+    assert member.h == 50.0
+    # 圆链也必须落在身体框上（首圆圆心 = 身体框左内切圆）
+    first = member.circles[0]
+    assert first[0] == 110.0 + 25.0        # 半径 = min(60,50)/2 = 25
+    assert first[1] == 120.0 + 25.0

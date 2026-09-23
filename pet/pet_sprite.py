@@ -125,6 +125,17 @@ class PetSprite(QObject):
         r = self.rect()
         return QPointF(r.x() + r.width() / 2, r.y() + r.height() / 2)
 
+    def body_rect(self) -> QRect:
+        """稳定身体框（overlay 局部逻辑坐标）= rect 原点 + body_box×scale。
+
+        贴边钳制/碰撞体/气泡锚点的统一口径（V-2）：未声明 body_box 的
+        角色包回退全画布（= rect()，语义等同"画布即身体"）。
+        """
+        body = self._body_local_rect()
+        r = self.rect()
+        return QRect(r.x() + body.x(), r.y() + body.y(),
+                     body.width(), body.height())
+
     def radius(self) -> float:
         """碰撞圆半径（与 Phase 0 探针同一经验系数：0.45 * min(w, h)）。"""
         r = self.rect()

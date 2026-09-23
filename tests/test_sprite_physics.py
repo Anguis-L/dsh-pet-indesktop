@@ -309,3 +309,18 @@ def test_press_sets_drag_state_and_stops_velocity():
     assert sprite.dragging
     assert sprite.interaction_state == INTERACTION_DRAG
     assert sprite.velocity == QPointF(0, 0)
+
+
+# ---------------------------------------------------------------- V-2：body_box 口径
+def test_sprite_bounds_inset_by_body_box(monkeypatch):
+    """V-2：抛掷反弹边界按身体框内缩（旧口径按整 canvas，反弹发生在透明边上）。
+
+    body_box=(100,60,400,330) × scale 0.5 → 局部身体框 QRect(50,30,150,135)；
+    bounds (0,0,800,600) → 左上角活动范围 (-50,-30,600,435)。
+    """
+    from pet import catalog
+
+    monkeypatch.setattr(catalog, "character_body_box", lambda _cid: (100, 60, 400, 330))
+    sprite = _make_sprite()
+    c = ThrowPhysicsController(BOUNDS)
+    assert c._sprite_bounds(sprite) == (-50.0, -30.0, 600.0, 435.0)

@@ -28,10 +28,10 @@ class ThrowPhysicsController:
     """"thrown" sprite 的抛掷物理：重力 + 边界反弹 + 地面摩擦 + 静止收尾。
 
     bounds 为 overlay 局部坐标下的可活动区域（QRect/QRectF，由调用方
-    传入；本模块不直接查 QScreen，保持 offscreen 可测）。sprite 外接
-    矩形贴到 bounds 四边即反弹——语义同旧架构 _throw_bounds（身体框
-    贴边，不是中心点贴边），因此每个 sprite 的有效边界按其矩形尺寸
-    内缩。
+    传入；本模块不直接查 QScreen，保持 offscreen 可测）。sprite 身体框
+    贴到 bounds 四边即反弹——语义同旧架构 _throw_bounds（身体框贴边，
+    画布透明边允许越界），每个 sprite 的有效边界按其身体框偏移与
+    尺寸内缩（V-2）。
     """
 
     def __init__(
@@ -67,13 +67,20 @@ class ThrowPhysicsController:
             self._advance_thrown(sprite, float(dt))
 
     def _sprite_bounds(self, sprite) -> tuple[float, float, float, float]:
-        """sprite 左上角的可活动范围：外接矩形贴 bounds 四边（内缩尺寸）。"""
+        """sprite 左上角的可活动范围：身体框贴 bounds 四边（V-2）。
+
+        语义对齐旧架构 window_placement.throw_bounds（身体框贴工作区，
+        画布透明边允许越界）——此前按整 canvas 矩形内缩，反弹发生在
+        透明画布边上，与注释声称的口径不符。
+        """
         rect = sprite.rect()
-        left = self._bounds.left()
-        top = self._bounds.top()
+        body = sprite.body_rect() if hasattr(sprite, "body_rect") else rect
+        off_x, off_y = body.x() - rect.x(), body.y() - rect.y()
+        left = self._bounds.left() - off_x
+        top = self._bounds.top() - off_y
         # sprite 比区域还大时 right/bottom 会小于 left/top：钳回，防死循环
-        right = max(left, self._bounds.right() - rect.width())
-        bottom = max(top, self._bounds.bottom() - rect.height())
+        right = max(left, self._bounds.right() - off_x - body.width())
+        bottom = max(top, self._bounds.bottom() - off_y - body.height())
         return left, top, right, bottom
 
     def _advance_thrown(self, sprite, dt: float) -> None:

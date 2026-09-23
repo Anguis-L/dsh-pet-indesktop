@@ -279,13 +279,22 @@ class BehaviorController:
 
     # ---------------------------------------------------------------- 边界
     def _clamp_into_bounds(self, sprite) -> None:
-        """sprite 矩形整体不得出活动边界（正常路径目标点本就在界内，这里是
-        拖拽/抛掷切回 normal 后落点在界外的兜底）。"""
+        """拖拽/抛掷切回 normal 后落点在界外的兜底。
+
+        口径与 set_pos 一致（V-2）：身体框完整落界内、画布透明边允许
+        越界——不再用整 canvas 矩形钳制（那会把按身体框贴边的 sprite
+        每 tick 拉回一个透明边距，造成可见瞬移）。sprite 已挂 bounds 时
+        set_pos 即唯一权威，这里的计算结果落在其允许域内，不会打架。
+        """
         r = sprite.rect()
-        max_x = self.bounds.x() + self.bounds.width() - r.width()
-        max_y = self.bounds.y() + self.bounds.height() - r.height()
-        x = min(max(sprite.pos.x(), float(self.bounds.x())), float(max(self.bounds.x(), max_x)))
-        y = min(max(sprite.pos.y(), float(self.bounds.y())), float(max(self.bounds.y(), max_y)))
+        body = sprite.body_rect() if hasattr(sprite, "body_rect") else r
+        off_x, off_y = body.x() - r.x(), body.y() - r.y()
+        lo_x = float(self.bounds.x()) - off_x
+        lo_y = float(self.bounds.y()) - off_y
+        max_x = lo_x + self.bounds.width() - body.width()
+        max_y = lo_y + self.bounds.height() - body.height()
+        x = min(max(sprite.pos.x(), lo_x), float(max(lo_x, max_x)))
+        y = min(max(sprite.pos.y(), lo_y), float(max(lo_y, max_y)))
         if x != sprite.pos.x() or y != sprite.pos.y():
             sprite.set_pos(QPointF(x, y))
 

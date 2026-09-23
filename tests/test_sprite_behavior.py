@@ -346,3 +346,40 @@ def test_categories_via_build_categories_when_names_available():
     assert cats["turns"] == ["东张西望"]
     assert cats["moves"] == ["螃蟹走路"]
     assert cats["clicks"] == ["点击回应 - 开心跃动"]
+
+
+# ---------------------------------------------------------------- V-2：body_box 口径
+def test_clamp_into_bounds_respects_body_box(monkeypatch):
+    """V-2：兜底钳制口径 = 身体框贴边（画布透明边允许越界）。
+
+    旧口径按整 canvas 矩形钳制，会把按身体框贴边的 sprite 每 tick 拉回
+    一个透明边距（可见瞬移）。body_box=(100,60,400,330) × scale 0.5
+    → 局部身体框 QRect(50,30,150,135)，画布 320×180。
+    """
+    from pet import catalog
+
+    monkeypatch.setattr(catalog, "character_body_box", lambda _cid: (100, 60, 400, 330))
+    lib = _make_library()
+    sprite = _make_sprite(lib, pos=(600, 435))   # 身体右缘 600+50+150=800 贴界、下缘 435+30+135=600 贴界
+    bounds = QRect(0, 0, 800, 600)
+    c = BehaviorController(bounds, rng=ScriptedRng())
+
+    c._clamp_into_bounds(sprite)
+
+    assert sprite.pos == QPointF(600, 435)       # 合法贴边位不被拉回
+    assert sprite.rect().right() > bounds.right()  # 画布透明边允许越界
+
+
+def test_clamp_into_bounds_body_box_pulls_back_only_overflow(monkeypatch):
+    """V-2：身体框真出界时按身体框口径钳回（不多拉）。"""
+    from pet import catalog
+
+    monkeypatch.setattr(catalog, "character_body_box", lambda _cid: (100, 60, 400, 330))
+    lib = _make_library()
+    sprite = _make_sprite(lib, pos=(700, 500))   # 身体右缘 850>800、下缘 665>600：均出界
+    bounds = QRect(0, 0, 800, 600)
+    c = BehaviorController(bounds, rng=ScriptedRng())
+
+    c._clamp_into_bounds(sprite)
+
+    assert sprite.pos == QPointF(600, 435)       # 钳到身体框贴边即停

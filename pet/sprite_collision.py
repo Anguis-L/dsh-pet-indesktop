@@ -194,9 +194,14 @@ class SpriteCollisionWorld:
             getattr(sprite, "interaction_state", INTERACTION_NORMAL) == INTERACTION_DRAG
 
     def _member_from_sprite(self, sprite) -> collision.MemberState:
+        # V-2：碰撞体口径 = 稳定身体框（body_box×scale），与旧架构
+        # 7ee8a34「鱼-鱼碰撞体改用身体框」一致；此前用整 canvas 矩形，
+        # 含透明边，两鱼隔一个画布边距就弹开。无 body_rect 的鸭式
+        # sprite（测试假对象/未声明 body_box 角色）回退整矩形。
         rect = sprite.rect()
-        left, top = float(rect.x()), float(rect.y())
-        w, h = float(rect.width()), float(rect.height())
+        body = sprite.body_rect() if hasattr(sprite, "body_rect") else rect
+        left, top = float(body.x()), float(body.y())
+        w, h = float(body.width()), float(body.height())
         circles = collision.circles_from_rect(left, top, w, h)
         dragging = self._is_dragging(sprite)
         flags = collision.FLAG_VISIBLE | collision.FLAG_COLLISION_ENABLED
