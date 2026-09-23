@@ -84,7 +84,7 @@ class SpriteFeedingController:
             total_bytes += size
         stats = self._record(files, folders, files + folders, total_bytes)
         self._play_eating_animation()
-        self._show_feedback(files, folders, total_bytes)
+        self._show_feedback(files, folders, total_bytes, stats)
         return {"files": files, "folders": folders,
                 "bytes": total_bytes, "stats": stats}
 
@@ -113,10 +113,11 @@ class SpriteFeedingController:
         if name:
             self._behavior.play_once(self._sprite, name)
 
-    def _show_feedback(self, files: int, folders: int, total_bytes: int) -> None:
+    def _show_feedback(self, files: int, folders: int, total_bytes: int,
+                       stats: dict) -> None:
         cb = self._bubble_cb
         if callable(cb):
             try:
-                cb(files, folders, total_bytes)
+                cb(files, folders, total_bytes, stats)
             except Exception:
                 logger.debug("overlay: 投喂气泡反馈失败", exc_info=True)

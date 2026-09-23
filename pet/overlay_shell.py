@@ -202,6 +202,10 @@ class OverlayShell(QObject):
         self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)
         self._last_marker_write = 0.0
         self._apply_window_capabilities()
+        # 4.1c 气泡跟随（真实 PetSpeechBubble；静默降级）
+        from .sprite_bubble import SpriteBubbleFollower
+        self._bubble_follower = SpriteBubbleFollower(self.overlay, self.sprite)
+        self._feeding._bubble_cb = self._say_feeding_bubble
         self._build_tray()
 
     def _create_main_library(self):
@@ -259,6 +263,8 @@ class OverlayShell(QObject):
         self._started = False
         self._watcher.stop()
         self._delete_runtime_marker()
+        if getattr(self, "_bubble_follower", None) is not None:
+            self._bubble_follower.close()
         self.overlay.stop()
         self.overlay.close()
         if self.tray is not None:
@@ -430,6 +436,13 @@ class OverlayShell(QObject):
             self.overlay.show()
         else:
             self.overlay.hide()
+            if getattr(self, "_bubble_follower", None) is not None:
+                bub = getattr(self._bubble_follower, "bubble", None)
+                if bub is not None:
+                    try:
+                        bub.hide()
+                    except Exception:
+                        pass
         island = getattr(getattr(self._instance, "shell", None), "island", None)
         if island is not None:
             try:
@@ -439,6 +452,26 @@ class OverlayShell(QObject):
 
     def _toggle_pet_visible(self) -> None:
         self.set_pet_visible(not self.overlay.isVisible())
+
+    def _say_feeding_bubble(self, files: int, folders: int,
+                            total_bytes: int, stats: dict) -> None:
+        """投喂气泡（file_eater._show_feedback 同文案格式）。"""
+        from .file_eater import format_bytes
+        if files and folders:
+            batch = f"{files} 个文件、{folders} 个文件夹"
+        elif files:
+            batch = f"{files} 个文件"
+        elif folders:
+            batch = f"{folders} 个文件夹"
+        else:
+            batch = "空气"
+        text = (
+            f"啊呜～吃掉 {batch}（{format_bytes(total_bytes)}），"
+            f"累计吃掉 {stats.get('file_count', 0)} 个文件、"
+            f"{stats.get('folder_count', 0)} 个文件夹，"
+            f"共 {format_bytes(stats.get('total_bytes', 0))}！"
+        )
+        self._bubble_follower.say(text, subtitle="放心，只是做个样子，文件没有删除或移动哦")
 
     def switch_character(self, character_id: str) -> None:
         """切换角色（4.1c）：换 per-pet 库 + 行为状态重置 + 配置持久化。
@@ -561,6 +594,10 @@ class OverlayShell(QObject):
         self._connect_screen(new_screen)
         was_started = self._started
         old_overlay.stop()
+        if getattr(self, "_bubble_follower", None) is not None:
+            self._bubble_follower.close()
+            from .sprite_bubble import SpriteBubbleFollower
+            self._bubble_follower = SpriteBubbleFollower(self.overlay, self.sprite)
         if was_started:
             self.overlay.show()
             self.overlay.start()

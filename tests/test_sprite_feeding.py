@@ -76,7 +76,7 @@ def test_drop_records_stats_and_plays_eat_anim(tmp_path):
         f1 = tmp_path / "snack.txt"
         f1.write_text("yummy", encoding="utf-8")
         bubbles = []
-        ctrl._bubble_cb = lambda files, folders, b: bubbles.append((files, folders, b))
+        ctrl._bubble_cb = lambda files, folders, b, stats: bubbles.append((files, folders, b))
         event = _drop_event(QPointF(shell.sprite.rect().center()), [str(f1)])
         result = ctrl.handle_drop(event)
         assert event.isAccepted()
@@ -103,5 +103,25 @@ def test_drop_ignored_away_from_sprite(tmp_path):
         assert ctrl.handle_drop(event) is None
         assert not event.isAccepted()
         assert not (tmp_path / "file_eaten_stats.json").exists()
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_feeding_bubble_text_format(tmp_path):
+    """投喂气泡文案（file_eater._show_feedback 同格式）经 shell 回调落到 follower。"""
+    shell, _lib, _ctrl = _make(tmp_path)
+    try:
+        said = []
+        shell._bubble_follower.say = lambda text, **kw: said.append((text, kw)) or True
+        f1 = tmp_path / "snack.txt"
+        f1.write_text("yummy", encoding="utf-8")
+        ctrl = shell._feeding
+        event = _drop_event(QPointF(shell.sprite.rect().center()), [str(f1)])
+        ctrl.handle_drop(event)
+        assert len(said) == 1
+        text, kw = said[0]
+        assert "啊呜～吃掉 1 个文件" in text
+        assert "累计吃掉 1 个文件" in text
+        assert kw["subtitle"] == "放心，只是做个样子，文件没有删除或移动哦"
     finally:
         shell._delete_runtime_marker()
