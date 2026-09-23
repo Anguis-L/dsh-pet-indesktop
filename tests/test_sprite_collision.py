@@ -293,3 +293,45 @@ def test_member_from_sprite_uses_body_rect():
     first = member.circles[0]
     assert first[0] == 110.0 + 25.0        # 半径 = min(60,50)/2 = 25
     assert first[1] == 120.0 + 25.0
+
+
+# ---------------------------------------------------------------- P1/③-1：静止豁免
+def test_static_world_skips_solve(monkeypatch):
+    """静止豁免：全员静止且无未结清交互时整 tick 跳过（成本→0）。"""
+    calls = []
+    real_solve = collision.solve_multi_body_collision
+    monkeypatch.setattr(collision, "solve_multi_body_collision",
+                        lambda *a, **kw: (calls.append(1), real_solve(*a, **kw))[1])
+    world = SpriteCollisionWorld()
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(500, 500, collision_id="b")
+
+    world.tick([a, b], 0.016)   # 首 tick 必求解（建立快照）
+    assert len(calls) == 1
+    world.tick([a, b], 0.016)   # 静止：跳过
+    world.tick([a, b], 0.016)
+    assert len(calls) == 1
+
+
+def test_world_wakes_on_motion_and_static_change(monkeypatch):
+    """签名变化（位移）或静态成员变更 → 立即恢复求解。"""
+    calls = []
+    real_solve = collision.solve_multi_body_collision
+    monkeypatch.setattr(collision, "solve_multi_body_collision",
+                        lambda *a, **kw: (calls.append(1), real_solve(*a, **kw))[1])
+    world = SpriteCollisionWorld()
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(500, 500, collision_id="b")
+    world.tick([a, b], 0.016)
+    world.tick([a, b], 0.016)
+    assert len(calls) == 1
+
+    b.set_pos(FakePoint(600, 500))          # 位移 → 唤醒
+    world.tick([a, b], 0.016)
+    assert len(calls) == 2
+
+    world.tick([a, b], 0.016)               # 再次静止 → 跳过
+    assert len(calls) == 2
+    world.add_static_member("island", 100, 100, 200, 80)  # 静态变更 → 唤醒
+    world.tick([a, b], 0.016)
+    assert len(calls) == 3

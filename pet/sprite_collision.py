@@ -110,6 +110,10 @@ class SpriteCollisionWorld:
         # 静态成员（灵动岛预留）：member_id -> (left, top, width, height)
         self._static_members: Dict[str, Tuple[float, float, float, float]] = {}
         self._listeners: List[Callable[[CollisionEvent], None]] = []
+        # 静止豁免（P1/③-1）：上 tick 的运动签名 + 静态成员脏标记。
+        # 签名一致且无未结清交互时，求解结果可证不变，整 tick 跳过
+        self._last_motion_sig: tuple | None = None
+        self._static_dirty = False
 
     # ---------------------------------------------------------------- 静态成员（灵动岛预留 API）
     def add_static_member(self, member_id: str, left: float, top: float,
@@ -121,11 +125,13 @@ class SpriteCollisionWorld:
         """
         self._static_members[str(member_id)] = (
             float(left), float(top), float(width), float(height))
+        self._static_dirty = True
 
     def remove_static_member(self, member_id: str) -> None:
         """注销静态成员；未注册过是 no-op。"""
         self._static_members.pop(str(member_id), None)
         self._prev_circles.pop(str(member_id), None)
+        self._static_dirty = True
 
     # ---------------------------------------------------------------- 事件回调
     def add_collision_listener(self, listener: Callable[[CollisionEvent], None]) -> None:
@@ -147,6 +153,16 @@ class SpriteCollisionWorld:
         （扫掠用帧间位置快照而非速度外推），保留在签名里对齐 tick 协议。
         """
         del dt  # 见 docstring：结算不依赖 dt
+        sig = self._motion_signature(sprites)
+        if (sig == self._last_motion_sig
+                and not self._static_dirty
+                and not self._overlap_history
+                and not self._position_only_ticks):
+            # 静止豁免（P1/③-1）：无任何成员运动（位置/速度/交互态/缩放/
+            # 成员集合全未变）、无静态成员变更、无未结清的重叠/分离去抖——
+            # 求解结果可证与上 tick 相同，整 tick 跳过。静止期间岛（静态
+            # 成员）变更经 _static_dirty 唤醒；外部 set_pos 经签名唤醒
+            return []
         self._tick += 1
         members: List[collision.MemberState] = []
         sprite_by_id: Dict[str, object] = {}
@@ -178,9 +194,37 @@ class SpriteCollisionWorld:
             m.runtime_id: m.circles for m in members if m.circles is not None
         }
         self._prune_position_only_ticks()
+        self._last_motion_sig = sig
+        self._static_dirty = False
         return results
 
     # ---------------------------------------------------------------- 内部：快照构造
+    @staticmethod
+    def _field(obj, name: str) -> float:
+        """读数值字段（QPointF/FakePoint 的 x()/y() 方法或裸属性）。"""
+        v = getattr(obj, name, None)
+        if callable(v):
+            return float(v())
+        return float(v) if v is not None else 0.0
+
+    @classmethod
+    def _motion_signature(cls, sprites: Sequence) -> tuple:
+        """成员运动签名（静止豁免判据）：成员集合 + 位置 + 速度 + 交互态 +
+        缩放——结算读取的全部动态输入；任一变化即重新求解。"""
+        items = []
+        for sprite in sprites:
+            pos = getattr(sprite, "pos", None)
+            vel = getattr(sprite, "velocity", None)
+            items.append((
+                cls._member_id(sprite),
+                cls._field(pos, "x"), cls._field(pos, "y"),
+                cls._field(vel, "x"), cls._field(vel, "y"),
+                getattr(sprite, "interaction_state", None),
+                cls._is_dragging(sprite),
+                float(getattr(sprite, "scale", 0.0) or 0.0),
+            ))
+        return tuple(items)
+
     @staticmethod
     def _member_id(sprite) -> str:
         """sprite 的碰撞世界成员 id：优先用 sprite.collision_id（若暴露），
