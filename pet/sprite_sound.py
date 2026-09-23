@@ -62,6 +62,25 @@ class SpriteSoundPlayer:
         if now - self._last_play < _THROTTLE_S:
             return
         self._last_play = now
+        self._submit(path, volume)
+
+    def _submit(self, path: Path, volume: float) -> None:
+        """提交播放：GUI 场景推迟到事件循环下一轮——play_sound 是同步阻塞
+        （winmm 首播 ~157ms / 其后 ~62ms，4.3 岛桥刀实测），在碰撞 listener
+        里直调会把该 tick 拖到 ~60ms（碰碰车场景每撞必卡）；推迟后位置交付
+        当帧完成、音效下一轮回放（+<16ms 无感）。无 QApplication（纯脚本/
+        测试直调）退化为同步直放。"""
+        try:
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QApplication
+            if QApplication.instance() is not None:
+                QTimer.singleShot(0, lambda: self._safe_play(path, volume))
+                return
+        except Exception:
+            pass
+        self._safe_play(path, volume)
+
+    def _safe_play(self, path: Path, volume: float) -> None:
         try:
             click_sound.play_sound(path, volume)
         except Exception:

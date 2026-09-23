@@ -30,6 +30,12 @@ class _Cfg:
         return self._v.get(key, default)
 
 
+def _pump():
+    # 播放已改事件循环下一轮提交（tick 路径零阻塞）：抽干 0ms 定时器
+    QApplication.processEvents()
+    QApplication.processEvents()
+
+
 def _player(monkeypatch, values=None, hit_min_dv=100.0, clock=None):
     plays = []
     monkeypatch.setattr(click_sound, "play_sound",
@@ -45,17 +51,21 @@ def _player(monkeypatch, values=None, hit_min_dv=100.0, clock=None):
 def test_click_volume_from_config(monkeypatch):
     player, plays = _player(monkeypatch, {"click_sound_volume": 0.3})
     player.on_click()
+    _pump()
     assert plays == [0.3]
 
 
 def test_collision_gate_and_tiers(monkeypatch):
     player, plays = _player(monkeypatch, hit_min_dv=100.0)
     player.on_collision(SimpleNamespace(j=50.0))    # 不到闸门不发声
+    _pump()
     assert plays == []
     player.on_collision(SimpleNamespace(j=150.0))   # 过闸门轻档
+    _pump()
     assert plays == [0.45]
     player._last_play = 0.0
     player.on_collision(SimpleNamespace(j=250.0))   # ≥2× 重档
+    _pump()
     assert plays == [0.45, 0.9]
 
 
@@ -64,9 +74,11 @@ def test_throttle(monkeypatch):
     player, plays = _player(monkeypatch, clock=lambda: now[0])
     player.on_click()
     player.on_click()                               # 80ms 内第二次被节流
+    _pump()
     assert len(plays) == 1
     now[0] += 0.1
     player.on_click()
+    _pump()
     assert len(plays) == 2
 
 
@@ -74,6 +86,7 @@ def test_disabled_silences(monkeypatch):
     player, plays = _player(monkeypatch, {"click_sound_enabled": False})
     player.on_click()
     player.on_collision(SimpleNamespace(j=999.0))
+    _pump()
     assert plays == []
 
 
@@ -87,6 +100,7 @@ def test_resolve_failure_degrades(monkeypatch):
     player = SpriteSoundPlayer(_Cfg(), SimpleNamespace(hit_min_dv=0.0))
     player.on_click()                               # 不抛异常
     player.on_collision(SimpleNamespace(j=1.0))
+    _pump()
     assert plays == []
 
 
