@@ -589,22 +589,17 @@ def _clear_dialog(config):
 
 def test_clear_spawned_pets_writes_overlay_command(tmp_path, monkeypatch):
     """overlay 拓扑：写指令文件（主进程消费），不再走 taskkill 回退。"""
-    import pet.child_pet_cleanup as cleanup_mod
     from pet import overlay_settings_command as cmd
 
     monkeypatch.setenv(cmd.ENV_TOPOLOGY, cmd.TOPOLOGY_OVERLAY)
     config = Config(base=tmp_path)
     dialog = _clear_dialog(config)
-    killed = []
-    monkeypatch.setattr(cleanup_mod, "clear_spawned_pets",
-                        lambda d: killed.append(d) or {})
     try:
         dialog._on_clear_spawned_pets()
         command = cmd.read_command(config.dir)
         assert command is not None, "overlay 拓扑必须写下指令文件"
         assert command["command"] == cmd.CMD_EXIT_SPAWNED_PETS
         assert command["target"] is None                # 主身份 = 全部子肥鱼
-        assert killed == [], "overlay 拓扑不得回退 child_pet_cleanup"
     finally:
         dialog.deleteLater()
         cmd.command_path(config.dir).unlink(missing_ok=True)
@@ -625,49 +620,43 @@ def test_clear_spawned_pets_child_config_targets_its_slot(tmp_path, monkeypatch)
         cmd.command_path(config.dir).unlink(missing_ok=True)
 
 
-def test_clear_spawned_pets_legacy_keeps_child_cleanup(tmp_path, monkeypatch):
-    """legacy 拓扑行为不变：仍然走 child_pet_cleanup，且不写指令文件。"""
-    import pet.child_pet_cleanup as cleanup_mod
+def test_clear_spawned_pets_legacy_also_uses_command_channel(tmp_path, monkeypatch):
+    """4.4a：legacy 拓扑同样走 D12 指令通道（不再 taskkill 子进程）。"""
     from pet import overlay_settings_command as cmd
 
     monkeypatch.delenv(cmd.ENV_TOPOLOGY, raising=False)
     config = Config(base=tmp_path)
     dialog = _clear_dialog(config)
-    killed = []
-    monkeypatch.setattr(cleanup_mod, "clear_spawned_pets",
-                        lambda d: killed.append(d) or {"killed_pids": [], "failed_pids": []})
     try:
         dialog._on_clear_spawned_pets()
-        assert killed == [config.dir]
-        assert not cmd.command_path(config.dir).exists()
+        command = cmd.read_command(config.dir)
+        assert command is not None, "legacy 拓扑也必须写下指令文件"
+        assert command["command"] == cmd.CMD_EXIT_SPAWNED_PETS
+        assert command["target"] is None
     finally:
         dialog.deleteLater()
+        cmd.command_path(config.dir).unlink(missing_ok=True)
 
 
-def test_clear_spawned_pets_legacy_child_config_is_skipped(tmp_path, monkeypatch):
-    """legacy 子肥鱼设置页：双保险早退（不杀主鱼、不写指令）。"""
-    import pet.child_pet_cleanup as cleanup_mod
+def test_clear_spawned_pets_legacy_child_config_targets_its_slot(tmp_path, monkeypatch):
+    """4.4a：legacy 子肥鱼设置页写 target=slot-N（只退那一只，不再静默早退）。"""
     from pet import overlay_settings_command as cmd
 
     monkeypatch.delenv(cmd.ENV_TOPOLOGY, raising=False)
     config = Config(base=tmp_path, instance_id="slot-1")
     dialog = _clear_dialog(config)
-    killed = []
-    monkeypatch.setattr(cleanup_mod, "clear_spawned_pets",
-                        lambda d: killed.append(d) or {})
     try:
         dialog._on_clear_spawned_pets()
-        assert killed == []
-        assert not cmd.command_path(config.dir).exists()
+        assert cmd.read_command(config.dir)["target"] == 1
     finally:
         dialog.deleteLater()
+        cmd.command_path(config.dir).unlink(missing_ok=True)
 
 
 def test_clear_spawned_pets_parent_callback_still_wins(tmp_path, monkeypatch):
-    """进程内设置页（有 PetWindow 回调）优先走回调，两条通道都不碰。"""
+    """进程内设置页（有 PetWindow 回调）优先走回调，指令通道不碰。"""
     from types import SimpleNamespace
 
-    import pet.child_pet_cleanup as cleanup_mod
     from pet import overlay_settings_command as cmd
 
     monkeypatch.setenv(cmd.ENV_TOPOLOGY, cmd.TOPOLOGY_OVERLAY)
@@ -676,13 +665,9 @@ def test_clear_spawned_pets_parent_callback_still_wins(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(dialog, "parentWidget",
                         lambda: SimpleNamespace(on_clear_spawned_pets=lambda: calls.append(1)))
-    killed = []
-    monkeypatch.setattr(cleanup_mod, "clear_spawned_pets",
-                        lambda d: killed.append(d) or {})
     try:
         dialog._on_clear_spawned_pets()
         assert calls == [1]
-        assert killed == []
         assert not cmd.command_path(config.dir).exists()
     finally:
         dialog.deleteLater()
@@ -692,19 +677,14 @@ def test_clear_spawned_pets_write_failure_is_not_fatal(tmp_path, monkeypatch, ca
     """指令写失败（只读盘/占位文件）：留日志、不抛、不误回退杀进程。"""
     import logging
 
-    import pet.child_pet_cleanup as cleanup_mod
     from pet import overlay_settings_command as cmd
 
     monkeypatch.setenv(cmd.ENV_TOPOLOGY, cmd.TOPOLOGY_OVERLAY)
     config = Config(base=tmp_path)
     dialog = _clear_dialog(config)
-    killed = []
-    monkeypatch.setattr(cleanup_mod, "clear_spawned_pets",
-                        lambda d: killed.append(d) or {})
     monkeypatch.setattr(cmd, "write_command", lambda *a, **k: False)
     try:
         dialog._on_clear_spawned_pets()          # 不抛
-        assert killed == []
     finally:
         dialog.deleteLater()
 

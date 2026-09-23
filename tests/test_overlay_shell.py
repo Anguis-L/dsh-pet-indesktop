@@ -363,7 +363,6 @@ def test_about_to_quit_pauses_warm_and_stops_tick():
 # ---------------------------------------------------------------- app.py 拓扑分支
 def _stub_shell_start(shell, monkeypatch):
     """把 start() 里分支点之外的进程级副作用全部换成 no-op 记录器。"""
-    monkeypatch.setattr(shell.instance.collision_ipc, "start", lambda: None)
     monkeypatch.setattr(shell._dsh_state_tracker, "start", lambda: None)
     monkeypatch.setattr(AppShell, "_sync_dynamic_island", lambda self: None)
 

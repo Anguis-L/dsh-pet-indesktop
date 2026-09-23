@@ -231,6 +231,53 @@ def test_decode_fanout_does_not_depend_on_window_or_player():
         assert banned not in src, f"decode_fanout 反向依赖 {banned}，破坏单向依赖"
 
 
+# 多进程多宠退役层（PHASE4_DESIGN.md §3 T6 清单，4.4a 停用 / 4.4b 删除）。
+# 4.4a 机器化守卫：**overlay 新路径**（单合成窗渲染面）必须零 import 这些
+# 模块——新架构的多宠碰撞/身份/生命周期全部在进程内 sprite 世界自足，
+# 一旦回潮就是"新路径又骑回多进程 IPC/文件锁"的架构倒退。
+RETIRED_MULTIPROCESS_MODULES = (
+    "collision_ipc",
+    "collision_codec",
+    "collision_client",
+    "instance_launcher",
+    "child_pet_cleanup",
+)
+
+
+def _overlay_new_path_modules() -> tuple[str, ...]:
+    """新路径模块清单：overlay_* / sprite_* / pet_sprite / tick_* / island_bridge。
+
+    按目录枚举（而不是硬编码文件名）——新路径新增模块自动纳入守卫，
+    不会因为"忘了加名单"漏掉一次回潮。
+    """
+    patterns = ("overlay_*.py", "sprite_*.py", "tick_*.py")
+    names = {"pet_sprite.py", "island_bridge.py"}
+    for pattern in patterns:
+        names.update(p.name for p in PET_DIR.glob(pattern))
+    return tuple(sorted(names))
+
+
+def test_overlay_new_path_has_zero_retired_layer_imports():
+    """4.4a 停用刀：新路径零 import 多进程多宠退役层（T6）。"""
+    offenders = []
+    modules = _overlay_new_path_modules()
+    assert "overlay_shell.py" in modules and "sprite_collision.py" in modules, (
+        "新路径模块枚举失效（目录变动？），守卫清单必须非空"
+    )
+    for name in modules:
+        for lineno, line in enumerate(_read(name).splitlines(), 1):
+            stripped = line.strip()
+            if not (stripped.startswith("from ") or stripped.startswith("import ")):
+                continue  # 只查 import 语句，注释里的历史提及不算回潮
+            for retired in RETIRED_MULTIPROCESS_MODULES:
+                if re.search(rf"\b{retired}\b", stripped):
+                    offenders.append(f"{name}:{lineno}: {stripped}")
+    assert not offenders, (
+        "overlay 新路径 import 了多进程多宠退役层模块（架构倒退）：\n"
+        + "\n".join(offenders)
+    )
+
+
 def test_window_private_surface_frozen():
     """S2 收口成果：window 私有成员跨模块访问在以下文件中必须保持零命中。"""
     pattern = re.compile(r"(?:win|pet|window)\._[a-z]")

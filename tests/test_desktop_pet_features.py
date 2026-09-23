@@ -643,7 +643,8 @@ def test_pet_app_assigns_distinct_offsets_to_spawned_pets(tmp_path, monkeypatch)
 
     app = QApplication.instance() or QApplication([])
     offsets = []
-    monkeypatch.setattr(app_mod, "launch_new_pet", lambda index: offsets.append(index))
+    monkeypatch.setattr(AppShell, "spawn_in_process_window",
+                        lambda self, index=1: offsets.append(index))
     owner = AppShell(app, Config(tmp_path))
     owner.spawn_pet()
     owner.spawn_pet()

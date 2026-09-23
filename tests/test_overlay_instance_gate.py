@@ -5,7 +5,8 @@
 1. 抢到门拒绝双开、释放后可再开、未持有者 release 不碰别人的锁文件；
 2. 崩溃残留锁（真子进程被 kill 后留下的锁文件）按 QLockFile 既有 stale 语义接管；
 3. 环境错误（锁文件根本建不出来）放行启动，不把坏环境伪装成"已有实例"；
-4. legacy 拓扑无门：不建锁文件/留痕，main 继续走 slot 竞争（行为不变）；
+4. legacy 拓扑无门：不建锁文件/留痕；4.4a 起 main() 不再抢 slot 文件锁
+   （`--slot` 兼容解析保留）；
 5. 启动链接线：overlay 双开在 slot 竞争之前被拒 + 留痕 + 静默退出码；
    正常退出（main finally）与会话结束（_on_session_end）两条路径都释放门；
 6. 真进程/真 QApplication 端到端双开（子进程跑 `python -m pet`）。
@@ -108,6 +109,9 @@ class _FakeQApplication:
 
     def setQuitOnLastWindowClosed(self, flag):  # noqa: N802 - Qt API
         self.quit_on_last_window_closed = bool(flag)
+
+    def exec(self):  # noqa: A003 - Qt API
+        return 0
 
 
 # ---------------------------------------------------------------- 核心互斥
@@ -269,25 +273,45 @@ def test_main_refuses_second_overlay_instance_before_slot(tmp_path, monkeypatch,
     assert "refused" in (config_dir / gate_mod.TRACE_NAME).read_text(encoding="utf-8")
 
 
-def test_main_legacy_topology_skips_gate_and_reaches_slot(tmp_path, monkeypatch):
-    """legacy 拓扑行为不变：门分支不触发，main 照旧走到 slot 竞争（返回既有 1）。"""
+def test_main_legacy_topology_skips_gate_and_does_not_take_slot_lock(
+        tmp_path, monkeypatch):
+    """legacy 拓扑不触门，且 4.4a 起 main() 不再抢 slot 文件锁（T5）。
+
+    `--slot N` 兼容解析保留：合法值只用于选 config-slot-N.json 身份，
+    不再有任何跨进程竞争副作用（不建 slots/、不落种、不留痕）。
+    """
     from pet import app as app_mod
 
     monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    monkeypatch.delenv("DSH_PET_INSTANCE", raising=False)
     monkeypatch.setattr(app_mod, "_default_base", lambda: tmp_path)
     monkeypatch.setattr(app_mod, "QApplication", _FakeQApplication)
+    monkeypatch.setattr(app_mod, "_setup_logging", lambda _config: None)
+    monkeypatch.setattr(app_mod.autostart_mod, "cleanup_stale_entries", lambda: 0)
 
-    calls: list = []
+    def _slot_must_not_be_used(*_args, **_kwargs):
+        raise AssertionError("legacy 拓扑不应再抢 slot 文件锁")
 
-    def _slot_busy(_config_dir, preferred_slot=None):
-        calls.append(preferred_slot)
-        raise SlotLockError("测试：legacy 槽位竞争（门不该拦在这里之前）")
+    monkeypatch.setattr(app_mod.slot_manager_mod, "acquire_pet_slot",
+                        _slot_must_not_be_used)
 
-    monkeypatch.setattr(app_mod.slot_manager_mod, "acquire_pet_slot", _slot_busy)
+    started = []
 
-    assert app_mod.main(["dsh-pet"]) == 1
-    assert calls == [None]
+    class _StubShell:
+        def __init__(self, *_args, **kwargs):
+            started.append(kwargs)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(app_mod, "AppShell", _StubShell)
+
+    assert app_mod.main(["dsh-pet", "--slot", "3"]) == 0
     config_dir = tmp_path / APP_DIR_NAME
+    assert started and started[0]["slot_id"] == 3          # 身份照旧按 --slot 选
+    assert os.environ["DSH_PET_INSTANCE"] == "slot-3"
+    assert not (config_dir / "slots").exists()              # 不抢锁 = 不建 slots/
+    assert not list(config_dir.glob("config-slot-*.json"))
     assert not (config_dir / gate_mod.LOCK_NAME).exists()
     assert not (config_dir / gate_mod.TRACE_NAME).exists()
 

@@ -129,10 +129,9 @@ def _make_flag_on_shell(tmp_path):
     config = Config(tmp_path)
     config.set("experimental_single_process_spawn", True)
     config.save()
-    slot_id, slot_handle = slot_manager_mod.acquire_pet_slot(config.dir, preferred_slot=0)
-    shell = AppShell(QApplication.instance(), config, enable_chat=True,
-                     slot_handle=slot_handle, slot_id=slot_id)
-    return shell, config, slot_handle
+    # 4.4a：不再抢 slot 文件锁（多进程多宠退役层停用）；身份直接给主槽。
+    shell = AppShell(QApplication.instance(), config, enable_chat=True, slot_id=0)
+    return shell, config, None
 
 
 def _make_primary_record_win(shell, config):
@@ -157,12 +156,8 @@ def _make_second_record_win(shell, tmp_path, monkeypatch):
     return second
 
 
-def _stop_sessions(*insts):
-    for inst in insts:
-        try:
-            inst.collision_ipc.stop()
-        except Exception:
-            pass
+def _stop_sessions(*_insts):
+    """4.4a：碰撞 IPC 会话随多进程多宠退役层停用——保留调用点占位（无操作）。"""
 
 
 def test_flag_on_agent_link_single_manager_fans_out(tmp_path, app, monkeypatch):
@@ -201,7 +196,6 @@ def test_flag_on_agent_link_single_manager_fans_out(tmp_path, app, monkeypatch):
         _stop_sessions(*getattr(shell, "instances", []))
         if getattr(shell, "_shared", None) is not None:
             shell._shared.stop_all()
-        slot_manager_mod._unlock_file(primary_handle)
 
 
 def test_flag_off_shared_subsystems_none(tmp_path, app):
@@ -264,7 +258,6 @@ def test_flag_on_tray_per_window_submenu_exists_and_routes(tmp_path, app, monkey
         _stop_sessions(*getattr(shell, "instances", []))
         if getattr(shell, "_shared", None) is not None:
             shell._shared.stop_all()
-        slot_manager_mod._unlock_file(primary_handle)
 
 
 def test_flag_on_island_toggle_all_windows(tmp_path, app, monkeypatch):
@@ -302,7 +295,6 @@ def test_flag_on_island_toggle_all_windows(tmp_path, app, monkeypatch):
         _stop_sessions(*getattr(shell, "instances", []))
         if getattr(shell, "_shared", None) is not None:
             shell._shared.stop_all()
-        slot_manager_mod._unlock_file(primary_handle)
 
 
 def test_flag_on_shared_proactive_broadcasts_bubble(tmp_path, app, monkeypatch):
@@ -327,7 +319,6 @@ def test_flag_on_shared_proactive_broadcasts_bubble(tmp_path, app, monkeypatch):
         _stop_sessions(*getattr(shell, "instances", []))
         if getattr(shell, "_shared", None) is not None:
             shell._shared.stop_all()
-        slot_manager_mod._unlock_file(primary_handle)
 
 
 def test_flag_on_hidden_notify_text_non_primary(tmp_path, app, monkeypatch):
@@ -361,7 +352,6 @@ def test_flag_on_hidden_notify_text_non_primary(tmp_path, app, monkeypatch):
         _stop_sessions(*getattr(shell, "instances", []))
         if getattr(shell, "_shared", None) is not None:
             shell._shared.stop_all()
-        slot_manager_mod._unlock_file(primary_handle)
 
 
 # ---------------------------------------------------------------- P1 复审回归
@@ -383,7 +373,6 @@ def test_new_window_receives_link_provider_after_real_build(tmp_path, app, monke
         if win is not None:
             win.close()
             win.deleteLater()
-        slot_manager_mod._unlock_file(handle)
         app.processEvents()
 
 
@@ -422,9 +411,6 @@ def test_shared_fullscreen_broadcast_respects_per_window_config(tmp_path, app):
                 w.close()
                 w.deleteLater()
         _stop_sessions(shell.instance, sec)
-        slot_manager_mod._unlock_file(handle)
-        if sec.slot_handle is not None:
-            slot_manager_mod._unlock_file(sec.slot_handle)
         app.processEvents()
 
 
@@ -748,4 +734,3 @@ def test_flag_on_production_watcher_reads_proxy_sentinel(tmp_path, app, monkeypa
         _stop_sessions(*getattr(shell, "instances", []))
         if getattr(shell, "_shared", None) is not None:
             shell._shared.stop_all()
-        slot_manager_mod._unlock_file(primary_handle)
