@@ -1059,6 +1059,8 @@ class AppShell:
         self._balance_cache = None
         self._balance_bridge = None
         self._on_about_to_quit_connected = False
+        # overlay 拓扑产品壳（4.1a）：仅 PET_RENDER_TOPOLOGY=overlay 时构造
+        self._overlay_shell = None
         self._dsh_state_tracker = DshStateTracker(config.dir)
         # 订阅 DSH 统一状态（d04fc10 曾接线，post-merge 重构时丢失，本分支恢复）：
         # 收敛出的 thinking → 联动管线补 legacy 没有的思考气泡/对话开始反应；
@@ -1664,7 +1666,16 @@ class AppShell:
         self._dsh_state_tracker.start()
         character_id = str(self.config.get('character', catalog.DEFAULT_CHARACTER))
         logging.info('当前形象: %s', character_id)
-        self._create_ui_with_character_fallback(character_id)
+        # 拓扑分流（T5/4.1a）：PET_RENDER_TOPOLOGY=overlay（dev flag，唯一
+        # 读取点在 overlay_shell.is_overlay_topology）→ 单合成窗产品壳
+        # 接管渲染，不建 PetWindow；默认路径逐行不变
+        from .overlay_shell import is_overlay_topology
+        if is_overlay_topology():
+            from .overlay_shell import OverlayShell
+            self._overlay_shell = OverlayShell(self.app, self.instance)
+            self._overlay_shell.start()
+        else:
+            self._create_ui_with_character_fallback(character_id)
         # 批5.2a：进程级共享全屏 watcher 在主窗就绪后启动（自省任一窗是否需要，
         # 无需窗——环则空转）；flag 关时 _shared 为 None，no-op。
         if self._shared is not None:
