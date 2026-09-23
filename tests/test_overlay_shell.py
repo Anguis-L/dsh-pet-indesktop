@@ -1,0 +1,403 @@
+# -*- coding: utf-8 -*-
+"""Phase 4.1a overlay 产品壳 offscreen 单测（QT_QPA_PLATFORM=offscreen 可跑）。
+
+覆盖：is_overlay_topology env 契约；OverlayShell 构建期 dpr/bounds/默认右下
+角落位；tick 顺序协议（行为→碰撞→物理，装桩记录调用序）；start/stop 幂等；
+geometryChanged 的 rx/ry 比例迁移；屏拔除的 overlay 重建与拖拽收尾；会话结束
+与退出收口；app.py 拓扑分支（默认路径不构造 OverlayShell）。
+纪律：同步直调 handler / _on_tick(dt=...)，不 sleep 赌时序（AGENTS.md 时序
+测试纪律）；sprite/库/屏用纯假实现，不碰 webm 素材与 ffmpeg。
+"""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Signal
+from PySide6.QtWidgets import QApplication
+
+import pet.app as app_mod
+import pet.overlay_shell as overlay_shell_mod
+from pet.app import AppShell
+from pet.config import Config
+from pet.overlay_shell import OverlayShell, is_overlay_topology
+
+app = QApplication.instance() or QApplication([])
+
+
+# ---------------------------------------------------------------- 假屏 / 假 sprite / 假实例
+class FakeScreen(QObject):
+    """鸭式 QScreen：几何/可用区/DPR 可变，带 Qt 信号验证真实接线。"""
+
+    geometryChanged = Signal(QRect)
+    availableGeometryChanged = Signal(QRect)
+
+    def __init__(self, geo, avail, *, dpr=1.0, refresh=60.0, name="fake-screen"):
+        super().__init__()
+        self._geo = QRect(*geo)
+        self._avail = QRect(*avail)
+        self._dpr = float(dpr)
+        self._refresh = float(refresh)
+        self._name = name
+
+    def set_rects(self, geo, avail, *, dpr=None):
+        self._geo = QRect(*geo)
+        self._avail = QRect(*avail)
+        if dpr is not None:
+            self._dpr = float(dpr)
+
+    def geometry(self):
+        return QRect(self._geo)
+
+    def availableGeometry(self):
+        return QRect(self._avail)
+
+    def devicePixelRatio(self):
+        return self._dpr
+
+    def refreshRate(self):
+        return self._refresh
+
+    def name(self):
+        return self._name
+
+
+class FakeSprite:
+    """记录 set_dpr/set_bounds/set_pos 调用的假 sprite（对接 4.1a 接口契约）。"""
+
+    SIZE = (120, 80)
+
+    def __init__(self, lib, pos, scale):
+        self.lib = lib
+        self.pos = QPointF(pos)
+        self.scale = scale
+        self.home_screen = None
+        self.dpr_calls: list[float] = []
+        self.bounds_calls: list[QRect] = []
+        self.pos_calls: list[QPointF] = []
+        self.releases: list[QPointF] = []
+        self.dragging = False
+        self.interaction_state = "normal"
+
+    def rect(self):
+        return QRect(int(self.pos.x()), int(self.pos.y()), *self.SIZE)
+
+    def set_dpr(self, dpr):
+        self.dpr_calls.append(float(dpr))
+
+    def set_bounds(self, bounds):
+        self.bounds_calls.append(QRect(bounds))
+
+    def set_pos(self, pos):
+        self.pos = QPointF(pos)
+        self.pos_calls.append(QPointF(pos))
+
+    def advance(self, dt):
+        return None
+
+    def paint(self, painter):
+        pass
+
+    def alpha_at(self, local):
+        return 0
+
+    def on_release(self, pos):
+        self.releases.append(QPointF(pos))
+        self.dragging = False
+
+
+class FakeLibrary:
+    def __init__(self):
+        self.manifest = {}
+        self.folder_map = {}
+        self.folder_files = {}
+        self.stopped_all = 0
+        self.paused = 0
+
+    def names(self):
+        return []
+
+    def stop_all_clips(self):
+        self.stopped_all += 1
+
+    def pause_warm(self):
+        self.paused += 1
+
+
+class FakeConfig:
+    def __init__(self, values=None):
+        self._values = dict(values or {})
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+    def set(self, key, value):
+        self._values[key] = value
+
+
+class FakeInstance:
+    def __init__(self, config=None):
+        self.config = config or FakeConfig()
+        self.created_character_ids: list[str] = []
+
+    def _create_library(self, character_id):
+        self.created_character_ids.append(character_id)
+        return FakeLibrary()
+
+
+def _make_shell(screen=None, instance=None):
+    screen = screen or FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040))
+    instance = instance or FakeInstance()
+    shell = OverlayShell(
+        app, instance, screen=screen,
+        sprite_factory=lambda lib, pos, scale: FakeSprite(lib, pos, scale))
+    return shell, screen, instance
+
+
+# ---------------------------------------------------------------- env flag 契约
+def test_is_overlay_topology_env_contract(monkeypatch):
+    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    assert is_overlay_topology() is False
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
+    assert is_overlay_topology() is True
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "legacy")
+    assert is_overlay_topology() is False
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "")
+    assert is_overlay_topology() is False
+
+
+# ---------------------------------------------------------------- 构建期：dpr/bounds/右下角
+def test_shell_wires_dpr_bounds_and_default_corner():
+    screen = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040), dpr=1.5)
+    shell, _, instance = _make_shell(screen=screen)
+
+    sprite = shell.sprite
+    assert sprite is not None
+    assert sprite in shell.overlay.sprites
+    assert sprite.home_screen is screen
+    assert sprite.dpr_calls == [1.5]                       # 构建即喂主屏 DPR
+    assert sprite.bounds_calls[0] == QRect(0, 0, 1920, 1040)  # 可用区转 overlay 局部
+    # 控制器进程级一组；行为/物理边界 = overlay 局部可用区
+    assert shell.behavior.bounds == QRect(0, 0, 1920, 1040)
+    assert shell.physics.bounds == QRectF(0, 0, 1920, 1040)
+    assert shell.overlay.behavior is shell.behavior        # contextMenuEvent 查表点
+    # 默认右下角（go_default_corner 旧算式：右缘留 CORNER_MARGIN、底贴可用区底）
+    expected = QPointF(1920 - 1 - FakeSprite.SIZE[0] - 24, 1040 - 1 - FakeSprite.SIZE[1])
+    assert sprite.pos_calls[-1] == expected
+    assert sprite.pos == expected
+    # per-pet 库：经实例 _create_library 按配置角色创建（T3）
+    assert instance.created_character_ids == ["shenshen"]
+
+
+def test_shell_library_character_fallback():
+    class MissingLibInstance(FakeInstance):
+        def _create_library(self, character_id):
+            self.created_character_ids.append(character_id)
+            if character_id != "shenshen":
+                raise FileNotFoundError(character_id)
+            return FakeLibrary()
+
+    instance = MissingLibInstance(FakeConfig({"character": "dlc-gone"}))
+    shell, _, _ = _make_shell(instance=instance)
+    assert instance.created_character_ids == ["dlc-gone", "shenshen"]
+    assert instance.config.get("character") == "shenshen"
+    assert shell.lib is not None
+
+
+# ---------------------------------------------------------------- tick 顺序协议
+def test_tick_order_behavior_collision_physics():
+    shell, _, _ = _make_shell()
+    calls = []
+
+    class Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def tick(self, sprites, dt):
+            calls.append((self.name, list(sprites), dt))
+
+    shell.behavior = Recorder("behavior")
+    shell.collision = Recorder("collision")
+    shell.physics = Recorder("physics")
+    shell.overlay._on_tick(dt=0.016)  # 同步直调，不跑真 QTimer
+
+    assert [c[0] for c in calls] == ["behavior", "collision", "physics"]
+    for _, sprites, dt in calls:
+        assert sprites == [shell.sprite]
+        assert dt == 0.016
+
+
+# ---------------------------------------------------------------- 生命周期
+def test_start_stop_idempotent():
+    shell, _, _ = _make_shell()
+    calls = []
+
+    class Nop:
+        def tick(self, sprites, dt):
+            calls.append(1)
+
+    shell.behavior = shell.collision = shell.physics = Nop()
+
+    assert not shell.overlay._timer.isActive()
+    shell.start()
+    assert shell.overlay._timer.isActive()
+    shell.start()  # 幂等：重复 start 不重建
+    assert shell.overlay._timer.isActive()
+    shell.stop()
+    assert not shell.overlay._timer.isActive()
+    shell.stop()   # 幂等：重复 stop 是 no-op
+    assert not shell.overlay._timer.isActive()
+
+
+# ---------------------------------------------------------------- 屏事件：geometryChanged 比例迁移
+def test_geometry_change_migrates_sprite_proportionally():
+    screen = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040), dpr=1.0)
+    shell, _, _ = _make_shell(screen=screen)
+    sprite = shell.sprite
+    # 摆到可用区正中：中心 (960, 520) → rx=ry=0.5
+    sprite.pos_calls.clear()
+    sprite.set_pos(QPointF(960 - 60, 520 - 40))
+    sprite.pos_calls.clear()
+
+    screen.set_rects((0, 0, 1280, 720), (0, 0, 1280, 680), dpr=2.0)
+    screen.geometryChanged.emit(screen.geometry())   # 走真信号接线，不直调 handler
+
+    assert shell.overlay.geometry() == QRect(0, 0, 1280, 720)
+    assert shell.behavior.bounds == QRect(0, 0, 1280, 680)
+    assert shell.physics.bounds == QRectF(0, 0, 1280, 680)
+    assert sprite.bounds_calls[-1] == QRect(0, 0, 1280, 680)
+    assert sprite.dpr_calls[-1] == 2.0               # 几何变化重喂 DPR
+    # rx/ry 不变：新中心 = (640, 340) → pos = (580, 300)
+    assert sprite.pos == QPointF(640 - 60, 340 - 40)
+
+
+def test_geometry_change_with_offset_origin():
+    # 屏原点非 (0,0)（副屏场景）：可用区换算 overlay 局部坐标
+    screen = FakeScreen((1920, 0, 1920, 1080), (1920, 40, 1920, 1040))
+    shell, _, _ = _make_shell(screen=screen)
+    sprite = shell.sprite
+    assert sprite.bounds_calls[0] == QRect(0, 40, 1920, 1040)
+
+    sprite.set_pos(QPointF(960 - 60, 40 + 520 - 40))  # 中心 (960, 560)：rx=0.5, ry=0.5
+    screen.set_rects((1920, 0, 1280, 720), (1920, 40, 1280, 680))
+    shell.handle_geometry_changed()                   # 直调 handler 路径
+
+    assert sprite.bounds_calls[-1] == QRect(0, 40, 1280, 680)
+    assert sprite.pos == QPointF(640 - 60, 40 + 340 - 40)
+
+
+# ---------------------------------------------------------------- 屏事件：拔除 → 重建
+def test_screen_removed_rebuilds_overlay_on_primary():
+    fake = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040))
+    shell, _, _ = _make_shell(screen=fake)
+    sprite = shell.sprite
+    old_overlay = shell.overlay
+    primary = app.primaryScreen()
+
+    # 拖拽中拔屏：先收尾拖拽再迁移（v1.1 §10）
+    sprite.dragging = True
+    old_overlay._mouse_grab = sprite
+    old_overlay._press_global = QPointF(10, 10).toPoint()
+
+    shell.handle_screen_removed(fake)
+
+    assert shell._screen is primary
+    assert shell.overlay is not old_overlay            # overlay 重建
+    assert sprite not in old_overlay.sprites
+    assert sprite in shell.overlay.sprites
+    assert sprite.home_screen is primary
+    assert len(sprite.releases) == 1                   # 拖拽被收尾
+    assert old_overlay._mouse_grab is None
+    assert not old_overlay._timer.isActive()
+    assert sprite.dpr_calls[-1] == float(primary.devicePixelRatio())
+    primary_bounds = OverlayShell._local_bounds(primary)
+    assert shell.behavior.bounds == primary_bounds
+
+
+def test_screen_removed_other_screen_keeps_overlay():
+    fake = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040))
+    shell, _, _ = _make_shell(screen=fake)
+    other = FakeScreen((1920, 0, 1920, 1080), (1920, 0, 1920, 1040), name="other")
+    old_overlay = shell.overlay
+    shell.handle_screen_removed(other)
+    assert shell.overlay is old_overlay                # 非当前屏：不重建
+    assert shell._screen is fake
+
+
+# ---------------------------------------------------------------- 会话结束 / 退出收口
+def test_session_end_stops_all_clips_and_tick_idempotent():
+    shell, _, _ = _make_shell()
+    shell.overlay._timer.start()                       # 制造"tick 运转中"状态
+    shell._on_session_end()
+    assert shell.lib.stopped_all == 1
+    assert not shell.overlay._timer.isActive()
+    shell._on_session_end()                            # 幂等
+    assert shell.lib.stopped_all == 1
+    shell.overlay._timer.stop()
+
+
+def test_about_to_quit_pauses_warm_and_stops_tick():
+    shell, _, _ = _make_shell()
+    shell.overlay._timer.start()
+    shell._on_about_to_quit()
+    assert shell.lib.paused == 1
+    assert not shell.overlay._timer.isActive()
+
+
+# ---------------------------------------------------------------- app.py 拓扑分支
+def _stub_shell_start(shell, monkeypatch):
+    """把 start() 里分支点之外的进程级副作用全部换成 no-op 记录器。"""
+    monkeypatch.setattr(shell.instance.collision_ipc, "start", lambda: None)
+    monkeypatch.setattr(shell._dsh_state_tracker, "start", lambda: None)
+    monkeypatch.setattr(AppShell, "_sync_dynamic_island", lambda self: None)
+
+
+def test_app_start_default_path_does_not_touch_overlay_shell(tmp_path, monkeypatch):
+    monkeypatch.delenv("PET_RENDER_TOPOLOGY", raising=False)
+    constructed = []
+    monkeypatch.setattr(overlay_shell_mod, "OverlayShell",
+                        lambda *a, **kw: constructed.append((a, kw)))
+    ui_calls = []
+    monkeypatch.setattr(AppShell, "_create_ui_with_character_fallback",
+                        lambda self, cid: ui_calls.append(cid))
+
+    shell = AppShell(app, Config(tmp_path))
+    _stub_shell_start(shell, monkeypatch)
+    shell.start()
+
+    assert constructed == []                           # 默认路径不构造 OverlayShell
+    assert ui_calls == ["shenshen"]                    # 旧路径主窗创建照常
+    assert getattr(shell, "_overlay_shell", None) is None
+
+
+def test_app_start_overlay_topology_takes_overlay_shell(tmp_path, monkeypatch):
+    monkeypatch.setenv("PET_RENDER_TOPOLOGY", "overlay")
+    created = []
+
+    class FakeOverlayShell:
+        def __init__(self, qapp, instance):
+            self.qapp = qapp
+            self.instance = instance
+            self.started = 0
+            created.append(self)
+
+        def start(self):
+            self.started += 1
+
+    monkeypatch.setattr(overlay_shell_mod, "OverlayShell", FakeOverlayShell)
+    ui_calls = []
+    monkeypatch.setattr(AppShell, "_create_ui_with_character_fallback",
+                        lambda self, cid: ui_calls.append(cid))
+
+    shell = AppShell(app, Config(tmp_path))
+    _stub_shell_start(shell, monkeypatch)
+    shell.start()
+
+    assert len(created) == 1
+    assert created[0].qapp is shell.app
+    assert created[0].instance is shell.instance
+    assert created[0].started == 1
+    assert shell._overlay_shell is created[0]
+    assert ui_calls == []                              # overlay 路径不建 PetWindow
