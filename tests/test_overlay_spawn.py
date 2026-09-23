@@ -1,23 +1,71 @@
 # -*- coding: utf-8 -*-
-"""4.2a 位置持久化 + 4.2b 多 sprite 生灭 offscreen 单测。
+"""4.2a 位置持久化 + 4.2b 多 sprite 生灭/身份/提升 offscreen 单测。
 
 覆盖：rx/ry 恢复与保存（身体中心比例口径）、无记录落右下角、facing 恢复、
 spawn 增 sprite（per-pet 库/行为接管/错开落位）、D1 clip 所有权隔离、clear
-全清（clip 释放/库 shutdown/行为注销）、菜单 spawn 入口。
+全清（clip 释放/库 shutdown/行为注销）、菜单 spawn 入口；4.2b 后段：D6 无锁
+身份分配（单调不撞）、D5 活跃宠清单增减、重启按清单复活（含各自位置/朝向/
+尺寸）、退出即不复活、清单损坏回退只有主宠、主宠退出提升首只子宠为主。
 """
 from __future__ import annotations
 
+import json
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtCore import QPointF, QRect
 from PySide6.QtWidgets import QApplication
 
+import tests.test_overlay_window_capabilities as cap
 import tests.test_sprite_menu_facade as fac
+from pet import overlay_spawn_state as ovs
+from pet.config import APP_DIR_NAME, Config
+from pet.overlay_shell import OverlayShell
+from pet.pet_sprite import PetSprite
 from pet.sprite_menu_facade import build_sprite_full_menu
 
 app = QApplication.instance() or QApplication([])
+
+
+def _make_persistent_shell(base, values=None):
+    """真 Config（config.json 落盘）+ 真 PetSprite 的壳。
+
+    身份/持久化测试必须走真实 ``config-slot-N.json`` 命名与写盘，才能锁住
+    "各自 config 身份"语义；返回 (shell, 新建库列表)。
+    """
+    config = Config(str(base))
+    for key, value in (values or {}).items():
+        config.set(key, value)
+    config.save()
+    instance = cap.CapInstance(config)
+    screen = cap.FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040))
+    shell = OverlayShell(
+        app, instance, screen=screen,
+        sprite_factory=lambda lib, pos, scale: PetSprite(lib, pos=pos, scale=scale))
+    main_lib = fac.RichLibrary()
+    shell.lib = main_lib
+    shell.sprite.library = main_lib
+    made: list = []
+
+    def make_lib():
+        lib = fac.RichLibrary()
+        made.append(lib)
+        return lib
+
+    shell._create_main_library = make_lib
+    return shell, made
+
+
+def _center_ratios(shell, sprite):
+    """sprite 身体中心相对可用区比例（与 save_position 同口径）。"""
+    body = sprite.body_rect()
+    bounds = shell._bounds
+    return ((body.x() + body.width() / 2.0 - bounds.left()) / bounds.width(),
+            (body.y() + body.height() / 2.0 - bounds.top()) / bounds.height())
+
 
 
 def test_restore_position_from_rx_ry(tmp_path):
@@ -126,3 +174,236 @@ def test_menu_has_spawn_entries(tmp_path):
         assert "退出子肥鱼" in titles
     finally:
         shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- 4.2b 身份/活跃清单
+def test_spawn_allocates_monotonic_identity_and_persists_list(tmp_path):
+    """D6：spawn 身份单调不撞；D5：spawn 进活跃清单、退出出清单。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    shell, made = _make_persistent_shell(tmp_path)
+    try:
+        shell.spawn_pet()
+        shell.spawn_pet()
+        assert [shell._spawned_slots[s] for s in shell._spawned] == [1, 2]
+        assert len(made) == 2                                  # per-pet 库（T3）
+        assert ovs.load_active_slots(config_dir) == [1, 2]
+        assert (config_dir / "config-slot-1.json").is_file()
+        assert (config_dir / "config-slot-2.json").is_file()
+        shell.clear_spawned_pets()
+        assert ovs.load_active_slots(config_dir) == []
+        # 已退出的身份配置保留 → 分配继续单调，绝不回收撞既有身份
+        shell.spawn_pet()
+        assert shell._spawned_slots[shell._spawned[0]] == 3
+        assert ovs.load_active_slots(config_dir) == [3]
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_spawn_skips_legacy_slot_config_identities(tmp_path):
+    """旧版多进程时代遗留的 slot 配置身份不被复用（身份记忆不覆盖）。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config-slot-1.json").write_text(
+        json.dumps({"version": 4, "rx": 0.11, "ry": 0.22}), encoding="utf-8")
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        shell.spawn_pet()
+        assert shell._spawned_slots[shell._spawned[0]] == 2
+        legacy = json.loads(
+            (config_dir / "config-slot-1.json").read_text(encoding="utf-8"))
+        assert legacy["rx"] == 0.11 and legacy["ry"] == 0.22
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_clear_spawned_pets_does_not_revive_after_restart(tmp_path):
+    """退出子肥鱼 = 出清单：配置保留但重启不再出现（D5 铁律）。"""
+    shell, _ = _make_persistent_shell(tmp_path)
+    shell.spawn_pet()
+    shell.spawn_pet()
+    shell.clear_spawned_pets()
+    assert (tmp_path / APP_DIR_NAME / "config-slot-1.json").is_file()  # 配置保留
+    shell2, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert shell2._spawned == []
+        assert shell2.overlay.sprites == [shell2.sprite]
+    finally:
+        shell2._delete_runtime_marker()
+        shell._delete_runtime_marker()
+
+
+def test_exit_single_spawned_pet_removes_only_that_slot(tmp_path):
+    config_dir = tmp_path / APP_DIR_NAME
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        shell.spawn_pet()
+        shell.spawn_pet()
+        first, second = shell._spawned
+        assert shell.exit_pet(first) is True
+        assert shell._spawned == [second]
+        assert first not in shell.overlay.sprites
+        assert ovs.load_active_slots(config_dir) == [2]
+        assert shell.exit_pet(first) is False            # 已退出 → no-op
+        shell2, _ = _make_persistent_shell(tmp_path)
+        try:
+            assert [shell2._spawned_slots[s] for s in shell2._spawned] == [2]
+        finally:
+            shell2._delete_runtime_marker()
+    finally:
+        shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- 4.2b 重启复活
+def test_restart_revives_active_pets_with_their_own_positions(tmp_path):
+    shell, _ = _make_persistent_shell(tmp_path)
+    shell.spawn_pet()
+    shell.spawn_pet()
+    first, second = shell._spawned
+    first.set_pos(QPointF(120, 140))
+    second.set_pos(QPointF(760, 420))
+    first.facing = "right"
+    want_first = _center_ratios(shell, first)
+    want_second = _center_ratios(shell, second)
+    shell.save_spawned_positions()  # 退出收口路径（aboutToQuit）
+
+    shell2, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert [shell2._spawned_slots[s] for s in shell2._spawned] == [1, 2]
+        got_first = _center_ratios(shell2, shell2._spawned[0])
+        got_second = _center_ratios(shell2, shell2._spawned[1])
+        assert abs(got_first[0] - want_first[0]) < 0.005
+        assert abs(got_first[1] - want_first[1]) < 0.005
+        assert abs(got_second[0] - want_second[0]) < 0.005
+        assert abs(got_second[1] - want_second[1]) < 0.005
+        assert shell2._spawned[0].facing == "right"
+        assert shell2._spawned[0].scale == pytest.approx(first.scale)
+    finally:
+        shell2._delete_runtime_marker()
+        shell._delete_runtime_marker()
+
+
+def test_revive_uses_each_slot_scale(tmp_path):
+    """每只子肥鱼按各自 slot 身份恢复尺寸（不是跟随主宠当前尺寸）。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    ovs.save_active_slots(config_dir, [1, 2])
+    (config_dir / "config-slot-1.json").write_text(
+        json.dumps({"version": 4, "rx": 0.3, "ry": 0.3, "scale": 0.5}),
+        encoding="utf-8")
+    (config_dir / "config-slot-2.json").write_text(
+        json.dumps({"version": 4, "rx": 0.7, "ry": 0.7, "scale": 0.25}),
+        encoding="utf-8")
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert [s.scale for s in shell._spawned] == [pytest.approx(0.5),
+                                                     pytest.approx(0.25)]
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_spawn_persists_each_pet_position_separately(tmp_path):
+    config_dir = tmp_path / APP_DIR_NAME
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        shell.spawn_pet()
+        shell.spawn_pet()
+        first, second = shell._spawned
+        first.set_pos(QPointF(150, 130))
+        second.set_pos(QPointF(800, 500))
+        shell.save_spawned_positions()
+        slot1 = ovs.read_slot_geometry(config_dir, 1)
+        slot2 = ovs.read_slot_geometry(config_dir, 2)
+        assert abs(slot1["rx"] - _center_ratios(shell, first)[0]) < 1e-9
+        assert abs(slot2["rx"] - _center_ratios(shell, second)[0]) < 1e-9
+        assert slot1["rx"] != slot2["rx"]
+    finally:
+        shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- 4.2b 清单损坏回退
+def test_corrupt_active_list_revives_only_main(tmp_path):
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config-slot-1.json").write_text(
+        json.dumps({"version": 4, "rx": 0.4, "ry": 0.4, "scale": 0.72}),
+        encoding="utf-8")
+    (config_dir / "overlay-active-pets.json").write_text("{ broken", encoding="utf-8")
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert shell._spawned == []
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_active_entry_without_slot_config_is_dropped(tmp_path):
+    """清单里指向已消失身份的条目：跳过复活并摘除（不让坏条目永久留下）。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    ovs.save_active_slots(config_dir, [1, 2])
+    (config_dir / "config-slot-1.json").write_text(
+        json.dumps({"version": 4, "rx": 0.4, "ry": 0.4, "scale": 0.72}),
+        encoding="utf-8")
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert [shell._spawned_slots[s] for s in shell._spawned] == [1]
+        assert ovs.load_active_slots(config_dir) == [1]
+    finally:
+        shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- 4.2b 主实例提升
+def test_main_exit_promotes_first_spawned_pet(tmp_path):
+    """主宠退出 → 活跃清单列表头提升为主（app.py P1-3 等价语义）。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        shell.spawn_pet()
+        shell.spawn_pet()
+        first, second = shell._spawned
+        first.set_pos(QPointF(200, 160))
+        want = _center_ratios(shell, first)
+        old_main, old_lib = shell.sprite, shell.lib
+        assert shell.exit_pet() is True
+        assert shell.sprite is first                      # 提升为主 sprite
+        assert shell.lib is first.library
+        assert shell._spawned == [second]
+        assert list(shell._spawned_slots.values()) == [2]
+        assert old_main not in shell.overlay.sprites
+        assert old_lib.shutdown_calls == 1
+        assert ovs.load_active_slots(config_dir) == [2]
+        # 接管主身份：提升者几何写进主配置
+        assert abs(float(shell._config.get("rx")) - want[0]) < 0.005
+        assert abs(float(shell._config.get("ry")) - want[1]) < 0.005
+        # 只认主 sprite 的接线跟着换（投喂控制器重挂）
+        assert shell._feeding._sprite is first
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_promoted_pet_takes_over_main_identity_after_restart(tmp_path):
+    shell, _ = _make_persistent_shell(tmp_path)
+    shell.spawn_pet()
+    promoted = shell._spawned[0]
+    promoted.set_pos(QPointF(300, 220))
+    want = _center_ratios(shell, promoted)
+    assert shell.exit_pet() is True
+
+    shell2, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert shell2._spawned == []                      # 提升者不再是子肥鱼
+        got = _center_ratios(shell2, shell2.sprite)
+        assert abs(got[0] - want[0]) < 0.005
+        assert abs(got[1] - want[1]) < 0.005
+    finally:
+        shell2._delete_runtime_marker()
+        shell._delete_runtime_marker()
+
+
+def test_main_exit_without_spawned_pets_quits_app(tmp_path):
+    shell, _ = _make_persistent_shell(tmp_path)
+    quits: list = []
+    shell.app = SimpleNamespace(quit=lambda: quits.append(1))
+    assert shell.exit_pet() is True
+    assert quits == [1]                                   # 最后一窗 → 全部退出
+    assert ovs.load_active_slots(tmp_path / APP_DIR_NAME) == []
+
