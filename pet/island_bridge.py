@@ -1,0 +1,424 @@
+# -*- coding: utf-8 -*-
+"""灵动岛 ↔ 进程内碰撞世界桥（4.3 前段 / M-4 装配合一）。
+
+自 ``.scratch/single-overlay-window/run_overlay_demo.py`` 的
+``IslandCollisionBridge``（Phase 3c）迁入 pet/ 的产品化版本：demo 改为 import
+本模块，装配不再有第二份实现（M-4：消除 demo / overlay_shell 平行宇宙）。
+
+职责（与 demo 版逐点等价）
+------------------------
+1. **注册**：把岛几何作为碰撞世界静态成员 ``collision.ISLAND_MEMBER_ID``
+   登记（``SpriteCollisionWorld.add_static_member``）。坐标 = 岛全局几何 -
+   overlay 全局原点（碰撞世界是 overlay 局部坐标，M-3「每屏逻辑坐标」口径）。
+2. **更新**：岛几何/显隐变化 → 重登记或注销（岛隐藏不留幽灵墙）。
+3. **反馈**：碰撞 listener 识别 pair 含岛成员且 ``j >= world.static_hit_min_dv``
+   → bump 回调 ``(min(3.0, j / 400.0), dir_x, dir_y)``（口径同旧架构
+   ``island_collision._apply_feedback``：strength 封顶 3、dir = 岛被顶的方向）
+   + 可选音效 hook。进程内直连，旧架构「远端墙无信号」死结天然消失。
+
+产品化增强（demo 版没有）
+----------------------
+- **stadium 胶囊圆链**：静态成员碰撞体走 ``sprite_collision.capsule_circles``
+  的体育场等效圆链（4bfa6f3 / D9 口径），对齐旧架构
+  ``island_collision._island_stadium``。demo 版只给矩形（世界回退内切三圆），
+  宽扁岛（如 400×80）胶囊中段存在可穿入空档；
+- **幂等**：重复 ``attach``/``detach``/``update_geometry`` 不产生第二份监听器
+  或重复注册；同几何重复同步不再打脏碰撞世界（静止豁免依赖 ``_static_dirty``，
+  无变化的重复标脏会让静止期白跑多体求解）；
+- **防御**：未喂几何 = 不注册；宽/高 ≤ 0、坐标非有限值（NaN/±inf）、非数值
+  一律视为不可注册并撤下既有墙；岛对象/回调异常静默降级（岛本体功能不受影响）；
+- **屏迁移**：``IslandWindowBridge.set_origin`` 更新 overlay 全局原点后重算
+  局部几何（overlay 重建/换屏时壳层调用，气泡跟随器 ``set_origin`` 同款）。
+
+Qt 耦合面（写清）
+----------------
+- ``IslandCollisionBridge`` 是核心桥，**模块级零 PySide6 import**：几何经
+  ``update_geometry(left, top, width, height)`` 参数喂入，可在没有
+  QApplication 的纯逻辑测试里跑（本模块只 import 标准库 + ``.collision`` /
+  ``.sprite_collision``）。
+- ``IslandWindowBridge`` 是薄适配层，面向 QWidget 形态的岛
+  （``pet/dynamic_island.DynamicIsland``）：读 ``geometry()/isVisible()``、
+  挂无参几何回调 ``on_geometry_changed``、装 Show/Hide/Move/Resize 事件过滤器，
+  把全局坐标换算成本地坐标后喂核心桥。唯一 Qt 落点是惰性构造的事件过滤器
+  QObject（``_build_island_event_filter``，模块 import 期不触碰 Qt）。
+- 岛若不用 QWidget（自绘 / 远端几何），直接接核心桥：``attach(world)`` +
+  ``update_geometry(...)``，Qt 侧零依赖。
+- **单槽回调警告**：``island.on_geometry_changed`` 是单槽（旧路径
+  ``app.py`` 用它接 ``IslandCollisionBody.submit``）——overlay 拓扑下由本桥
+  占用，旧果冻墙路径不得与同一个岛同时挂（覆盖时有 WARNING 日志）。
+  ``on_pet_visibility_changed`` 是另一个槽，本桥不碰。
+
+壳层接线（本刀不碰壳层文件）：见交付报告「主人接线清单」。
+"""
+from __future__ import annotations
+
+import logging
+import math
+
+from . import collision
+from .sprite_collision import STATIC_HIT_MIN_DV, capsule_circles
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["IslandCollisionBridge", "IslandWindowBridge"]
+
+# bump 强度口径（旧架构 island_collision._apply_feedback: bump(min(3.0, j/400.0))）
+BUMP_STRENGTH_DIVISOR = 400.0
+BUMP_STRENGTH_MAX = 3.0
+
+
+def _validated_geometry(left, top, width, height):
+    """几何校验：返回 ``(l, t, w, h)`` 或 ``None``（不可注册）。
+
+    防御面：非数值（含 None）→ None；非有限值（NaN/±inf）→ None；
+    宽/高 ≤ 0 → None（负尺寸绝不进碰撞世界，否则圆链/半径全乱）。
+    """
+    try:
+        l, t, w, h = float(left), float(top), float(width), float(height)
+    except (TypeError, ValueError):
+        return None
+    if not all(map(math.isfinite, (l, t, w, h))):
+        return None
+    if w <= 0.0 or h <= 0.0:
+        return None
+    return (l, t, w, h)
+
+
+def _local_geometry(geometry, origin_x: float, origin_y: float):
+    """岛全局几何 - overlay 全局原点 → 碰撞世界（overlay 局部）几何。
+
+    ``geometry`` 按鸭子类型消费（QRect 或任何暴露 x()/y()/width()/height()
+    的对象），本函数因此不引入 Qt 依赖。
+    """
+    return (float(geometry.x()) - float(origin_x),
+            float(geometry.y()) - float(origin_y),
+            float(geometry.width()), float(geometry.height()))
+
+
+class IslandCollisionBridge:
+    """核心桥（零 Qt）：把岛几何注册为碰撞世界静态成员 + 撞击反馈。
+
+    用法::
+
+        bridge = IslandCollisionBridge(bump=island.bump)
+        bridge.attach(world)                     # 幂等
+        bridge.update_geometry(left, top, w, h)  # 几何经参数喂入（局部坐标）
+        bridge.set_visible(False)                # 岛隐藏 → 撤墙
+        bridge.detach()                          # 退出收口：零残留
+
+    几何状态与可见性在 ``detach`` 后保留：再次 ``attach`` 会按最新状态复墙。
+    """
+
+    def __init__(self, *, bump=None, sound=None, member_id: str | None = None) -> None:
+        # bump 反馈挂点：callable(strength, dir_x, dir_y)；异常静默降级
+        self._bump = bump
+        # 音效 hook：对象需有 on_collision(event)（如 sprite_sound.SpriteSoundPlayer）
+        self._sound = sound
+        self._member_id = str(member_id or collision.ISLAND_MEMBER_ID)
+        self._world = None
+        self._visible = True
+        self._geometry: tuple[float, float, float, float] | None = None
+        self._applied: tuple[float, float, float, float] | None = None
+        self.bumps = 0
+
+    # ---------------------------------------------------------------- 只读状态
+    @property
+    def member_id(self) -> str:
+        """碰撞世界成员 id（默认 ``collision.ISLAND_MEMBER_ID``）。"""
+        return self._member_id
+
+    @property
+    def attached(self) -> bool:
+        """是否已挂接碰撞世界（监听器在线）。"""
+        return self._world is not None
+
+    @property
+    def registered(self) -> bool:
+        """当前是否有生效的静态成员（可见 + 几何有效）。"""
+        return self._applied is not None
+
+    @property
+    def geometry(self) -> tuple[float, float, float, float] | None:
+        """最近一次喂入且校验通过的几何（局部坐标）；None = 未喂/无效。"""
+        return self._geometry
+
+    # ---------------------------------------------------------------- 生命周期
+    def attach(self, world) -> None:
+        """挂接碰撞世界（幂等）：注册撞击监听器并按已知几何建墙。
+
+        重复 ``attach`` 同一 world 不会产生第二份监听器；换 world 会先清掉旧
+        world 的残留（同 ``detach`` 语义），保证同一时刻只挂一个世界。
+        """
+        if world is None:
+            return
+        if self._world is not None and self._world is not world:
+            self.detach()
+        self._world = world
+        self._applied = None  # 注册态与当前 world 重新对齐
+        world.add_collision_listener(self.on_collision)
+        self._sync()
+
+    def detach(self) -> None:
+        """摘下监听器与静态成员（幂等，零残留）；几何/可见性状态保留。"""
+        world, self._world = self._world, None
+        self._applied = None
+        if world is None:
+            return
+        try:
+            world.remove_collision_listener(self.on_collision)
+        except Exception:
+            logger.debug("island_bridge: 摘除撞击监听器失败", exc_info=True)
+        try:
+            world.remove_static_member(self._member_id)
+        except Exception:
+            logger.debug("island_bridge: 摘除岛静态成员失败", exc_info=True)
+
+    # ---------------------------------------------------------------- 几何/显隐
+    def update_geometry(self, left, top, width, height) -> bool:
+        """喂入岛在碰撞世界坐标系（overlay 局部）里的几何并同步注册。
+
+        返回几何是否有效（有效 = 已按当前可见性登记；无效 = 不作为墙，既有
+        注册一并撤下）。
+        """
+        self._geometry = _validated_geometry(left, top, width, height)
+        self._sync()
+        return self._geometry is not None
+
+    def set_visible(self, visible: bool) -> None:
+        """岛显隐：隐藏 → 撤墙（不留幽灵墙），显示 → 按最近几何复墙。"""
+        self._visible = bool(visible)
+        self._sync()
+
+    def _sync(self) -> None:
+        """把「可见 + 几何有效」的目标状态落到碰撞世界（无变化则不打脏）。"""
+        world = self._world
+        if world is None:
+            return
+        target = self._geometry if (self._visible and self._geometry is not None) else None
+        if target == self._applied:
+            return  # 幂等：同状态重复同步不重复登记、不打脏静止豁免
+        try:
+            if target is None:
+                world.remove_static_member(self._member_id)
+            else:
+                left, top, width, height = target
+                world.add_static_member(
+                    self._member_id, left, top, width, height,
+                    circles=capsule_circles(left, top, width, height))
+        except Exception:
+            logger.debug("island_bridge: 岛静态成员同步失败", exc_info=True)
+            return
+        self._applied = target
+
+    # ---------------------------------------------------------------- 撞击反馈
+    def _hit_floor(self) -> float:
+        """真撞击阈值 = 世界的静态成员放宽阈值（对齐 demo/旧架构）。"""
+        world = self._world
+        value = getattr(world, "static_hit_min_dv", STATIC_HIT_MIN_DV)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(STATIC_HIT_MIN_DV)
+
+    def on_collision(self, event) -> None:
+        """碰撞 listener：pair 含岛且冲量达阈值 → bump 回调 + 音效 hook。
+
+        未挂接（detach 后）直接返回：摘下的桥不再对外发反馈。
+        """
+        if self._world is None:
+            return
+        if self._member_id not in (event.a, event.b):
+            return
+        j = float(getattr(event, "j", 0.0) or 0.0)
+        if j < self._hit_floor():
+            return  # 轻触不反馈（音效/形变纪律同现架构）
+        # 岛被顶的方向 = 从对方指向岛（island_collision 从对方 dv 取反的口径
+        # 在进程内等价于碰撞法线方向）
+        if event.b == self._member_id:
+            dir_x, dir_y = event.nx, event.ny
+        else:
+            dir_x, dir_y = -event.nx, -event.ny
+        self._fire_bump(j, float(dir_x), float(dir_y))
+        if self._sound is not None:
+            try:
+                self._sound.on_collision(event)
+            except Exception:
+                logger.debug("island_bridge: 撞击音效失败", exc_info=True)
+
+    def _fire_bump(self, j: float, dir_x: float, dir_y: float) -> None:
+        callback = self._bump
+        if not callable(callback):
+            return
+        try:
+            callback(min(BUMP_STRENGTH_MAX, j / BUMP_STRENGTH_DIVISOR), dir_x, dir_y)
+            self.bumps += 1
+        except Exception:
+            logger.debug("island_bridge: 岛 bump 反馈失败", exc_info=True)
+
+
+def _build_island_event_filter(bridge: "IslandWindowBridge"):
+    """惰性构造岛事件过滤器（PySide6 只在这个函数体内落地）。
+
+    模块 import 期不触碰 Qt：核心桥与纯逻辑测试无需 Qt 环境。返回的 QObject
+    监听岛的 Show/Hide/Move/Resize——``on_geometry_changed`` 只覆盖岛自己的
+    几何弹跳/停靠动画，原生 show/hide/move 得靠事件过滤补齐（demo 口径）。
+    """
+    from PySide6.QtCore import QEvent, QObject
+
+    class _IslandEventFilter(QObject):
+        _GEOMETRY_EVENTS = (
+            QEvent.Type.Show, QEvent.Type.Hide,
+            QEvent.Type.Move, QEvent.Type.Resize,
+        )
+
+        def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
+            if obj is bridge.island and event.type() in self._GEOMETRY_EVENTS:
+                bridge.sync_geometry()
+            return False
+
+    return _IslandEventFilter()
+
+
+class IslandWindowBridge:
+    """Qt 适配层：QWidget 形态的岛（DynamicIsland）→ 零 Qt 核心桥。
+
+    构造即接线（口径同 demo Phase 3c）：``island.on_geometry_changed`` 挂
+    ``sync_geometry``、装 Show/Hide/Move/Resize 事件过滤器，把岛全局几何 -
+    overlay 原点换算成本地几何喂核心桥。``world`` 给了就 ``attach``（默认
+    bump = ``island.bump``）；``overlay`` 给了就以其 ``geometry().topLeft()``
+    为原点（``overlay=None`` 时原点为 (0,0)，岛几何即局部几何）。
+
+    本类本身不是 QObject：Qt 只出现在惰性事件过滤器里（见
+    ``_build_island_event_filter``），岛按鸭子类型消费（geometry/isVisible/
+    bump/installEventFilter/removeEventFilter）。
+    """
+
+    def __init__(self, island, world=None, overlay=None, *, sound=None,
+                 bump=None, member_id: str | None = None) -> None:
+        self._island = island
+        origin = overlay.geometry().topLeft() if overlay is not None else None
+        self._origin = (float(origin.x()), float(origin.y())) if origin is not None else (0.0, 0.0)
+        self._filter = None
+        self._filter_installed = False
+        self._core = IslandCollisionBridge(
+            bump=bump if bump is not None else self._bump_island,
+            sound=sound, member_id=member_id)
+        self._wire_island()
+        if world is not None:
+            self.attach(world)
+        else:
+            self.sync_geometry()
+
+    # ---------------------------------------------------------------- 只读状态
+    @property
+    def island(self):
+        """被桥接的岛（事件过滤器用它做归属判定）。"""
+        return self._island
+
+    @property
+    def core(self) -> IslandCollisionBridge:
+        """零 Qt 核心桥（高级用法：直接喂几何/查注册态）。"""
+        return self._core
+
+    @property
+    def member_id(self) -> str:
+        return self._core.member_id
+
+    @property
+    def attached(self) -> bool:
+        return self._core.attached
+
+    @property
+    def registered(self) -> bool:
+        return self._core.registered
+
+    @property
+    def bumps(self) -> int:
+        """撞击反馈命中计数（demo/指标口径）。"""
+        return self._core.bumps
+
+    # ---------------------------------------------------------------- 接线
+    def _bump_island(self, strength: float, dir_x: float, dir_y: float) -> None:
+        self._island.bump(strength, dir_x, dir_y)
+
+    def _wire_island(self) -> None:
+        """挂岛的几何回调 + 事件过滤器（幂等；异常静默降级）。"""
+        try:
+            previous = getattr(self._island, "on_geometry_changed", None)
+            if callable(previous) and previous != self.sync_geometry:
+                # 单槽回调被外来方占用：旧 island_collision 路径与 overlay 拓扑
+                # 不能同挂一个岛（壳层接线须二选一），这里给出可诊断的告警
+                logger.warning("island_bridge: 覆盖岛既有 on_geometry_changed=%r"
+                               "（单槽回调，旧果冻墙路径不应与本桥同挂）", previous)
+            self._island.on_geometry_changed = self.sync_geometry
+        except Exception:
+            logger.debug("island_bridge: 挂岛几何回调失败", exc_info=True)
+        if self._filter is None:
+            try:
+                self._filter = _build_island_event_filter(self)
+            except Exception:
+                self._filter = None  # 无 Qt 环境：几何回调路径仍可用
+                logger.debug("island_bridge: 事件过滤器构造失败", exc_info=True)
+        if self._filter is not None and not self._filter_installed:
+            try:
+                self._island.installEventFilter(self._filter)
+                self._filter_installed = True
+            except Exception:
+                logger.debug("island_bridge: 装岛事件过滤器失败", exc_info=True)
+
+    def _unwire_island(self) -> None:
+        """摘线：过滤器移除 + 几何回调还原（只还原成我方挂的那个）。"""
+        if self._filter is not None and self._filter_installed:
+            try:
+                self._island.removeEventFilter(self._filter)
+            except Exception:
+                logger.debug("island_bridge: 摘岛事件过滤器失败", exc_info=True)
+            self._filter_installed = False
+        try:
+            if getattr(self._island, "on_geometry_changed", None) == self.sync_geometry:
+                self._island.on_geometry_changed = None
+        except Exception:
+            logger.debug("island_bridge: 还原岛几何回调失败", exc_info=True)
+
+    # ---------------------------------------------------------------- 生命周期
+    def attach(self, world) -> None:
+        """挂接碰撞世界（幂等）：核心桥 attach + 岛接线在线 + 立即对齐几何。"""
+        self._core.attach(world)
+        self._wire_island()
+        self.sync_geometry()
+
+    def detach(self) -> None:
+        """摘线 + 摘碰撞世界（幂等，零残留）；再次 attach 可恢复。"""
+        self._unwire_island()
+        self._core.detach()
+
+    def close(self) -> None:
+        """退出收口别名（demo/壳层口径同 ``detach``）。"""
+        self.detach()
+
+    # ---------------------------------------------------------------- 几何/反馈
+    def set_origin(self, origin) -> None:
+        """overlay 重建/换屏后更新全局原点并重算局部几何（鸭子类型 x()/y()）。"""
+        self._origin = (float(origin.x()), float(origin.y()))
+        self.sync_geometry()
+
+    def update_geometry(self, left, top, width, height) -> bool:
+        """直接喂局部几何（岛非 QWidget / 几何来自别处时用）。"""
+        return self._core.update_geometry(left, top, width, height)
+
+    def sync_geometry(self) -> None:
+        """按岛当前可见性/几何刷新注册（无参回调与事件过滤共用入口）。"""
+        try:
+            if not self._island.isVisible():
+                self._core.set_visible(False)
+                return
+            self._core.set_visible(True)
+            left, top, width, height = _local_geometry(
+                self._island.geometry(), self._origin[0], self._origin[1])
+            self._core.update_geometry(left, top, width, height)
+        except Exception:
+            logger.debug("island_bridge: 岛几何同步失败", exc_info=True)
+
+    def on_collision(self, event) -> None:
+        """碰撞事件入口（转发核心桥；world 直接挂本对象也可）。"""
+        self._core.on_collision(event)
