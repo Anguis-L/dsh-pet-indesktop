@@ -29,6 +29,8 @@ from PySide6.QtGui import QImage, QPainter, QPixmap
 from . import catalog
 from . import physics as physics_mod
 from .library import MovieLibrary, clip_current_image
+from .window_effects import (begin_rotation, end_rotation, rotated_region_bounds,
+                             unrotate_point)
 
 # 交互状态（跨模块协调协议，见 .scratch/single-overlay-window/spec.md）：
 # "normal" = 行为状态机驱动（游荡/待机/转向）；"drag" = 被用户拖拽；
@@ -73,11 +75,20 @@ class PetSprite(QObject):
         # 收口 set_pos（body_box 钳制的唯一执行点）。
         # 脏上报（V-3/V-4）：overlay 在 add_sprite 时挂 _dirty_cb(old, new)，
         # set_pos 与帧到达直驱重绘，tick 不再是重绘闸门；_last_reported_rect
-        # 记"上次上报给 overlay 的 rect"，advance 据此捕获 tick 之外
-        # （物理控制器/拖拽事件）发生的位移。
+        # 记"上次上报给 overlay 的绘制外接矩形"（含探头旋转溢出，见
+        # paint_bounds），advance 据此捕获 tick 之外（物理控制器/拖拽事件）
+        # 发生的位移。
         self._dirty_cb = None
         self._kinetic_cb = None  # M-1：运动信号回调（overlay 挂接）
         self._last_reported_rect: QRect | None = None
+        # 边缘探头姿态（pet/sprite_edge_probe.SpriteEdgeProbeWorld 写入）：
+        # _probe_angle = 旋转角（度，绕帧绘制矩形中心）；_probe_exposure =
+        # 露出比例，1.0 是「无探头」哨兵，同时是钳制放宽的闸门（<1 时该
+        # sprite 的身体允许按 probe_body_bounds 语义藏出左右缘）。默认值即
+        # 改造前行为：不旋转、不放宽、不加任何绘制成本。必须在 set_pos 之前
+        # 就位——构造期 set_pos 会读它选钳制域。
+        self._probe_angle = 0.0
+        self._probe_exposure = 1.0
         self.pos = QPointF(0, 0)
         self.set_pos(pos if pos is not None else QPointF(0, 0))
         self._clip = None
@@ -125,11 +136,11 @@ class PetSprite(QObject):
             raise ValueError(f"scale 必须为正: {value!r}")
         if value == self._scale:
             return
-        old_rect = self.rect()
+        old_rect = self.paint_bounds()
         self._scale = value
         self._invalidate_frames()  # 签名含 scale：立即按新尺寸重建（D2）
         self.set_pos(self.pos)    # 尺寸变化后按新身体框补钳（内部判变）
-        self._notify_dirty(old_rect, self.rect())
+        self._notify_dirty(old_rect, self.paint_bounds())
 
     def _logical_size(self) -> tuple[int, int]:
         """逻辑大小（CANVAS*scale）：rect/命中/碰撞坐标系的尺寸，与 DPR 无关。"""
@@ -212,7 +223,7 @@ class PetSprite(QObject):
             return
         self._dpr = dpr
         self._invalidate_frames()
-        rect = self.rect()
+        rect = self.paint_bounds()
         self._notify_dirty(rect, rect)  # 立即重绘（不等 tick）
 
     # ---------------------------------------------------------------- 钳制（D3）
@@ -267,6 +278,17 @@ class PetSprite(QObject):
             return lower
         return min(max(value, lower), upper)
 
+    def _clamp_domain(self) -> QRectF | None:
+        """set_pos 的生效钳制域：探头姿态用放宽域，否则常规 bounds。
+
+        放宽域由本 sprite 的 bounds + 身体框就地算出、只作用于自己（不写共享
+        状态），因此不影响其它 sprite 的钳制。
+        """
+        relaxed = self.probe_clamp_bounds()
+        if relaxed is not None:
+            return relaxed
+        return self._bounds
+
     def set_pos(self, pos: QPointF) -> None:
         """唯一位置写入口：写入前按 body_box 钳制（D3）。
 
@@ -275,9 +297,12 @@ class PetSprite(QObject):
         透明边可以越界）。无 bounds 或无 body_box 声明（回退全画布）时
         等价于整矩形钳制。模块内一切位置写入（velocity 积分/拖拽/外部
         控制器）都必须经此入口。
+
+        探头姿态（probe_exposure<1）改用放宽域（probe_body_bounds 语义），
+        身体可整体藏出左右缘；取消探头即恢复常规钳制。
         """
         x, y = float(pos.x()), float(pos.y())
-        b = self._bounds
+        b = self._clamp_domain()
         if b is not None:
             body = self._body_local_rect()
             x = self._clamp_axis(x, b.left(), b.left() + b.width(),
@@ -287,13 +312,15 @@ class PetSprite(QObject):
         new_pos = QPointF(x, y)
         if new_pos == self.pos:
             return
-        old_rect = self.rect()
+        old_rect = self.paint_bounds()
         self.pos = new_pos
         # V-3/V-4：位移直驱重绘——物理控制器（before_sprites_advance）与
         # 拖拽事件都在 advance 之外移动 sprite，旧位置必须即时上报清除，
         # 否则静态素材冻结、动画素材拖尾。overlay 的 update 天然合并
         # 同一事件轮次内的多次调用，tick 内多次 set_pos 不会放大 paint。
-        self._notify_dirty(old_rect, self.rect())
+        # 脏矩形口径 = 绘制外接矩形（含探头旋转溢出），45° 姿态下只报
+        # rect() 会在旋转角上留残影。
+        self._notify_dirty(old_rect, self.paint_bounds())
 
     def _notify_dirty(self, old: QRect, new: QRect) -> None:
         """向 overlay 上报脏矩形（add_sprite 挂接；未挂接时 no-op）。"""
@@ -308,6 +335,94 @@ class PetSprite(QObject):
         cb = self._kinetic_cb
         if cb is not None and not self.velocity.isNull():
             cb()
+
+    # ---------------------------------------------------------------- 探头姿态（边缘探头）
+    @property
+    def probe_angle(self) -> float:
+        """探头旋转角（度，正值 = QPainter.rotate 的顺时针方向）。"""
+        return self._probe_angle
+
+    @property
+    def probe_exposure(self) -> float:
+        """探头露出比例（1.0 = 无探头）。"""
+        return self._probe_exposure
+
+    @property
+    def probe_active(self) -> bool:
+        """是否处于探头姿态（曝光 < 1）。
+
+        行为控制器据此跳过贴边钳制与游荡（探头会话期间只允许待机/转向，
+        旧机 _effects_probe_active 闸门的 sprite 版）。
+        """
+        return self._probe_exposure < 1.0
+
+    def probe_clamp_bounds(self) -> QRectF | None:
+        """探头放宽后的钳制域 = 旧 edge_probe.probe_body_bounds 同式。
+
+        正常移动时身体被钳在工作区内（角色不会被拖丢）；探头要「藏一半
+        出屏」，所以左右各放宽一个完整身体宽。**必须减去 body.x()**：身体框
+        在画布里本就右偏（body_box 局部 x>0），不减掉这一项时左向几乎不放宽，
+        那不是「藏半边」而是把身体钉在边缘（旧机注释同款坑）。
+
+        未处于探头姿态（曝光 = 1）或未挂 bounds 的 sprite 返回 None——调用方
+        据此判断"当前是否用了放宽域"。
+        """
+        if not self.probe_active:
+            return None
+        b = self._bounds
+        if b is None:
+            return None
+        body = self._body_local_rect()
+        return QRectF(
+            b.left() - body.x() - body.width(),
+            b.top() - body.y(),
+            b.width() + 2 * body.width() + 2 * body.x(),
+            b.height() + 2 * body.y(),
+        )
+
+    def paint_bounds(self) -> QRect:
+        """当前绘制外接矩形（含探头旋转溢出）：角度 0 时恒等于 rect()。
+
+        脏上报与 advance 的 old/new 都用它——旋转让绘制溢出 rect()，只报
+        rect() 会在 45° 姿态的旋转角上留残影；同时它恒包含 rect()，保证
+        overlay.paintEvent 的 ``region.intersects(sprite.rect())`` 闸门不会
+        漏画。角度 0 时无额外计算成本。
+        """
+        rect = self.rect()
+        if abs(self._probe_angle) < 1e-6:
+            return rect
+        return rotated_region_bounds(rect, rect, self._probe_angle).united(rect)
+
+    def set_probe_pose(self, angle_deg: float, exposure: float) -> None:
+        """写入探头姿态（角度 + 曝光）并按既有脏矩形通道上报。
+
+        角度/曝光都没变时 no-op——探头 tween 每 tick 调用它，稳态零成本。
+        曝光 < 1 即放宽钳制（见 probe_clamp_bounds），所以调用方应在写目标
+        位置之前先写姿态。
+        """
+        angle = float(angle_deg)
+        exposure = max(0.0, min(1.0, float(exposure)))
+        if angle == self._probe_angle and exposure == self._probe_exposure:
+            return
+        old = self.paint_bounds()
+        self._probe_angle = angle
+        self._probe_exposure = exposure
+        self._notify_dirty(old, self.paint_bounds())
+
+    def clear_probe_pose(self) -> None:
+        """清探头姿态并恢复常规钳制（身体被钳回 bounds 内）。
+
+        会话取消（拖拽/碰撞/抛掷/功能关闭）的收口：旧机的窗口 x 恢复值在
+        sprite 世界就是「清姿态 + 常规钳制」——set_pos 会把身体钳回边缘，
+        与进入探头前的位置一致。未处于探头姿态时是 no-op（幂等）。
+        """
+        if not self.probe_active and abs(self._probe_angle) < 1e-6:
+            return
+        old = self.paint_bounds()
+        self._probe_angle = 0.0
+        self._probe_exposure = 1.0
+        self.set_pos(self.pos)  # 常规钳制钳回屏内（位置没变时不重复报脏）
+        self._notify_dirty(old, self.paint_bounds())
 
     def close(self) -> None:
         """释放 clip 所有权（V-8）：断开信号 + 停解码 + 清帧缓存。
@@ -367,7 +482,7 @@ class PetSprite(QObject):
     def _on_frame_changed(self, _frame: int) -> None:
         self._frame_dirty = True
         # V-4：帧到达直驱重绘，不经过 tick——tick 降档后动画帧率不随之掉
-        rect = self.rect()
+        rect = self.paint_bounds()
         self._notify_dirty(rect, rect)
 
     # ---------------------------------------------------------------- tick
@@ -382,13 +497,14 @@ class PetSprite(QObject):
         位置未动且帧未变（视觉无变化）返回 None——overlay 据此跳过
         update（按需刷新铁律，见 Phase 0 实测：整窗重绘 CPU +36%）。
 
-        旧矩形取 _last_reported_rect（上次上报给 overlay 的 rect）而非
-        本函数入口的 rect()：物理控制器（before_sprites_advance）与拖拽
+        旧矩形取 _last_reported_rect（上次上报给 overlay 的绘制外接矩形）
+        而非本函数入口的 rect()：物理控制器（before_sprites_advance）与拖拽
         事件都在 advance 之外移动 sprite，入口取 rect 会 old==new 漏报
-        旧位置（V-3）。
+        旧位置（V-3）。口径用 paint_bounds()（含探头旋转溢出），45° 姿态下
+        旋转角的旧像素同样必须被清掉。
         """
         old = (self._last_reported_rect
-               if self._last_reported_rect is not None else self.rect())
+               if self._last_reported_rect is not None else self.paint_bounds())
         if self.interaction_state == INTERACTION_NORMAL and not self.velocity.isNull():
             self.set_pos(self.pos + self.velocity * dt)  # 积分也过 body_box 钳制
         squashing = False
@@ -397,7 +513,7 @@ class PetSprite(QObject):
             if self._squash_progress >= 1.0:
                 self._squash_progress = None
             squashing = True  # 收势帧也要再画一次（回正）
-        new = self.rect()
+        new = self.paint_bounds()
         if new != old or self._frame_dirty or self._squash_progress is not None or squashing:
             self._frame_dirty = False
             self._last_reported_rect = new
@@ -456,7 +572,7 @@ class PetSprite(QObject):
     def squash(self) -> None:
         """启动 Q 弹挤压（点击/真碰撞反馈，window.py _start_squash 语义）。"""
         self._squash_progress = 0.0
-        rect = self.rect()
+        rect = self.paint_bounds()
         self._notify_dirty(rect, rect)
 
     def _squashed_rect(self) -> QRect:
@@ -472,16 +588,34 @@ class PetSprite(QObject):
         return QRect(x, y, w, h)
 
     def paint(self, painter: QPainter) -> None:
-        """把当前帧画到 overlay 的 painter 上（pos 即 overlay 局部坐标）。"""
+        """把当前帧画到 overlay 的 painter 上（pos 即 overlay 局部坐标）。
+
+        探头姿态：角度非 0 时复用 window_effects.begin_rotation/end_rotation
+        绕帧绘制矩形中心旋转（与旧 _apply_pose 的 pivot = _frame_draw_rect
+        中心同口径）；角度 0 时两个 helper 都是 no-op——不 save/restore、
+        不产生变换，改造前路径零额外成本。Q 弹（squash）路径挂在同一层
+        变换之下：先旋转，再按压缩矩形绘制。
+        """
         self._rebuild_pixmap()
-        if self._pixmap is not None:
+        if self._pixmap is None:
+            return
+        angle = self._probe_angle
+        begin_rotation(painter, self.rect(), angle)
+        try:
             if self._squash_progress is not None:
                 painter.drawPixmap(self._squashed_rect(), self._pixmap)
             else:
                 painter.drawPixmap(self.pos, self._pixmap)
+        finally:
+            end_rotation(painter, angle)
 
     def alpha_at(self, local: QPoint | QPointF) -> int:
         """sprite 局部**逻辑**坐标处的 alpha（0-255）。镜像已烘焙进缓存帧，无需再翻转。
+
+        探头姿态下先把查询点逆旋转回未旋转坐标系（window_effects.
+        unrotate_point，与绘制变换严格互逆）——否则 45° 探头时"画在哪"和
+        "能点到哪"不一致，贴在屏幕缘的可见身体会点不中（点击拉直的入口）。
+        角度 0 时逆变换是 no-op。
 
         命中图是物理像素（CANVAS*scale*dpr），输入逻辑坐标按「命中图物理
         尺寸 ÷ 逻辑尺寸」的实际比例换算（D2）——不用裸 dpr：物理尺寸是
@@ -492,8 +626,12 @@ class PetSprite(QObject):
         if img is None:
             return 0
         lw, lh = self._logical_size()
-        x = math.floor(local.x() * img.width() / lw)
-        y = math.floor(local.y() * img.height() / lh)
+        point = local
+        if abs(self._probe_angle) >= 1e-6:
+            point = unrotate_point(QPointF(local), QRect(0, 0, lw, lh),
+                                   self._probe_angle)
+        x = math.floor(point.x() * img.width() / lw)
+        y = math.floor(point.y() * img.height() / lh)
         if 0 <= x < img.width() and 0 <= y < img.height():
             return (img.pixel(x, y) >> 24) & 0xFF
         return 0

@@ -183,7 +183,17 @@ class BehaviorController:
 
     # ---------------------------------------------------------------- 状态机
     def _tick_sprite(self, sprite, st: _SpriteState, dt: float) -> None:
-        self._clamp_into_bounds(sprite)
+        # 边缘探头会话（sprite.probe_active = 曝光<1）的 sprite：它自己的钳制
+        # 域已被放宽（身体按曝光比例藏出屏幕缘），这里不能再按常规 bounds 钳，
+        # 否则探头姿态每 tick 被拉回屏内。游荡同样要拦（见 _plan_move）：位置
+        # 归探头控制器唯一所有。
+        probing = bool(getattr(sprite, "probe_active", False))
+        if probing and st.state == STATE_MOVE:
+            # 进场时若恰在移动态（速度刚好低于静止阈值）：先收尾回待机，否则
+            # 到点 snap 会把探头姿态一脚踹回走路目标点
+            self._enter_idle(sprite, st, self._categories(sprite.library))
+        if not probing:
+            self._clamp_into_bounds(sprite)
         st.elapsed += dt
         if st.state == STATE_IDLE:
             if st.anim is None:
@@ -267,7 +277,12 @@ class BehaviorController:
             st.predictor.begin_anim(name)
 
     def _roll_next(self, sprite, st: _SpriteState) -> None:
-        """待机播完掷骰：30% 待机 / 10% 转向 / 40% 待机（acts 桶让位）/ 20% 移动。"""
+        """待机播完掷骰：30% 待机 / 10% 转向 / 40% 待机（acts 桶让位）/ 20% 移动。
+
+        探头会话期间移动桶必然落空（_plan_move 闸门），沿既有回退链进动作池/
+        待机——「只允许待机/转向」的位移语义由此保证；动作池 clip 只播原地动画，
+        不改位置。
+        """
         cats = self._categories(sprite.library)
         # 批10-A1：先消费预测（context/gen 校验单规则，不符即弃 → 现场掷骰）
         if st.predictor is not None and self.predict_enabled:
@@ -366,7 +381,15 @@ class BehaviorController:
     def _plan_move(self, sprite, st: _SpriteState, cats: dict,
                    anim_override: str | None = None) -> bool:
         """排定一次移动（window.py _try_move 语义）；返回 False = 未建立计划。
-        anim_override：菜单「移动」类指定素材（trigger_move），None = 掷骰随机。"""
+        anim_override：菜单「移动」类指定素材（trigger_move），None = 掷骰随机。
+
+        探头会话（sprite.probe_active）一律拒绝：旧机在 PetWindow._try_move
+        入口用 _effects_probe_active 整体拦住位移（防止挂着探头姿态被平移出
+        屏幕边缘），sprite 世界把闸门收在这一处——掷骰、预测产物、菜单移动
+        三条路径都经此，调用方按既有回退链进动作池/待机。
+        """
+        if getattr(sprite, "probe_active", False):
+            return False
         moves = cats["moves"]
         if not moves:
             return False
