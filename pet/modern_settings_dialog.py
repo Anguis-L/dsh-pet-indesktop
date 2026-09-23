@@ -1516,13 +1516,33 @@ class ModernSettingsDialog(QDialog):
         """一键静默退出所有小肥鱼（slot-N）；它们的设置与数据保留。
 
         优先走 PetWindow 上已接线的 ``on_clear_spawned_pets``（= AppShell 路径，
-        含进程内子窗前置于关闭，单进程模式才清得掉）；拿不到回调时回退为
-        直接文件级退出。批 I：无确认框无结果框（操作不删数据可重新生成，
-        子肥鱼消失即反馈）。
+        含进程内子窗前置于关闭，单进程模式才清得掉）；拿不到回调时按拓扑分流：
+
+        - overlay 拓扑（``PET_RENDER_TOPOLOGY=overlay``，D12）：子肥鱼是**进程内
+          sprite**，跨进程 taskkill（child_pet_cleanup）找不到目标，按钮必然静默
+          失效——改写指令文件，由主进程（OverlayShell）经 config 目录 watcher +
+          轮询消费；按本配置身份回填 target，语义收窄到"这一只"（主身份 = 全部）；
+        - legacy 拓扑：回退为直接文件级退出，逐行不变。
+
+        批 I：无确认框无结果框（操作不删数据可重新生成，子肥鱼消失即反馈）。
         """
         callback = getattr(self.parentWidget(), "on_clear_spawned_pets", None)
         if callable(callback):
             callback()
+            return
+        from .overlay_settings_command import (
+            CMD_EXIT_SPAWNED_PETS,
+            is_overlay_topology,
+            slot_from_instance_id,
+            write_command,
+        )
+        if is_overlay_topology():
+            target = slot_from_instance_id(self.config.instance_id)
+            if write_command(self.config.dir, CMD_EXIT_SPAWNED_PETS, target=target):
+                logging.info("退出子肥鱼：已写下 overlay 指令（target=%s，主进程消费）",
+                             target)
+            else:
+                logging.warning("退出子肥鱼：写 overlay 指令文件失败，本次未执行")
             return
         if self.config.instance_id:
             # 双保险：子肥鱼不开放该操作（按钮已禁用；即便被旧接线调到也不执行，

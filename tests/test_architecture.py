@@ -193,7 +193,13 @@ WINDOW_PY_LINE_BUDGET = 4648
 # SettingRow 改为按构建变体条件收录（净 +3，注释另计）：无 pet.chat 的
 # 打包变体不再展示该死路开关（运行时回退在 pet/dynamic_island.py 的
 # chat_available）。实测 2357；按文件约定只随实测校准，不为达标压行。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2357
+# 2026-09-23 上调到 2377：4.2c 后段 D12「一键退出子肥鱼」按拓扑分流（+20）——
+# overlay 拓扑下子肥鱼是进程内 sprite，跨进程 taskkill 回退（child_pet_cleanup）
+# 找不到目标、按钮静默失效，改为写指令文件由主进程消费；legacy 回退逐行不变。
+# 拓扑判定/写指令/校验的实现全在零 Qt 的 pet/overlay_settings_command.py，
+# 本文件只做一次分支与身份回填（slot_from_instance_id）。实测 2377；按文件约定
+# 只随实测校准，不为达标压行（拆分仍是待办）。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2377
 
 
 def _read(name: str) -> str:
@@ -204,12 +210,15 @@ def test_pure_logic_modules_do_not_import_qt():
     # 节日提醒的纯逻辑/纯数据模块同样必须零 Qt（2026-09-16 加入，随功能一起
     # 把"纯逻辑层零 Qt"从约定升级为机器化守卫；festival_service/festival_settings
     # 不在本列——前者属服务层、后者属 UI 层，本就不受此约束）。
+    # 2026-09-23 加入 overlay_settings_command：D12 指令通道的写/读/消费与拓扑门
+    # 必须零 Qt——独立设置进程（pet/__main__.py --settings）禁止导入 pet.app/
+    # overlay_shell，env 读取的唯一实现只能落在两侧都能 import 的轻模块里。
     for name in (
         "collision.py", "physics.py", "collision_codec.py",
         "festival_calendar.py", "festival_data.py", "festival.py",
         "festival_quotes_cn.py", "festival_quotes_west.py",
         "festival_quotes_west_movie.py", "festival_quotes_west_game.py",
-        "festival_quotes_west_song.py",
+        "festival_quotes_west_song.py", "overlay_settings_command.py",
     ):
         src = _read(name)
         assert "PySide6" not in src, f"{name} 引入了 Qt 依赖，破坏纯函数层定位"

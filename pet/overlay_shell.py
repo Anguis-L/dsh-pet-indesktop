@@ -28,18 +28,23 @@ T5 切换策略：PET_RENDER_TOPOLOGY=overlay 环境变量是开发期一次性�
 （slot 配置保留）；重启严格按清单复活（含各自 rx/ry/facing/scale）；主宠退出
 按 app.py P1-3 语义提升列表首只子宠为主（接管主身份/持久化身份）。清单、无锁
 身份分配、每身份几何读写的纯逻辑在 ``overlay_spawn_state``（零 Qt，便于单测）。
+
+4.2c 后段（本刀）：托盘聚合（单托盘 + 逐只子菜单，对齐 app.py:3267-3301 的
+单托盘多窗语义）、D12「退出子肥鱼」指令通道消费（独立设置进程写指令文件 →
+本壳经 config 目录 watcher + 轮询消费，纯逻辑在 ``overlay_settings_command``）、
+D13 逐 sprite 设置路由（菜单按被点 sprite 的 config 身份传 ``--instance``）。
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 
-from PySide6.QtCore import QObject, QPointF, QRect, Qt
+from PySide6.QtCore import QObject, QPointF, QRect, QTimer, Qt
 from PySide6.QtWidgets import QMenu, QStyle, QSystemTrayIcon
 
 from . import catalog
+from . import overlay_settings_command
 from . import overlay_spawn_state
 from . import slot_manager
 from .overlay_peripherals import FullscreenCursorWatcher
@@ -52,13 +57,43 @@ from .sprite_physics import ThrowPhysicsController
 from .sprite_sound import SpriteSoundPlayer
 from .tick_driver import TickDriver
 
-ENV_TOPOLOGY = "PET_RENDER_TOPOLOGY"
-TOPOLOGY_OVERLAY = "overlay"
+ENV_TOPOLOGY = overlay_settings_command.ENV_TOPOLOGY
+TOPOLOGY_OVERLAY = overlay_settings_command.TOPOLOGY_OVERLAY
 
 
 def is_overlay_topology() -> bool:
-    """唯一 env 读取点（T5：dev flag，不进 Config/设置页/schema）。"""
-    return os.environ.get(ENV_TOPOLOGY, "").strip().lower() == TOPOLOGY_OVERLAY
+    """唯一拓扑判定入口（T5：dev flag，不进 Config/设置页/schema）。
+
+    实现在零 Qt 的 ``overlay_settings_command``：设置进程（``--settings``，
+    ``pet/__main__.py`` 明确禁止导入 pet.app/overlay_shell）也要按拓扑决定
+    D12 指令通道走不走，故 env 读取的实现必须落在两侧都能 import 的模块；
+    本函数保留为对外唯一入口名（app.py/overlay_instance_gate 照旧转发）。
+    """
+    return overlay_settings_command.is_overlay_topology()
+
+
+class _SettingsIdentityConfig:
+    """身份载体的 config 面（``open_settings_process`` 只读 ``instance_id``）。"""
+
+    __slots__ = ("instance_id",)
+
+    def __init__(self, instance_id: str) -> None:
+        self.instance_id = instance_id
+
+
+class _SettingsIdentity:
+    """D13：喂给 ``AppShell.open_settings_process`` 的身份载体（鸭子类型）。
+
+    该入口只读 ``instance.config.instance_id``（app.py:1518-1523）：主身份与
+    进程级 ``DSH_PET_INSTANCE`` 同值 → 命令逐字不变；子 sprite 的 ``slot-N``
+    不等于 env → 追加 ``--instance slot-N``，独立设置进程因此打开该子肥鱼的
+    ``config-slot-N.json`` 而不是静默打开主宠配置。这里不建 Config、不碰磁盘。
+    """
+
+    __slots__ = ("config",)
+
+    def __init__(self, instance_id: str) -> None:
+        self.config = _SettingsIdentityConfig(instance_id)
 
 
 def _screen_name(screen) -> str:
@@ -138,7 +173,11 @@ class ShellOverlayWindow(OverlayWindow):
             event.ignore()
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
-        """4.1c：有全量菜单建造器（产品壳）走 facade 菜单，否则基类最小集。"""
+        """4.1c：有全量菜单建造器（产品壳）走 facade 菜单，否则基类最小集。
+
+        D13：把**被点中的 sprite** 透传给建造器——菜单里的设置入口要按它自己的
+        config 身份打开（否则右击子肥鱼的「桌宠设置」会静默打开主宠配置）。
+        """
         builder = getattr(self, "_full_menu_builder", None)
         if builder is None:
             super().contextMenuEvent(event)
@@ -147,7 +186,7 @@ class ShellOverlayWindow(OverlayWindow):
         if target is None:
             event.ignore()
             return
-        menu = builder()
+        menu = builder(target)
         menu.exec(event.globalPos())
         event.accept()
 
@@ -179,7 +218,11 @@ class OverlayShell(QObject):
         self.lib = None
         self.tray: QSystemTrayIcon | None = None
         self._tray_menu: QMenu | None = None
+        self._tray_actions: list = []
         self._session_watcher = None
+        # D12 指令通道（overlay 拓扑：独立设置进程 → 主进程）；未装时为惰性空转
+        self._command_watcher = None
+        self._command_timer = QTimer(self)
         self._bounds = QRect()
         # 4.2b 子肥鱼登记：sprite 顺序 = spawn 顺序 = 活跃宠清单顺序
         self._spawned: list = []
@@ -227,7 +270,8 @@ class OverlayShell(QObject):
         self.overlay.slingshot.config = self._config
         # 4.1c 全量右键菜单（facade 适配旧 context_menus 建造器）
         from .sprite_menu_facade import build_sprite_full_menu
-        self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
+        self.overlay._full_menu_builder = (
+            lambda target: build_sprite_full_menu(self, target))
         self.lib = self._create_main_library()
         # 首跑帧序列自动供给（B 档）：口径同 app._create_library，库内幂等
         getattr(self.lib, 'maybe_provision_frameseq', lambda: None)()
@@ -264,6 +308,7 @@ class OverlayShell(QObject):
         # 4.1c 气泡跟随（真实 PetSpeechBubble；静默降级）
         self._bind_bubble()
         self._build_tray()
+        self._install_settings_command_watch()
 
     def _create_main_library(self):
         """per-pet MovieLibrary（T3）；角色素材缺失回退默认角色（口径同
@@ -359,6 +404,7 @@ class OverlayShell(QObject):
             return
         self._started = False
         self.app.removeEventFilter(self)
+        self._teardown_settings_command_watch()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
             bridge.close()
@@ -375,6 +421,7 @@ class OverlayShell(QObject):
     def _on_about_to_quit(self) -> None:
         """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。"""
         self._watcher.stop()
+        self._teardown_settings_command_watch()
         self._delete_runtime_marker()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
@@ -391,28 +438,100 @@ class OverlayShell(QObject):
             except Exception:
                 logging.exception("overlay: 退出时暂停预热失败")
 
-    # ---------------------------------------------------------------- 托盘（最小集）
+    # ---------------------------------------------------------------- 托盘（多宠聚合）
     def _build_tray(self) -> None:
-        """最小托盘：退出入口（右键 sprite 菜单的 退出 之外的保底路径）。
-        全量托盘菜单 parity 属 4.1b/4.1c。"""
+        """建单托盘 + 双击显隐；菜单本体交给 ``_refresh_tray_menu`` 聚合重建。
+
+        对齐 legacy（app.py:3171-3309）：进程级**单**托盘，多宠时逐只子菜单；
+        图标/双击接线只做一次，菜单随生灭刷新（托盘菜单是快照，不重建会把已
+        退出的身份留在菜单里）。
+        """
         try:
             tray = QSystemTrayIcon(self._tray_icon(), self)
             tray.activated.connect(
                 lambda reason: self._toggle_pet_visible()
                 if reason == QSystemTrayIcon.ActivationReason.DoubleClick
                 else None)
-            menu = QMenu()
-            menu.addAction("显示/隐藏桌宠", self._toggle_pet_visible)
-            menu.addAction("退出", self.app.quit)
-            tray.setContextMenu(menu)
             tray.setToolTip("dsh-pet (overlay)")
             # 菜单本体强引用保活（app.py F5 教训：PySide6 wrapper 回收后
             # contextMenu 会命中失效 wrapper）
-            self._tray_menu = menu
             self.tray = tray
+            self._refresh_tray_menu()
         except Exception:
             logging.exception("overlay: 创建托盘失败")
             self.tray = None
+
+    def _refresh_tray_menu(self) -> None:
+        """重建聚合托盘菜单：进程级动作 + 逐只子菜单（legacy 单托盘多窗语义）。
+
+        逐条对照 legacy（app.py:3203-3301，见 PR 报告）：
+        - 顶层「显示 / 隐藏」「回到右下角」= legacy 主窗两项（overlay 单窗，
+          显隐天然覆盖全部 sprite）；
+        - 「生小肥鱼 / 退出子肥鱼」= overlay 多宠生命周期入口（legacy 在右键
+          菜单/设置页，不重复造第二个实现，直接复用壳的两个公开方法）；
+        - 多宠时逐只子菜单「主肥鱼 / 小肥鱼 [slot-N]」= legacy 每窗子菜单，
+          含「回到右下角」「退出这只」；逐 sprite 显隐需要 per-sprite visible
+          标志（4.1b 未落地项，涉及 overlay_window/pet_sprite），本刀不做，
+          顶层显隐即全显全隐；
+        - 「桌宠设置」按主身份路由（D13）、「退出」= app.quit。
+        """
+        if self.tray is None:
+            return
+        menu = QMenu()
+        # 气泡是置顶 Tool 窗口（层级高于菜单）：弹出前先隐藏（legacy 同款）
+        menu.aboutToShow.connect(self._hide_bubble_for_menu)
+        menu.addAction("显示 / 隐藏", self._toggle_pet_visible)
+        menu.addAction("回到右下角", lambda: self._go_default_corner(self.sprite))
+        menu.addSeparator()
+        menu.addAction("生小肥鱼", self.spawn_pet)
+        menu.addAction("退出子肥鱼", self.clear_spawned_pets)
+        if self._spawned:
+            menu.addSeparator()
+            for sprite, label in self._pet_entries():
+                sub = menu.addMenu(label)
+                sub.addAction("回到右下角",
+                              lambda s=sprite: self._go_default_corner(s))
+                sub.addAction("退出这只",
+                              lambda s=sprite: self.exit_pet(s))
+        menu.addSeparator()
+        menu.addAction("桌宠设置", lambda: self.open_settings_for(self.sprite))
+        menu.addAction("退出", self.app.quit)
+        old = self._tray_menu
+        self.tray.setContextMenu(menu)  # 新菜单先接管，旧菜单才允许释放（F5）
+        self._tray_menu = menu
+        # QAction wrapper 一并保活：子菜单的 menuAction 挂在父菜单 actions 里，
+        # wrapper 被回收会让整棵菜单被 PySide6 判为已删除（app.py:3319 同因）
+        snapshot = list(menu.actions())
+        for act in list(snapshot):
+            sub = act.menu()
+            if sub is not None:
+                snapshot.extend(sub.actions())
+        self._tray_actions = snapshot
+        if old is not None and old is not menu:
+            old.deleteLater()
+
+    def _pet_entries(self) -> list:
+        """托盘逐只条目：(sprite, 标签)。主宠在前 = 活跃清单列表头口径。"""
+        entries = [(self.sprite, "主肥鱼")]
+        for sprite in self._spawned:
+            slot = self._spawned_slots.get(sprite)
+            label = f"小肥鱼 [slot-{slot}]" if slot is not None else "小肥鱼"
+            entries.append((sprite, label))
+        return entries
+
+    def _go_default_corner(self, sprite) -> None:
+        """把指定 sprite 送回右下角（window.go_default_corner 等价）。"""
+        sprite.set_pos(self._default_corner_pos(self._bounds, sprite.rect()))
+
+    def _hide_bubble_for_menu(self) -> None:
+        """托盘菜单弹出前隐藏气泡（legacy menu.aboutToShow → hide_speech_bubble）。"""
+        bubble = getattr(getattr(self, "_bubble_follower", None), "bubble", None)
+        hide = getattr(bubble, "hide", None)
+        if callable(hide):
+            try:
+                hide()
+            except Exception:
+                logging.debug("overlay: 托盘弹出前隐藏气泡失败", exc_info=True)
 
     def _tray_icon(self):
         """托盘图标尽力取鱼本体 idle 首帧（裁剪/精修是 4.1b 的事）；
@@ -619,6 +738,7 @@ class OverlayShell(QObject):
             logging.exception("overlay: 生小肥鱼失败 (slot=%s)", slot)
             return
         self._persist_active_slots()
+        self._refresh_tray_menu()  # 托盘逐只条目随生灭重建（4.2c）
         logging.info("overlay: 已生成子肥鱼 (slot=%s)", slot)
 
     def _spawn_slot(self, slot: int) -> None:
@@ -722,6 +842,7 @@ class OverlayShell(QObject):
             self._remove_spawned_sprite(sprite)
         self._spawned = []
         self._persist_active_slots()
+        self._refresh_tray_menu()
 
     def save_spawned_positions(self) -> None:
         """退出收口：逐只按各自 slot 身份持久化几何（重启复活的位置来源）。"""
@@ -747,6 +868,7 @@ class OverlayShell(QObject):
         if target in self._spawned:
             self._remove_spawned_sprite(target)
             self._persist_active_slots()
+            self._refresh_tray_menu()
             return True
         return False
 
@@ -756,6 +878,7 @@ class OverlayShell(QObject):
         self.save_position()
         if not self._spawned:
             self._persist_active_slots()
+            self._refresh_tray_menu()
             quit_fn = getattr(self.app, "quit", None)
             if callable(quit_fn):
                 quit_fn()  # 最后一窗关闭 → 走全部退出语义
@@ -781,6 +904,7 @@ class OverlayShell(QObject):
         self.lib = promoted_lib
         self.overlay.remove_sprite(old_main)
         self._persist_active_slots()
+        self._refresh_tray_menu()
         self._rebind_main_sprite()
         shutdown = getattr(old_lib, "shutdown", None)
         if callable(shutdown):
@@ -825,6 +949,117 @@ class OverlayShell(QObject):
                 self._config.dir, self._config.instance_id)
         except Exception:
             logging.debug("overlay: 删 runtime 标记失败", exc_info=True)
+
+    # ---------------------------------------------------------------- D12 指令通道
+    def _install_settings_command_watch(self) -> None:
+        """装 D12 指令消费：config 目录 watcher + 3s 轮询兜底（不新起线程）。
+
+        「独立设置进程写指令文件 → 主进程消费」的消费侧，机制与 app.py
+        ``_install_config_watcher`` 同款：QFileSystemWatcher 盯目录（原子
+        ``os.replace`` 会在目录里产生事件）+ QTimer 轮询兜底（网络盘/换 inode
+        等场景可能漏事件，轮询是保底；与 ``_settings_watch_timer`` 同 3s 节奏）。
+        无 config 目录（假配置对象 / 目录不可建）时整条链不装——与
+        ``_spawn_config_dir()`` 的既有防御一致，绝不在测试替身上抛。
+        """
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return
+        from PySide6.QtCore import QFileSystemWatcher
+
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logging.warning("overlay: 配置目录不可创建，跳过指令通道: %s", config_dir)
+            return
+        watcher = QFileSystemWatcher(self)
+        watcher.directoryChanged.connect(self._on_settings_command_dir_changed)
+        if not watcher.addPath(str(config_dir)):
+            logging.warning("overlay: 无法监视配置目录，指令通道退化为轮询: %s",
+                            config_dir)
+        self._command_watcher = watcher
+        self._command_timer.setInterval(3000)
+        self._command_timer.timeout.connect(self._consume_settings_command)
+        self._command_timer.start()
+        # 启动即消费：设置进程可能在主进程起来之前就写下了指令（保鲜窗口内有效）
+        self._consume_settings_command()
+
+    def _on_settings_command_dir_changed(self, _path: str) -> None:
+        self._consume_settings_command()
+
+    def _consume_settings_command(self) -> None:
+        """消费一条设置进程指令（幂等；无指令 = 空转）。
+
+        指令语义：``target`` 为空 = 退出全部子肥鱼（设置页「一键退出子肥鱼」）；
+        否则只退那个 slot 身份（身份已不在活跃清单 = 空操作，只留日志）。
+        """
+        config_dir = self._spawn_config_dir()
+        if not config_dir:
+            return
+        command = overlay_settings_command.consume_command(config_dir)
+        if command is None:
+            return
+        if command.get("command") != overlay_settings_command.CMD_EXIT_SPAWNED_PETS:
+            return  # consume 已按白名单过滤，这里只是防御
+        target = command.get("target")
+        if target is None:
+            logging.info("overlay: 收到设置进程指令 → 退出全部子肥鱼")
+            self.clear_spawned_pets()
+            return
+        sprite = next((item for item in self._spawned
+                       if self._spawned_slots.get(item) == target), None)
+        if sprite is None:
+            logging.info("overlay: 指令目标 slot-%s 已不在活跃清单，跳过", target)
+            return
+        logging.info("overlay: 收到设置进程指令 → 退出子肥鱼 slot-%s", target)
+        self.exit_pet(sprite)
+
+    def _teardown_settings_command_watch(self) -> None:
+        """释放指令 watcher 与轮询定时器（stop / aboutToQuit / 测试收口共用）。"""
+        watcher = getattr(self, "_command_watcher", None)
+        if watcher is not None:
+            try:
+                watcher.directoryChanged.disconnect(
+                    self._on_settings_command_dir_changed)
+            except (RuntimeError, TypeError):
+                pass
+            watcher.setParent(None)
+            watcher.deleteLater()
+            self._command_watcher = None
+        timer = getattr(self, "_command_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+    # ---------------------------------------------------------------- D13 逐 sprite 设置路由
+    def sprite_instance_id(self, sprite) -> str:
+        """sprite 的 config 身份：主 sprite = 主身份，子 sprite = 各自 slot 身份。
+
+        D13：独立设置进程按 ``--instance`` 打开对应 ``config-slot-N.json``
+        （app.py:1518-1523 的透传模式）；主身份与进程级 DSH_PET_INSTANCE 同值
+        → 命令逐字不变。陌生 sprite（不在登记表）回退主身份，绝不瞎猜 slot。
+        """
+        main_id = str(getattr(self._config, "instance_id", "") or "")
+        if sprite is None or sprite is self.sprite:
+            return main_id
+        slot = self._spawned_slots.get(sprite)
+        if slot is None:
+            return main_id
+        return slot_manager.slot_to_instance_id(int(slot))
+
+    def open_settings_for(self, sprite=None) -> bool:
+        """按被点 sprite 的 config 身份打开设置页（D13 落点）。
+
+        返回 True = 已交给独立设置进程（与 ``AppShell.open_settings_process``
+        同义）。只认 AppShell 的 opener：拿不到（测试替身）或开关关闭 → False；
+        overlay 拓扑没有 PetWindow 可挂 parent，故不做进程内回退。
+        """
+        opener = getattr(getattr(self._instance, "shell", None),
+                         "open_settings_process", None)
+        if not callable(opener):
+            return False
+        return bool(opener(_SettingsIdentity(self.sprite_instance_id(sprite))))
 
     def set_pet_visible(self, visible: bool) -> None:
         """显隐切换（app.py toggle_visible 等价）+ 岛状态同步。"""
@@ -1039,7 +1274,8 @@ class OverlayShell(QObject):
         # （slingshot_enabled 热读，设置页即改即生效）
         self.overlay.slingshot.config = self._config
         from .sprite_menu_facade import build_sprite_full_menu
-        self.overlay._full_menu_builder = lambda: build_sprite_full_menu(self)
+        self.overlay._full_menu_builder = (
+            lambda target: build_sprite_full_menu(self, target))
         self.overlay._through_changed = self._on_user_through_changed
         self.overlay._grab_finished_cb = self._on_grab_finished
         self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)

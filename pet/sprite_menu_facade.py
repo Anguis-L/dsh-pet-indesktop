@@ -15,7 +15,11 @@ spawn/黄金回旋/edge_probe 等未接外围不展示——与纯桌宠版隐�
     ───
     回到右下角 / 窗口置顶 / 不移动 / 鼠标穿透 / 开机自启 / 隐藏桌宠
     ───
-    桌宠设置 / 退出
+    桌宠设置 / 退出这只（多宠时） / 退出
+
+4.2c D13：菜单作用对象 = 右键命中的那一只（``sprite`` 参数）。设置入口按它
+自己的 config 身份传 ``--instance``（子肥鱼 = slot-N），「退出这只」直接接
+``OverlayShell.exit_pet(sprite)``——主宠退出时由壳负责提升列表首只子宠。
 """
 from __future__ import annotations
 
@@ -40,10 +44,20 @@ from .context_menus.shared import add_action as _add_action
 
 
 class SpriteMenuFacade:
-    """context_menus 建造器的 pet 形适配面（duck-typed，非 PetWindow 子类）。"""
+    """context_menus 建造器的 pet 形适配面（duck-typed，非 PetWindow 子类）。
 
-    def __init__(self, shell) -> None:
+    ``sprite`` = 本次菜单的作用对象（4.2c D13）：右键命中的是哪一只，菜单里的
+    设置入口与「退出这只」就作用在哪一只。不给 = 主 sprite（兼容既有调用面）。
+    """
+
+    def __init__(self, shell, sprite=None) -> None:
         self._shell = shell
+        self._sprite = sprite
+
+    @property
+    def sprite(self):
+        """菜单作用对象（默认主 sprite）。"""
+        return self._shell.sprite if self._sprite is None else self._sprite
 
     # ---------------------------------------------------------------- 基础属性
     @property
@@ -157,10 +171,12 @@ class SpriteMenuFacade:
         self._shell.clear_spawned_pets()
 
     def on_open_settings(self) -> None:
-        app_shell = getattr(self._shell._instance, "shell", None)
-        opener = getattr(app_shell, "open_settings_process", None)
-        if callable(opener):
-            opener(self._shell._instance)
+        """打开设置页（D13：按被点 sprite 的 config 身份传给独立设置进程）。"""
+        self._shell.open_settings_for(self.sprite)
+
+    def on_exit_pet(self) -> None:
+        """「退出这只」：退掉菜单作用对象（主宠退出则提升列表首只子宠为主）。"""
+        self._shell.exit_pet(self.sprite)
 
     def close(self) -> None:
         self._shell.app.quit()
@@ -169,9 +185,13 @@ class SpriteMenuFacade:
         self.close()
 
 
-def build_sprite_full_menu(shell) -> QMenu:
-    """overlay 全量右键菜单（窗口能力子集，组合对齐 legacy 布局相关段）。"""
-    facade = SpriteMenuFacade(shell)
+def build_sprite_full_menu(shell, sprite=None) -> QMenu:
+    """overlay 全量右键菜单（窗口能力子集，组合对齐 legacy 布局相关段）。
+
+    ``sprite`` = 被点中的那一条（4.2c D13 由 ``ShellOverlayWindow.contextMenuEvent``
+    透传）；动作面里作用于"某一只"的入口（桌宠设置 / 退出这只）按它路由。
+    """
+    facade = SpriteMenuFacade(shell, sprite)
     menu = QMenu()
     build_animation_categories(menu, facade, icons=False)
     build_speed_menu(menu, facade, icons=False)
@@ -189,6 +209,11 @@ def build_sprite_full_menu(shell) -> QMenu:
     menu.addSeparator()
     _add_action(menu, "桌宠设置", None, facade.on_open_settings,
                 close_on_trigger=True)
+    # 「退出这只」只在多宠时出现（legacy parity：单窗 flag 关时不注入该入口，
+    # 只有 app.quit 语义的「退出」）——没有子肥鱼时它等价于「退出」，不重复列出
+    if getattr(shell, "_spawned", None):
+        _add_action(menu, "退出这只", None, facade.on_exit_pet,
+                    close_on_trigger=True)
     add_quit(menu, facade, icons=False)
     # F5 教训：facade 与菜单同寿命（wrapper 回收后回调命中失效引用）
     menu._facade = facade
