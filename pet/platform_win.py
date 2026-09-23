@@ -183,8 +183,13 @@ def _fs_user_busy_state() -> tuple[bool, int]:
         hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
         if hr != 0:  # S_OK
             return False, -1
-        # 2=QUNS_BUSY(全屏应用运行中) 3=QUNS_RUNNING_D3D_FULL_SCREEN 4=QUNS_PRESENTATION_MODE
-        return state.value in (2, 3, 4), state.value
+        # 3=QUNS_RUNNING_D3D_FULL_SCREEN 4=QUNS_PRESENTATION_MODE——只认这两个
+        # 无歧义「真全屏应用」信号。QUNS_BUSY(2) 不收：Win11 下它对任意全屏
+        # 置顶窗（包括本进程自己的 overlay 合成窗）都会报 BUSY——overlay 可见
+        # → BUSY=2 → 判全屏 → 隐藏 → BUSY 消退 → 显示 → BUSY=2……实机抓到
+        # 1Hz 自激频闪（2026-09-23，soak 日志逐秒翻转 64 次）。真全屏游戏/
+        # 视频仍由 QUNS=3 或几何判定（覆盖整屏+无标题栏/置顶）覆盖，不损失。
+        return state.value in (3, 4), state.value
     except Exception:
         return False, -1
 

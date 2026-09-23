@@ -237,6 +237,9 @@ class ShellOverlayWindow(OverlayWindow):
         self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        import logging
+        logging.info("overlay: mousePress button=%s pos=%s",
+                     event.button(), event.position())  # 实机右键归因（临诊）
         self._press_pos = event.position()
         super().mousePressEvent(event)
         if (self._mouse_grab is not None and self.edge_probe is not None
@@ -295,6 +298,10 @@ class ShellOverlayWindow(OverlayWindow):
         config 身份打开（否则右击子肥鱼的「桌宠设置」会静默打开主宠配置）。
         """
         builder = getattr(self, "_full_menu_builder", None)
+        import logging
+        logging.info("overlay: contextMenu pos=%s builder=%s target=%s",
+                     event.pos(), builder is not None,
+                     self.sprite_at(event.pos()) is not None)  # 实机右键不出菜单归因（临诊）
         if builder is None:
             super().contextMenuEvent(event)
             return
@@ -1197,8 +1204,16 @@ class OverlayShell(QObject):
         一并 pause，恢复时 resume——legacy 的 ``host.hide()`` 走自定义 hide →
         ``_pause_activity`` 正是这条链。
         """
-        logging.info("overlay: 全屏状态变化 hit=%s auto_hidden=%s",
-                     hit, self._auto_hidden)
+        # 诊断留痕：探测翻转时记录判定原因（2026-09-23 实机抓到 1Hz 翻转，
+        # 无原因无法归因——probe 的 why 串本来就有，只差落日志）
+        why = ""
+        try:
+            from . import platform_win
+            why = platform_win._fg_fullscreen_probe()[1]
+        except Exception:
+            pass
+        logging.info("overlay: 全屏状态变化 hit=%s auto_hidden=%s why=%s",
+                     hit, self._auto_hidden, why)
         if hit:
             if not self._auto_hidden and self.overlay.isVisible():
                 self._auto_hidden = True
