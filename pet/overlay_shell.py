@@ -26,11 +26,14 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
-from PySide6.QtCore import QObject, QPointF, QRect
+from PySide6.QtCore import QObject, QPointF, QRect, Qt
 from PySide6.QtWidgets import QMenu, QStyle, QSystemTrayIcon
 
 from . import catalog
+from . import slot_manager
+from .overlay_peripherals import FullscreenCursorWatcher
 from .overlay_window import OverlayWindow
 from .pet_sprite import PetSprite
 from .session_watcher import install_session_watcher
@@ -137,6 +140,20 @@ class OverlayShell(QObject):
         self.overlay.add_sprite(self.sprite)
         # 位置持久化是 4.2a 的事：本刀恒按 go_default_corner 语义落右下角
         self.sprite.set_pos(self._default_corner_pos(self._bounds, self.sprite.rect()))
+        # 4.1b 窗口能力：on_top/穿透复合/全屏与光标监视/runtime 避让标记
+        self._auto_hidden = False
+        self._user_mouse_through = bool(self._config.get("mouse_through", False))
+        self._auto_cursor_hidden = False
+        self._cursor_restore_pending = False
+        self._watcher = FullscreenCursorWatcher(self)
+        self._watcher.fullscreen_changed.connect(self._on_fullscreen_changed)
+        self._watcher.cursor_visibility_changed.connect(
+            self._on_cursor_visibility_changed)
+        self.overlay._through_changed = self._on_user_through_changed
+        self.overlay._grab_finished_cb = self._on_grab_finished
+        self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)
+        self._last_marker_write = 0.0
+        self._apply_window_capabilities()
         self._build_tray()
 
     def _create_main_library(self):
@@ -183,6 +200,7 @@ class OverlayShell(QObject):
         self._started = True
         self.overlay.show()
         self.overlay.start()
+        self._sync_runtime_marker()  # D7：设置进程避让
         if self.tray is not None:
             self.tray.show()
 
@@ -191,14 +209,17 @@ class OverlayShell(QObject):
         if not self._started:
             return
         self._started = False
+        self._watcher.stop()
+        self._delete_runtime_marker()
         self.overlay.stop()
         self.overlay.close()
         if self.tray is not None:
             self.tray.hide()
 
     def _on_about_to_quit(self) -> None:
-        """退出收口：停 tick + 暂停预热（口径同旧路径 _on_about_to_quit 的
-        窗级项；位置持久化 4.2a 才接入）。"""
+        """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。"""
+        self._watcher.stop()
+        self._delete_runtime_marker()
         if self.overlay is not None:
             self.overlay.stop()
         pause = getattr(self.lib, "pause_warm", None)
@@ -214,7 +235,12 @@ class OverlayShell(QObject):
         全量托盘菜单 parity 属 4.1b/4.1c。"""
         try:
             tray = QSystemTrayIcon(self._tray_icon(), self)
+            tray.activated.connect(
+                lambda reason: self._toggle_pet_visible()
+                if reason == QSystemTrayIcon.ActivationReason.DoubleClick
+                else None)
             menu = QMenu()
+            menu.addAction("显示/隐藏桌宠", self._toggle_pet_visible)
             menu.addAction("退出", self.app.quit)
             tray.setContextMenu(menu)
             tray.setToolTip("dsh-pet (overlay)")
@@ -242,6 +268,126 @@ class OverlayShell(QObject):
         except Exception:
             pass
         return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+    # ---------------------------------------------------------------- 4.1b 窗口能力
+    def refresh_settings(self) -> None:
+        """外部配置变更应用点（AppShell._apply_external_config_change 扇出）。"""
+        self._apply_window_capabilities()
+
+    def _apply_window_capabilities(self) -> None:
+        """按当前配置应用窗口能力（4.1b parity）：on_top / 穿透复合 /
+        全屏与光标监视器门。"""
+        self.set_on_top(bool(self._config.get("on_top", True)), persist=False)
+        self._user_mouse_through = bool(self._config.get("mouse_through", False))
+        self._apply_effective_mouse_through()
+        self._watcher.set_fullscreen_enabled(
+            bool(self._config.get("auto_hide_fullscreen", True)))
+        self._watcher.set_cursor_enabled(
+            bool(self._config.get("cursor_hidden_passthrough", True)))
+
+    def set_on_top(self, on: bool, *, persist: bool = True) -> None:
+        """窗口置顶（window.py set_on_top 等价）。"""
+        on = bool(on)
+        was_visible = self.overlay.isVisible()
+        self.overlay.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        if was_visible:
+            self.overlay.show()  # setWindowFlag 重建原生窗口会先隐藏
+        if persist:
+            self._config.set("on_top", on)
+            save = getattr(self._config, "save", None)
+            if callable(save):
+                save()
+
+    def _apply_effective_mouse_through(self) -> None:
+        """有效穿透 = 用户手动穿透 OR 光标自动穿透（window.py:4204 同式）。"""
+        self.overlay.mouse_through = bool(
+            self._user_mouse_through or self._auto_cursor_hidden)
+
+    def _on_user_through_changed(self, on: bool) -> None:
+        """菜单「鼠标穿透」直写收编：记用户意愿 + 持久化 + 复合重算。"""
+        self._user_mouse_through = bool(on)
+        self._config.set("mouse_through", self._user_mouse_through)
+        save = getattr(self._config, "save", None)
+        if callable(save):
+            save()
+        self._apply_effective_mouse_through()
+
+    def _on_fullscreen_changed(self, hit: bool) -> None:
+        """全屏出现 → 隐藏；退出 → 恢复（window_screen.on_fullscreen_changed 等价）。"""
+        logging.info("overlay: 全屏状态变化 hit=%s auto_hidden=%s",
+                     hit, self._auto_hidden)
+        if hit:
+            if not self._auto_hidden and self.overlay.isVisible():
+                self._auto_hidden = True
+                self.overlay.hide()
+        elif self._auto_hidden:
+            self._auto_hidden = False
+            self.overlay.show()
+
+    def _cursor_transition_blocked(self) -> bool:
+        """拖拽进行中（window._cursor_transition_blocked 等价）。"""
+        return self.overlay._mouse_grab is not None
+
+    def _on_cursor_visibility_changed(self, visibility: str) -> None:
+        """光标隐藏（watcher 已做 0.2s 去抖）→ 自动穿透；恢复 → 解除。"""
+        if visibility == "HIDDEN":
+            if not self._cursor_transition_blocked():
+                self._auto_cursor_hidden = True
+                self._apply_effective_mouse_through()
+        elif visibility == "SHOWING":
+            if self._cursor_transition_blocked():
+                self._cursor_restore_pending = True
+            else:
+                self._cursor_restore_pending = False
+                self._auto_cursor_hidden = False
+                self._apply_effective_mouse_through()
+
+    def _on_grab_finished(self) -> None:
+        """拖拽收尾（overlay._finish_grab 钩子）：冲刷光标恢复滞留。"""
+        if self._cursor_restore_pending:
+            self._cursor_restore_pending = False
+            self._auto_cursor_hidden = False
+            self._apply_effective_mouse_through()
+
+    # ---------------------------------------------------------------- D7 设置进程避让标记
+    def _sync_runtime_marker(self) -> None:
+        """写 runtime 标记（设置进程避让读它）：主 sprite 身体框的全局几何。"""
+        try:
+            body = self.sprite.body_rect()
+            origin = self.overlay.geometry().topLeft()
+            slot_manager.write_runtime_marker(
+                self._config.dir, self._config.instance_id,
+                origin.x() + body.x(), origin.y() + body.y(),
+                body.width(), body.height(), versioned=True)
+        except Exception:
+            logging.debug("overlay: 写 runtime 标记失败", exc_info=True)
+
+    def _on_main_sprite_moved(self, _sprite) -> None:
+        now = time.monotonic()
+        if now - self._last_marker_write < 1.0:  # 1Hz 节流
+            return
+        self._last_marker_write = now
+        self._sync_runtime_marker()
+
+    def _delete_runtime_marker(self) -> None:
+        try:
+            slot_manager.delete_runtime_marker(
+                self._config.dir, self._config.instance_id)
+        except Exception:
+            logging.debug("overlay: 删 runtime 标记失败", exc_info=True)
+
+    def _toggle_pet_visible(self) -> None:
+        """托盘显隐（app.py toggle_visible 等价）+ 岛状态同步。"""
+        if self.overlay.isVisible():
+            self.overlay.hide()
+        else:
+            self.overlay.show()
+        island = getattr(getattr(self._instance, "shell", None), "island", None)
+        if island is not None:
+            try:
+                island.set_pet_visible(self.overlay.isVisible())
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- 屏事件
     def _wire_screen_signals(self) -> None:

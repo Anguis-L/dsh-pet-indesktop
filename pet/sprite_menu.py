@@ -58,7 +58,11 @@ def build_sprite_menu(overlay, sprite, *, behavior=None) -> QMenu:
     through = menu.addAction("鼠标穿透")
     through.setCheckable(True)
     through.setChecked(bool(overlay.mouse_through))
-    through.toggled.connect(lambda checked: setattr(overlay, "mouse_through", bool(checked)))
+    # 有统一直写点就走它（shell 收编为用户+自动穿透复合语义），demo 直接写字段
+    through.toggled.connect(
+        lambda checked: overlay.set_mouse_through(bool(checked))
+        if hasattr(overlay, "set_mouse_through")
+        else setattr(overlay, "mouse_through", bool(checked)))
 
     menu.addSeparator()
 

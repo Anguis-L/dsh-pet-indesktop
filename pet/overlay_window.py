@@ -314,6 +314,14 @@ class OverlayWindow(QWidget):
         painter.end()
 
     # ---------------------------------------------------------------- 命中与鼠标路由
+    def set_mouse_through(self, on: bool) -> None:
+        """用户手动穿透开关的统一直写点（菜单/集成层）；shell 可挂
+        _through_changed 回调收编为"用户穿透 + 自动穿透"的复合语义。"""
+        self.mouse_through = bool(on)
+        cb = getattr(self, "_through_changed", None)
+        if callable(cb):
+            cb(self.mouse_through)
+
     def sprite_at(self, local_pos: QPoint | QPointF):
         """逐像素联合命中：z-order 顶层往下，矩形粗筛 + alpha 细判。
 
@@ -396,6 +404,9 @@ class OverlayWindow(QWidget):
             self._input_controller.set_drag_active(False)
         if grab is not None:
             grab.on_release(position)
+        cb = getattr(self, "_grab_finished_cb", None)
+        if callable(cb):
+            cb()  # 4.1b：shell 冲刷光标恢复滞留等拖拽后状态
 
     def _check_stale_press(self) -> None:
         """V-7 拖拽看门狗：release 事件丢失（alt-tab/弹窗抢 grab/屏拔除）

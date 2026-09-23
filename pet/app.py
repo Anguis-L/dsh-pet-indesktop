@@ -1404,6 +1404,11 @@ class AppShell:
             win = getattr(inst, "win", None)
             if win is not None:
                 win.refresh_pet_settings()
+        overlay_shell = getattr(self, "_overlay_shell", None)
+        if overlay_shell is not None:
+            refresh = getattr(overlay_shell, "refresh_settings", None)
+            if callable(refresh):
+                refresh()  # overlay 拓扑的窗口能力重应用（4.1b）
         self._sync_dynamic_island()
         self._apply_balance_timer()
         # Phase 1/2：设置保存后按配置同步可选服务（todo 懒启停）与动画预热
