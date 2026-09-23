@@ -64,6 +64,7 @@ class _SpriteState:
         self.duration = 0.0               # 当前 clip 时长（秒）
         self.move_target: QPointF | None = None
         self.pending_move: dict | None = None  # 反向前先转向的移动计划
+        self.predictor = None                  # tick 创建状态时挂 PredictivePrewarm
 
 
 class BehaviorController:

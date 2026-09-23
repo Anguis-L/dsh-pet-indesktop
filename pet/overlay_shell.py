@@ -186,8 +186,10 @@ class OverlayShell(QObject):
         # DPR 由 overlay.add_sprite 按所在屏统一喂（V-11 收口，不再双喂）
         self.sprite.set_bounds(QRect(self._bounds))
         self.overlay.add_sprite(self.sprite)
-        # 位置持久化是 4.2a 的事：本刀恒按 go_default_corner 语义落右下角
-        self.sprite.set_pos(self._default_corner_pos(self._bounds, self.sprite.rect()))
+        # 4.2b：sprite 移除时注销行为状态（spawn/退出子肥鱼的清理链）
+        self.overlay.add_sprite_removed_listener(self.behavior.forget)
+        # 4.2a：按 rx/ry 比例恢复上次位置（无记录 → 默认右下角）
+        self._restore_position()
         # 4.1c 投喂（拖文件喂 sprite，命中判定与穿透同口径）
         from .sprite_feeding import SpriteFeedingController
         self._feeding = SpriteFeedingController(
@@ -279,6 +281,7 @@ class OverlayShell(QObject):
         """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。"""
         self._watcher.stop()
         self._delete_runtime_marker()
+        self.save_position()  # 4.2a：退出持久化（rx/ry/facing/scale）
         if self.overlay is not None:
             self.overlay.stop()
         pause = getattr(self.lib, "pause_warm", None)
@@ -415,6 +418,79 @@ class OverlayShell(QObject):
             self._cursor_restore_pending = False
             self._auto_cursor_hidden = False
             self._apply_effective_mouse_through()
+
+    # ---------------------------------------------------------------- 4.2a 位置持久化
+    def _restore_position(self) -> None:
+        """按"身体中心相对可用区比例"恢复位置（window_placement.restore_position
+        语义；贴边钳制由 set_pos 的 body_box 钳制收口）。"""
+        rx, ry = self._config.get("rx"), self._config.get("ry")
+        if rx is None or ry is None:
+            self.sprite.set_pos(self._default_corner_pos(
+                self._bounds, self.sprite.rect()))
+        else:
+            body = (self.sprite.body_rect() if hasattr(self.sprite, "body_rect")
+                    else self.sprite.rect())
+            bw, bh = body.width(), body.height()
+            cx = self._bounds.left() + float(rx) * self._bounds.width()
+            cy = self._bounds.top() + float(ry) * self._bounds.height()
+            off_x, off_y = body.x() - self.sprite.rect().x(), body.y() - self.sprite.rect().y()
+            self.sprite.set_pos(QPointF(cx - bw / 2 - off_x, cy - bh / 2 - off_y))
+        facing = str(self._config.get("facing", "") or "")
+        if facing in ("left", "right"):
+            self.sprite.facing = facing
+
+    def save_position(self) -> None:
+        """身体中心相对可用区比例持久化（window_placement.save_position 语义）。"""
+        if self._bounds.width() <= 0 or self._bounds.height() <= 0:
+            return
+        body = (self.sprite.body_rect() if hasattr(self.sprite, "body_rect")
+                else self.sprite.rect())
+        cx = body.x() + body.width() / 2.0
+        cy = body.y() + body.height() / 2.0
+        self._config.set("rx", (cx - self._bounds.left()) / self._bounds.width())
+        self._config.set("ry", (cy - self._bounds.top()) / self._bounds.height())
+        facing = getattr(self.sprite, "facing", None)
+        if facing in ("left", "right"):
+            self._config.set("facing", facing)
+        self._config.set("scale", float(getattr(self.sprite, "scale", 1.0) or 1.0))
+        save = getattr(self._config, "save", None)
+        if callable(save):
+            save()
+
+    # ---------------------------------------------------------------- 4.2b 多 sprite 生灭
+    def spawn_pet(self) -> None:
+        """生小肥鱼（app.py spawn_pet 进程内路径语义）：per-pet 库 + 新 sprite，
+        落位自主 sprite 向右逐级错开（重叠规避由 body 钳制兜底）。"""
+        lib = self._create_main_library()
+        scale = float(self._config.get("scale") or catalog.DEFAULT_SCALE)
+        index = len(getattr(self, "_spawned", [])) + 1
+        main_body = self.sprite.body_rect()
+        sprite = self._sprite_factory(
+            lib, QPointF(main_body.x() + main_body.width() + 24 * index,
+                         main_body.y()), scale)
+        sprite.home_screen = self._screen
+        sprite.set_bounds(QRect(self._bounds))
+        self.overlay.add_sprite(sprite)
+        if not hasattr(self, "_spawned"):
+            self._spawned: list = []
+            self._spawned_libs: dict = {}
+        self._spawned.append(sprite)
+        self._spawned_libs[sprite] = lib
+
+    def clear_spawned_pets(self) -> None:
+        """退出全部子肥鱼（app.py clear_spawned_pets 语义）：remove_sprite
+        自带 clip 释放（V-8）与行为注销（V-9 挂点），库 shutdown 收尾。"""
+        spawned = list(getattr(self, "_spawned", []) or [])
+        for sprite in spawned:
+            self.overlay.remove_sprite(sprite)
+            lib = self._spawned_libs.pop(sprite, None)
+            shutdown = getattr(lib, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    logging.exception("overlay: 子肥鱼素材库收尾失败")
+        self._spawned = []
 
     # ---------------------------------------------------------------- D7 设置进程避让标记
     def _sync_runtime_marker(self) -> None:

@@ -27,7 +27,9 @@ from .context_menus.shared import (
     add_no_move,
     add_on_top,
     add_quit,
+    add_clear_spawned_pets,
     add_return_corner,
+    add_spawn_pet,
     build_animation_categories,
     build_character_menu,
     build_speed_menu,
@@ -148,6 +150,12 @@ class SpriteMenuFacade:
     def request_switch_character(self, character_id: str) -> None:
         self._shell.switch_character(str(character_id))
 
+    def on_spawn_pet(self) -> None:
+        self._shell.spawn_pet()
+
+    def on_clear_spawned_pets(self) -> None:
+        self._shell.clear_spawned_pets()
+
     def on_open_settings(self) -> None:
         app_shell = getattr(self._shell._instance, "shell", None)
         opener = getattr(app_shell, "open_settings_process", None)
@@ -175,6 +183,8 @@ def build_sprite_full_menu(shell) -> QMenu:
     add_no_move(menu, facade, icons=False)
     add_mouse_through(menu, facade, icons=False)
     add_autostart(menu, facade, icons=False)
+    add_spawn_pet(menu, facade)
+    add_clear_spawned_pets(menu, facade, icons=False)
     add_hide_pet(menu, facade, icons=False)
     menu.addSeparator()
     _add_action(menu, "桌宠设置", None, facade.on_open_settings,
