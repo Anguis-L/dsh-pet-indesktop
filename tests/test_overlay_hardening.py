@@ -8,7 +8,10 @@
 - V-9  _cats_cache 弱键（库销毁自动回收）；
 - V-10 scale property（置脏/重钳/上报）；
 - V-12 closeEvent 停 tick timer；
-- V-13 拖拽中被非左键打断 → 合成 release 收尾。
+- V-13 拖拽中被非左键打断 → 合成 release 收尾。**弹弓刀调和**：右键在
+  ``slingshot_enabled`` 为真时改为「进蓄力瞄准」（不再合成 release），
+  其余非左键（中键等）与弹弓关闭时维持原语义——瞄准有明确退出路径
+  （松左键发射 / Esc / 再点右键取消 / 左键丢失看门狗），不会卡 drag 态。
 
 纪律（AGENTS.md 时序测试）：同步直调 handler，不 sleep 赌时序；
 素材用纯 QImage 假 clip。
@@ -26,7 +29,7 @@ from PySide6.QtGui import QCloseEvent, QImage, QMouseEvent, QRegion
 from PySide6.QtWidgets import QApplication
 
 from pet.overlay_window import OverlayWindow
-from pet.pet_sprite import PetSprite
+from pet.pet_sprite import INTERACTION_DRAG, INTERACTION_NORMAL, PetSprite
 from pet.sprite_behavior import BehaviorController
 
 app = QApplication.instance() or QApplication([])
@@ -208,19 +211,100 @@ def test_close_event_stops_tick_timer():
     assert not overlay._timer.isActive()
 
 
-# ---------------------------------------------------------------- V-13
+# ---------------------------------------------------------------- V-13（弹弓刀调和）
+class FakeSlingshotConfig:
+    """最小 config 替身：controller 只依赖 get(key, default)。"""
+
+    def __init__(self, enabled):
+        self.enabled = bool(enabled)
+
+    def get(self, key, default=None):
+        if key == "slingshot_enabled":
+            return self.enabled
+        return default
+
+
+def _make_hittable_sprite(pos=QPointF(100, 100), scale=0.5):
+    """整幅不透明的 sprite（sprite_at 逐像素命中需要 alpha >= 阈值）。"""
+    clip = FakeClip()
+    clip.image.fill(0xFF336699)
+    sprite = PetSprite(FakeLibrary(clip), pos=pos, scale=scale)
+    sprite.bind_clip("idle")
+    sprite._rebuild_pixmap()
+    return sprite
+
+
+def _press(overlay, pos, button, buttons):
+    point = QPointF(pos) if isinstance(pos, QPoint) else QPointF(float(pos[0]), float(pos[1]))
+    overlay.mousePressEvent(QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress, point, point,
+        button, buttons, Qt.KeyboardModifier.NoModifier))
+
+
+def _drag_once(overlay, sprite):
+    """左键按下并移动一次（真实拖拽态），返回移动后的光标点。"""
+    hit = QPoint(sprite.rect().center())
+    _press(overlay, hit, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+    assert overlay._mouse_grab is sprite
+    moved = QPoint(hit.x() + 20, hit.y())
+    overlay.mouseMoveEvent(QMouseEvent(
+        QMouseEvent.Type.MouseMove, QPointF(moved), QPointF(moved),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    return moved
+
+
 def test_non_left_press_during_grab_synthesizes_release():
+    """中键等非左键（非右键）：V-13 原语义不变——合成 release 收尾。"""
     overlay = OverlayWindow()
     grab = FakeGrab()
     overlay._mouse_grab = grab
     overlay._press_global = QPoint(5, 5)
-    event = QMouseEvent(
-        QMouseEvent.Type.MouseButtonPress, QPointF(10, 10), QPointF(10, 10),
-        Qt.MouseButton.RightButton, Qt.MouseButton.RightButton,
-        Qt.KeyboardModifier.NoModifier)
-
-    overlay.mousePressEvent(event)
+    _press(overlay, (10, 10), Qt.MouseButton.MiddleButton,
+           Qt.MouseButton.MiddleButton)
 
     assert overlay._mouse_grab is None
     assert overlay._press_global is None
     assert grab.released is True
+    assert overlay.slingshot.aiming is False
+
+
+def test_right_press_during_grab_enters_slingshot_instead_of_release():
+    """右键在拖拽中 = 进蓄力瞄准（slingshot_enabled 热读为真），不合成 release。
+
+    为什么允许偏离 V-13：右键若继续走合成 release，弹弓就没有入口。瞄准
+    本身有明确退出路径（松左键发射 / Esc / 再点右键取消 / 左键丢失看门狗），
+    sprite 全程留在 drag 等价态（免积分/无限质量），不会卡在无人收尾的态上。
+    """
+    overlay = OverlayWindow()
+    sprite = _make_hittable_sprite()
+    overlay.add_sprite(sprite)
+    moved = _drag_once(overlay, sprite)
+    anchored = QPointF(sprite.pos)
+
+    _press(overlay, moved, Qt.MouseButton.RightButton,
+           Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton)
+
+    assert overlay.slingshot.aiming is True
+    assert overlay._mouse_grab is sprite                 # 没被 V-13 收尾放下
+    assert overlay._press_global is not None             # 左键仍按住
+    assert sprite.pos == anchored                        # sprite 定锚不动
+    assert sprite.interaction_state == INTERACTION_DRAG   # drag 等价态（免推进）
+    assert sprite.velocity == QPointF(0, 0)
+
+
+def test_right_press_keeps_v13_release_when_slingshot_disabled():
+    """config 关闭弹弓：右键回到 V-13 合成 release（热读，无需重建 controller）。"""
+    overlay = OverlayWindow()
+    overlay.slingshot.config = FakeSlingshotConfig(False)
+    sprite = _make_hittable_sprite()
+    overlay.add_sprite(sprite)
+    moved = _drag_once(overlay, sprite)
+
+    _press(overlay, moved, Qt.MouseButton.RightButton,
+           Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton)
+
+    assert overlay.slingshot.aiming is False
+    assert overlay._mouse_grab is None                   # V-13 合成 release 收尾
+    assert overlay._press_global is None
+    assert sprite.interaction_state == INTERACTION_NORMAL

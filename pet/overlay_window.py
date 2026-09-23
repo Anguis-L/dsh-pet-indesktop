@@ -23,17 +23,26 @@ Phase 4 M-2：仿真推进（行为/碰撞/抛掷物理）与 tick 时钟、M-1 
 「advance → 脏矩形 → 位置监听 fanout → update」段（``tick_advance``）与
 绘制/命中/鼠标路由。``start``/``stop``/``_on_tick``/``_note_kinetic`` 等旧属性面
 保留为转发（deprecation shim，见各自 docstring）。
+
+弹弓蓄力瞄准（sprite 世界移植，见 pet/sprite_slingshot.py）：
+拖拽中右键 = 进瞄准（``slingshot_enabled`` 热读），移动调拉拽矢量，
+松左键发射，Esc / 再点右键取消；瞄准期绘制橡皮带 + 轨迹预览。这要求
+调和 V-13（原先「拖拽中收到任何非左键 press → 合成 release 收尾」）：
+右键在拖拽中被弹弓消费时**不**合成 release——瞄准有明确退出路径
+（松左键发射 / Esc / 再点右键取消 / 左键丢失看门狗），不会卡 drag 态；
+其余非左键（中键等）与 ``slingshot_enabled`` 关闭时维持 V-13 原语义。
 """
 
 from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QCursor, QPainter, QRegion, QScreen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .sprite_menu import build_sprite_menu
+from .sprite_slingshot import SlingshotController
 from .tick_driver import TickDriver
 
 if sys.platform == "win32":
@@ -60,6 +69,22 @@ class OverlayWindow(QWidget):
 
         self.sprites: list = []
         self._mouse_grab = None
+        # 弹弓蓄力瞄准（sprite 世界移植）：会话/数学/瞄准 UI 都在控制器里，
+        # overlay 只负责事件调和与脏区刷新。壳层接线：把产品 config 交给它
+        # （``overlay.slingshot.config = instance.config``）或整体替换本属性，
+        # 见交付报告「壳层接线清单」。未接 config 时 enabled 取产品默认 True。
+        self.slingshot = SlingshotController()
+        # 瞄准 UI 上一次画出的外接矩形（QRegion）：取消/发射后连同新状态一起
+        # 局部重绘，保证零残留（不整屏 repaint）。
+        self._slingshot_dirty = QRegion()
+        # 右键菜单一次性抑制（旧 window.py:2994/3589 同语义）：弹弓消费了右键
+        # press 后，随之而来的 ContextMenu 事件必须丢弃（见 event()）。
+        self._context_menu_suppressed = False
+        # 键盘焦点：Esc 取消瞄准需要 widget 拿得到键盘焦点（旧 PetWindow:549
+        # 同款 StrongFocus）。overlay 是防抢焦点窗口（Windows
+        # WS_EX_NOACTIVATE），生产路径通常拿不到焦点——壳层全局 Esc 兜底见
+        # 交付报告清单；本类不主动 setFocus（绝不抢用户前台焦点）。
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # sprite 位置监听（Phase 3b）：sprite -> [cb]，tick 推进后 rect 发生
         # 变化的 sprite 触发其 listeners（cb(sprite)）；外围小窗（气泡等）的
         # 跟随源——sprite 不是窗口，没有 moveEvent 可挂。
@@ -326,6 +351,11 @@ class OverlayWindow(QWidget):
         """
         if sprite not in self.sprites:
             return
+        if self.slingshot.sprite is sprite:
+            # 被瞄准的 sprite 被移除 = 锚点消失：就地收掉瞄准会话
+            # （否则 UI 会拿一个已移除对象的几何继续绘制）
+            self.slingshot.cancel()
+            self._refresh_slingshot_visual()
         self.sprites.remove(sprite)
         self._position_listeners.pop(sprite, None)
         sprite._dirty_cb = None
@@ -418,6 +448,7 @@ class OverlayWindow(QWidget):
         for sprite in self.sprites:  # 列表序 = z-order：先画底层，尾部最上
             if region.intersects(sprite.rect()):
                 sprite.paint(painter)
+        self._paint_slingshot(painter)  # 瞄准 UI 层（橡皮带 + 轨迹预览，最上）
         painter.end()
 
     # ---------------------------------------------------------------- 命中与鼠标路由
@@ -452,6 +483,11 @@ class OverlayWindow(QWidget):
 
     def contextMenuEvent(self, event) -> None:
         """右键菜单（Phase 3a）：命中 sprite 弹最小集菜单；未命中忽略。"""
+        if self._context_menu_blocked():
+            # 弹弓消费的右键 / 瞄准会话中：不弹菜单（正常 Qt 路径已在
+            # event() 拦下，这里兜底直调路径）
+            event.ignore()
+            return
         self._note_kinetic()  # M-1：输入事件同步升档
         target = self.sprite_at(event.pos())
         if target is None:
@@ -465,14 +501,33 @@ class OverlayWindow(QWidget):
     def mousePressEvent(self, event) -> None:
         self._note_kinetic()  # M-1：输入事件同步升档
         if event.button() != Qt.MouseButton.LeftButton:
-            # V-13：左键拖拽中被其它键打断——先合成 release 收尾，否则
-            # sprite 卡 drag 态（behavior 跳过、velocity 已清零）直到下次按下
+            if (event.button() == Qt.MouseButton.RightButton
+                    and (self._mouse_grab is not None or self.slingshot.aiming)
+                    and not self.mouse_through
+                    and self._consume_right_press_for_slingshot(event)):
+                # V-13 调和（弹弓刀）：拖拽中点右键 = 进蓄力瞄准 / 取消瞄准
+                # （slingshot_enabled 热读为真时）。这里**不**合成 release：
+                # 瞄准有明确退出路径（松左键发射 / Esc / 再点右键取消 / 左键
+                # 丢失看门狗），不会把 sprite 卡在 drag 态，也不会把拖拽丢成
+                # 一次「原地放下」。其余非左键（中键/侧键）与
+                # slingshot_enabled 关闭时，下方 V-13 合成 release 原样保留。
+                # 断言与理由见 tests/test_overlay_hardening.py V-13 段落。
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                # 未被弹弓消费的右键 = 正经的菜单手势：清掉上一次的抑制旗标
+                # （旧 window.py:3224-3225 同语义），否则菜单会被误吞一次
+                self._context_menu_suppressed = False
             if self._mouse_grab is not None:
                 self._finish_grab(event.position())
             # 只有左键进拖拽 grab——右键语义是弹菜单（contextMenuEvent），
             # 若进 grab，松手会被当成一次"原地放下"的拖拽（PetWindow 旧语义）
             event.ignore()
             return
+        if self.slingshot.aiming:
+            # 防御：瞄准中又收到左键 press（多点设备/事件序列丢失）= 会话已
+            # 失效，先收会话再走正常 grab，绝不留下无按压源的瞄准态。
+            self._cancel_slingshot(resume_drag=False)
         target = self.sprite_at(event.position())
         if target is None:
             self._mouse_grab = None
@@ -486,6 +541,13 @@ class OverlayWindow(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
+        if self.slingshot.aiming:
+            # 瞄准中：move 只更新拉拽矢量，sprite 定锚不动（不走 on_move）
+            self._note_kinetic()  # M-1：瞄准移动保持 T0
+            self.slingshot.update_pull(event.position())
+            self._refresh_slingshot_visual()
+            event.accept()
+            return
         if self._mouse_grab is None:
             event.ignore()
             return
@@ -496,6 +558,15 @@ class OverlayWindow(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         self._note_kinetic()  # M-1：松手（甩出判定）同步升档
+        if self.slingshot.aiming:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._fire_slingshot(event.position())
+                event.accept()
+                return
+            # 右键/其它键松手：瞄准继续（左键仍按住）。右键的取消手势在
+            # press 侧（"再点右键取消"），press+release 不能互相抵消。
+            event.accept()
+            return
         grab = self._mouse_grab
         self._finish_grab(event.position())
         if grab is None:
@@ -503,13 +574,51 @@ class OverlayWindow(QWidget):
             return
         event.accept()
 
-    def _finish_grab(self, position) -> None:
-        """收尾当前拖拽 grab（release/打断/看门狗共用）。"""
+    def keyPressEvent(self, event) -> None:
+        """Esc 取消瞄准（旧 window.py:3601-3605 语义）。
+
+        焦点口径：overlay 通常拿不到键盘焦点（防抢焦点窗口），本处理器在
+        overlay 确有焦点时直接生效；生产路径的 Esc 兜底（全局钩子）由壳层
+        负责，见交付报告「壳层接线清单」。
+        """
+        if event.key() == Qt.Key.Key_Escape and self.slingshot.aiming:
+            self._cancel_slingshot(resume_drag=False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def event(self, event) -> bool:  # noqa: N802 (Qt 命名)
+        """Qt 事件入口：丢弃弹弓消费右键后随之而来的右键菜单。
+
+        子类（ShellOverlayWindow）覆写 ``contextMenuEvent`` 且不走 super()，
+        只在 contextMenuEvent 里判旗标挡不住产品路径；本钩子在 Qt 分发
+        ContextMenu 之前拦下——同一次右键的 press 处理必然先于 ContextMenu。
+        """
+        if (event.type() == QEvent.Type.ContextMenu
+                and self._context_menu_blocked()):
+            event.ignore()
+            return True
+        return super().event(event)
+
+    def _context_menu_blocked(self) -> bool:
+        """是否抑制右键菜单：弹弓消费过右键，或正处于瞄准会话。"""
+        if self._context_menu_suppressed:
+            self._context_menu_suppressed = False
+            return True
+        return self.slingshot.aiming
+
+    def _finish_grab(self, position, *, forward: bool = True) -> None:
+        """收尾当前拖拽 grab（release/打断/看门狗共用）。
+
+        ``forward=False``：只清 overlay 侧 grab 状态与子类回调，不再把
+        位置转发给 sprite——弹弓发射/取消已按自己的协议在控制器里收尾
+        （on_release 的语义与弹射结果冲突，转发会把初速覆盖回拖拽估算值）。
+        """
         grab, self._mouse_grab = self._mouse_grab, None
         self._press_global = None
         if self._input_controller is not None:
             self._input_controller.set_drag_active(False)
-        if grab is not None:
+        if grab is not None and forward:
             grab.on_release(position)
         cb = getattr(self, "_grab_finished_cb", None)
         if callable(cb):
@@ -523,4 +632,74 @@ class OverlayWindow(QWidget):
             return
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
             return
+        if self.slingshot.aiming and self._cancel_slingshot(resume_drag=False):
+            # 瞄准会话的按压源（左键）已消失且 release 没到：收会话回锚点
+            # （不发射），grab 收尾已在 _cancel_slingshot 内完成。
+            return
         self._finish_grab(QPointF(self.mapFromGlobal(QCursor.pos())))
+
+    # ---------------------------------------------------------------- 弹弓会话（事件侧调和）
+    def _consume_right_press_for_slingshot(self, event) -> bool:
+        """右键 press 交给弹弓：进瞄准或取消瞄准；返回是否被消费。
+
+        消费成功即刷新脏区 + 抑制随之而来的右键菜单 + 作废子类的
+        点击/拖拽判别状态（``ShellOverlayWindow._press_pos``：右键 press
+        会覆写它，若不清理，随后的左键松手会被壳层判成一次单击）。
+        """
+        if not self.slingshot.maybe_enter_on_right_press(
+                self._mouse_grab, event.position()):
+            return False
+        self._context_menu_suppressed = True
+        self._invalidate_press_discriminator()
+        self._refresh_slingshot_visual()
+        return True
+
+    def _fire_slingshot(self, position) -> bool:
+        """松左键：发射（或拉拽不足回锚点），并结束本次 grab。"""
+        fired = self.slingshot.fire(position)
+        self._finish_grab(position, forward=False)
+        self._invalidate_press_discriminator()
+        self._refresh_slingshot_visual()
+        return fired
+
+    def _cancel_slingshot(self, *, resume_drag: bool) -> bool:
+        """取消瞄准：``resume_drag=False`` 回锚点并结束 grab（Esc / 看门狗）；
+        ``True`` 就地恢复拖拽、grab 继续（再点右键）。"""
+        if not self.slingshot.cancel(resume_drag=resume_drag):
+            return False
+        self._invalidate_press_discriminator()
+        if not resume_drag:
+            self._finish_grab(None, forward=False)
+        self._refresh_slingshot_visual()
+        return True
+
+    def _invalidate_press_discriminator(self) -> None:
+        """作废子类（ShellOverlayWindow）的单击/拖拽判别状态。
+
+        壳层在 mousePressEvent 里记录 ``_press_pos``、在 mouseReleaseEvent
+        里据它区分单击 vs 拖拽；弹弓消费掉的 press/release 会让这套判别
+        错位（右键进瞄准后松左键会被当成一次原地单击 → 误触点击反馈/音效）。
+        基类在此清空该字段；壳层改用 ``overlay.slingshot.aiming`` 判定后
+        本兜底可移除。裸 OverlayWindow 无此字段，调用即 no-op。
+        """
+        if "_press_pos" in self.__dict__:
+            self.__dict__["_press_pos"] = None
+
+    def _paint_slingshot(self, painter: QPainter) -> bool:
+        """瞄准 UI 绘制挂点（橡皮带 + 轨迹预览）。只在瞄准期间有内容。"""
+        return self.slingshot.paint(painter)
+
+    def _refresh_slingshot_visual(self) -> None:
+        """按脏区通道刷新瞄准 UI：新旧区域合并后局部 update。
+
+        走 overlay 既有 update(QRegion) 通道（与 sprite 脏上报同一路），
+        不整屏 repaint；区域取 ``visual_region``（带宽 + 每个轨迹点的小方框，
+        不是外接大矩形——预测弧能横跨大半屏，按外包框重绘会白刷几十个百分点
+        的像素）。取消/发射后当前区域为空，旧区域这一笔负责把残留的带/点
+        擦干净。
+        """
+        current = self.slingshot.visual_region(self.rect())
+        dirty = current | self._slingshot_dirty
+        self._slingshot_dirty = current
+        if not dirty.isEmpty():
+            self.update(dirty)
