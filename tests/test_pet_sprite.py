@@ -42,6 +42,8 @@ class FakeClip(QObject):
         self.image.fill(0xFF336699)
         self.start_count = 0
         self.stop_count = 0
+        self.jump_count = 0
+        self.events: list[str] = []
         self.accept_start = accept_start
         self.start_returns_none = start_returns_none
         self.playback_speed = 1.0
@@ -61,6 +63,7 @@ class FakeClip(QObject):
 
     def start(self):
         self.start_count += 1
+        self.events.append("start")
         if self.start_returns_none:
             return None
         return bool(self.accept_start)
@@ -69,6 +72,8 @@ class FakeClip(QObject):
         self.stop_count += 1
 
     def jumpToFrame(self, _index):
+        self.jump_count += 1
+        self.events.append("jump")
         return True
 
     def set_playback_speed(self, speed):
@@ -123,8 +128,27 @@ def test_restart_clip_starts_current_clip_again():
 
     assert sprite.restart_clip() is True
 
-    assert clip.start_count == 2            # 原地续播（走 clip 自身的 re-arm）
-    assert clip.stop_count == 0             # 不经过 stop：软停驻留留给 start 处理
+    assert clip.start_count == 2            # 原地续播
+    # 必须先 jumpToFrame(0) 再 start（旧机 _restart_current_clip 序列）：
+    # WebM 软停续圈的前提 _soft_parked 只在 stop() 里置位，jumpToFrame 内部
+    # 走 stop()；只 start 会落 fresh start——换代、退役 reader、每圈新起
+    # ffmpeg（实跑实证 gen 1->2 retired=1，旧机序列 1->1 retired=0）。
+    assert clip.events[-2:] == ["jump", "start"]
+
+
+def test_restart_clip_invalidates_frame_signature():
+    """M2：restart 作废帧签名——否则 start 归帧号 0 后第一次重建会用
+    「帧号 0 + 旧末帧图」记签名，真帧 0 到货被快路径吞掉（每圈吞一帧）。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    sprite.bind_clip("walk")
+    sprite._rebuild_pixmap()  # 让签名挂上当前帧
+    assert sprite._frame_sig is not None
+
+    assert sprite.restart_clip() is True
+
+    assert sprite._frame_sig is None
+    assert sprite._rebuild_pixmap() is True  # 签名作废后必重建（不再吞帧）
 
 
 def test_restart_clip_without_clip_returns_false():

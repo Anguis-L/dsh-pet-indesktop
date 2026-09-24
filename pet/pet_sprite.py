@@ -574,12 +574,19 @@ class PetSprite(QObject):
     def restart_clip(self) -> bool:
         """原地续播当前 clip（圈末 re-arm，F2）；返回是否被接受。
 
-        只调 ``clip.start()``：WebMClip 的 start 自身处理「圈末软停 → re-arm
-        续圈」，未驻留时走 fresh start 并复位 _ended_fired（webm_clip.py:
-        1521-1567，故下一圈仍会发 finished）；帧序列 clip 的 start 自带
-        ``_cur = 0`` 回首帧（frameseq_clip.py:201-226）。旧机
-        _restart_current_clip 里额外的 jumpToFrame(0) 与 _ended_fired 复位在
-        这两条 start 路径里已各自完成，这里不重复（避免二次解码）。
+        走旧机 ``_restart_current_clip`` 的序列（window.py:1809-1828）：先
+        ``jumpToFrame(0)`` 再 ``start()``——WebMClip 的软停续圈前提
+        ``_soft_parked`` 只在 ``stop()`` 里置位（webm_clip.py:1594-1627），
+        而 ``jumpToFrame`` 内部会走 ``stop()``（webm_clip.py:1756-1757）；
+        只调 ``start()`` 会落 fresh start：换代、退役 reader、每圈新起一个
+        ffmpeg（实跑实证：gen 1->2 retired=1，旧机序列 gen 1->1 retired=0）。
+        帧序列 clip 的 ``jumpToFrame(0)`` 是同步取首帧，同样有益。
+
+        同时作废帧签名（M2）：``start`` 把帧号归 0 但 frameseq 的 start 不清
+        显示槽（修复 1），留着旧签名会让第一次重建用「帧号 0 + 旧末帧图」
+        记下签名，真帧 0 到货时被快路径吞掉——每圈首帧缺一帧（实跑实证：
+        rebuild=False 且 awaiting=-1）。
+
         ``False`` = 起播被拒，调用方按各自场景降级（旧机同契约）。
         """
         clip = self._clip
@@ -588,6 +595,11 @@ class PetSprite(QObject):
         start = getattr(clip, "start", None)
         if not callable(start):
             return False
+        jump = getattr(clip, "jumpToFrame", None)
+        if callable(jump):
+            jump(0)
+        self._frame_sig = None
+        self._frame_dirty = True
         return start() is not False
 
     def _on_clip_finished(self) -> None:

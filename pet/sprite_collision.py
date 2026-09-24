@@ -36,6 +36,7 @@ rect()/interaction_state/dragging/scale），纯逻辑可脱离 QApplication 单
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Sequence, Tuple
 
@@ -82,6 +83,11 @@ CONTACT_DV_FLOOR = 50.0     # 已 thrown 成员继续吸收冲量的下限 (px/s
 
 # 纯位置分离去抖窗口（对齐旧协调者 tick 的 15 tick 去抖）
 SEPARATION_DEBOUNCE_TICKS = 15
+# 静态成员速度时效（秒）：岛速只在几何事件回调里刷新，岛停下后不会再有
+# 回调——超过该时长未刷新的速度样本按 0 处理（防「幽灵速度」把贴到静止
+# 岛上的桌宠拍进 THROWN）。取值≈拖拽手势的采样间隙上界，远小于人的
+# 「按住停顿」体感（0.15s ≈ 25 tick@T0）。
+STATIC_VELOCITY_TTL_SECS = 0.15
 
 # 静态成员支撑落定（"落在岛上"= 落地）：抛掷物理的 is_at_rest 只认屏幕地板
 # （pet/physics.is_at_rest 的 bottom 判据），被岛托住的 thrown 永远满足不了
@@ -155,10 +161,13 @@ class SpriteCollisionWorld:
         self._support_streak: Dict[str, int] = {}
         # 静态成员（灵动岛预留）：member_id -> (left, top, width, height)
         self._static_members: Dict[str, Tuple[float, float, float, float]] = {}
-        # 静态成员速度（岛速通道）：member_id -> (vx, vy)。无限质量的静态体
-        # 不参与位置积分，但速度要参与求解器的相对法向速度——岛速恒 0 时
-        # 拖岛撞宠只有位置分离（平推），传真实岛速才有冲量弹开。写速度与
-        # 写几何一样经 add_static_member 打脏 _static_dirty（静止豁免被唤醒）。
+        # 静态成员速度（岛速通道）：member_id -> (vx, vy, 写入时刻 monotonic)。
+        # 无限质量的静态体不参与位置积分，但速度要参与求解器的相对法向速度——
+        # 岛速恒 0 时拖岛撞宠只有位置分离（平推），传真实岛速才有冲量弹开。
+        # 写速度与写几何一样经 add_static_member 打脏 _static_dirty（静止豁免
+        # 被唤醒）。时刻用于时效过期：岛速只在几何回调里刷新，「按住不动」
+        # （零回调）或松手样本落进桥侧死区时旧速度会残留——静止的岛把贴上
+        # 来的桌宠拍进 THROWN 的「幽灵速度」通道，过期是最后一道闸。
         self._static_member_velocity: Dict[str, Tuple[float, float]] = {}
         self._listeners: List[Callable[[CollisionEvent], None]] = []
         # 静态成员自定义圆链（岛 stadium 口径，member_id -> circles）
@@ -185,7 +194,8 @@ class SpriteCollisionWorld:
         """
         self._static_members[str(member_id)] = (
             float(left), float(top), float(width), float(height))
-        self._static_member_velocity[str(member_id)] = (float(vx), float(vy))
+        self._static_member_velocity[str(member_id)] = (
+            float(vx), float(vy), time.monotonic())
         if circles is not None:
             self._static_member_circles[str(member_id)] = [
                 [float(c[0]), float(c[1]), float(c[2])] for c in circles]
@@ -353,7 +363,11 @@ class SpriteCollisionWorld:
     def _static_member_state(self, member_id: str,
                              rect: Tuple[float, float, float, float]) -> collision.MemberState:
         left, top, w, h = rect
-        vx, vy = self._static_member_velocity.get(member_id, (0.0, 0.0))
+        vx, vy, ts = self._static_member_velocity.get(
+            member_id, (0.0, 0.0, 0.0))
+        if time.monotonic() - ts > STATIC_VELOCITY_TTL_SECS:
+            # 幽灵速度闸：速度样本超期未刷新（岛已停但无人再喂几何）→ 当 0。
+            vx, vy = 0.0, 0.0
         return collision.MemberState(
             runtime_id=member_id,
             x=left + w / 2.0,

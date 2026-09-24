@@ -141,7 +141,7 @@ def test_geometry_animation_does_not_sample_island_speed():
         world.add_collision_listener(events.append)
 
         _moving_island(bridge, clock)  # 同样的位移：动画期间必须不采样
-        assert world._static_member_velocity[ISLAND] == (0.0, 0.0)
+        assert world._static_member_velocity[ISLAND][:2] == (0.0, 0.0)
 
         world.tick([sprite], 1 / 60)
         assert events == []
@@ -163,7 +163,7 @@ def test_size_change_resets_sample_point_without_estimate():
         clock.advance(0.05)
         bridge.update_geometry(ISLAND_LEFT + 40.0, ISLAND_TOP, ISLAND_W + 60.0,
                                ISLAND_H)  # size 变了：清零 + 重置采样点
-        assert world._static_member_velocity[ISLAND] == (0.0, 0.0)
+        assert world._static_member_velocity[ISLAND][:2] == (0.0, 0.0)
     finally:
         bridge.detach()
 
@@ -195,7 +195,7 @@ def test_teleport_jump_is_not_sampled():
         bridge.update_geometry(ISLAND_LEFT, ISLAND_TOP, ISLAND_W, ISLAND_H)
         clock.advance(0.02)
         bridge.update_geometry(5000.0, ISLAND_TOP, ISLAND_W, ISLAND_H)  # 瞬移
-        assert world._static_member_velocity[ISLAND] == (0.0, 0.0)
+        assert world._static_member_velocity[ISLAND][:2] == (0.0, 0.0)
     finally:
         bridge.detach()
 
@@ -212,7 +212,7 @@ def test_overspeed_is_clamped_only_while_dragging():
         clock.advance(0.02)
         bridge.update_geometry(ISLAND_LEFT + 60.0, ISLAND_TOP, ISLAND_W,
                                ISLAND_H)  # 3000px/s
-        assert world._static_member_velocity[ISLAND] == (0.0, 0.0)
+        assert world._static_member_velocity[ISLAND][:2] == (0.0, 0.0)
     finally:
         bridge.detach()
 
@@ -225,7 +225,7 @@ def test_overspeed_is_clamped_only_while_dragging():
         bridge2.update_geometry(ISLAND_LEFT, ISLAND_TOP, ISLAND_W, ISLAND_H)
         clock2.advance(0.02)
         bridge2.update_geometry(ISLAND_LEFT + 60.0, ISLAND_TOP, ISLAND_W, ISLAND_H)
-        assert world2._static_member_velocity[ISLAND] == (
+        assert world2._static_member_velocity[ISLAND][:2] == (
             pytest.approx(MAX_ISLAND_SPEED), 0.0)
     finally:
         bridge2.detach()
@@ -244,7 +244,7 @@ def test_island_stop_with_unchanged_rect_zeroes_velocity():
         clock.advance(0.05)
         bridge.update_geometry(ISLAND_LEFT + 40.0, ISLAND_TOP, ISLAND_W,
                                ISLAND_H)  # rect 不变 = 岛停了
-        assert world._static_member_velocity[ISLAND] == (0.0, 0.0)
+        assert world._static_member_velocity[ISLAND][:2] == (0.0, 0.0)
 
         sprite = FakeSprite(*SPRITE_POS)
         events: list = []
@@ -254,3 +254,53 @@ def test_island_stop_with_unchanged_rect_zeroes_velocity():
         assert sprite.interaction_state == "normal"
     finally:
         bridge.detach()
+
+
+# ---------------------------------------------------------------- B1 幽灵速度
+def test_deadzone_release_sample_zeroes_velocity():
+    """松手样本落进 <10ms 死区也必须清零（桥侧闸，不再手动补喂 0.05s 停止样本）。
+
+    失效模式（DS 全量审查 B1）：松手瞬间的 geometry 回调距上次接受样本
+    < _MOTION_MIN_DT，守卫③ 早退不清零 → 静止的岛持残留速度把贴上来
+    的桌宠拍进 THROWN。本用例不再注入「停止时刻的 dt≥0.01 样本」——
+    产品里停止根本不会产生那种回调。
+    """
+    world = SpriteCollisionWorld()
+    clock = FakeClock()
+    bridge, _ = _bridge(dragging=True, clock=clock)
+    try:
+        bridge.attach(world)
+        _moving_island(bridge, clock)
+        assert world._static_member_velocity[ISLAND][0] == pytest.approx(800.0)
+
+        clock.advance(0.005)  # < _MOTION_MIN_DT 的死区样本，rect 不变 = 松手
+        bridge.update_geometry(ISLAND_LEFT + 40.0, ISLAND_TOP, ISLAND_W,
+                               ISLAND_H)
+        assert world._static_member_velocity[ISLAND][:2] == (0.0, 0.0)
+    finally:
+        bridge.detach()
+
+
+def test_stale_velocity_expires_without_any_callback():
+    """按住不动（零回调）场景的世界侧兜底：速度样本超 TTL 未刷新按 0 处理。
+
+    拖拽中按住不动 = 不再有几何回调，桥侧无从纠正；世界在读速度时按
+    写入时刻过期（STATIC_VELOCITY_TTL_SECS），静止岛不得再拍飞桌宠。
+    """
+    world = SpriteCollisionWorld()
+    try:
+        world.add_static_member(ISLAND, ISLAND_LEFT + 40.0, ISLAND_TOP,
+                                ISLAND_W, ISLAND_H, vx=800.0, vy=0.0)
+        # 把速度样本的写入时刻拨到 TTL 之前（等价于按住不动远超 0.15s）
+        vx, vy, ts = world._static_member_velocity[ISLAND]
+        world._static_member_velocity[ISLAND] = (vx, vy, ts - 1.0)
+
+        sprite = FakeSprite(*SPRITE_POS)
+        events: list = []
+        world.add_collision_listener(events.append)
+        world.tick([sprite], 1 / 60)
+
+        assert [e for e in events if ISLAND in (e.a, e.b)] == []
+        assert sprite.interaction_state == "normal"
+    finally:
+        world.remove_static_member(ISLAND)

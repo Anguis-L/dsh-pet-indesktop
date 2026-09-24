@@ -297,10 +297,16 @@ class IslandCollisionBridge:
         now = self._clock()
         if self._last_center is not None:
             dt = now - self._last_motion_ts
-            if dt < _MOTION_MIN_DT:
-                return  # 高频回调样本太密：保留上次速度，不刷新采样点
             dx, dy = cx - self._last_center[0], cy - self._last_center[1]
             jump = math.hypot(dx, dy)
+            if dt < _MOTION_MIN_DT:
+                # 高频回调样本太密：不刷新采样点。但「同 rect」样本（岛没动）
+                # 必须顺手清零——松手样本落进死区时旧速度会残留，静止的岛
+                # 会把贴上来的桌宠拍进 THROWN（幽灵速度，世界侧时效是兜底，
+                # 这里尽早纠正）。真实拖拽的密集样本位移 ≥ MIN_STEP，不受影响。
+                if jump < _MOTION_MIN_STEP:
+                    self._vx = self._vy = 0.0
+                return
             if jump > _MOTION_JUMP_SPEED * dt + w:
                 self._vx = self._vy = 0.0
                 self._last_center = (cx, cy)
