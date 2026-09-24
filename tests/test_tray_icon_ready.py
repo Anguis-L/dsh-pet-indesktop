@@ -24,6 +24,18 @@ from pet.window import PetWindow
 CHARACTER_RED = 200
 
 
+def _simulate_no_frame_yet(win):
+    """把窗口重置回「一帧都拿不到」的现场。
+
+    本分支帧序列 B 档让真实素材的首帧在窗口构造期即可同步就绪（并发过
+    frame_ready），托盘图标 bug 的「首帧未就绪」前提已无法自然复现；
+    这两个用例关心的是该前提下 icon_pixmap/frame_ready 的契约行为，
+    因此显式清状态模拟。
+    """
+    win._frame_pixmap = None
+    win._frame_ready_emitted = False
+
+
 class _FakeSignal:
     """PetWindow.frame_ready 的最小替身：记录连接，可手动触发。
 
@@ -167,7 +179,10 @@ def test_rebuild_frame_emits_frame_ready_once_per_window(app, tmp_path):
         def stop(self):  # closeEvent 会调
             pass
 
+    # 帧序列 B 档下构造期即同步出首帧并发过 frame_ready；重置回「首帧
+    # 未就绪」现场再验证契约（见 _simulate_no_frame_yet）。
     win = PetWindow(MovieLibrary(), Config(base=tmp_path))
+    _simulate_no_frame_yet(win)
     hits = []
     win.frame_ready.connect(lambda: hits.append(1))
 
@@ -187,10 +202,12 @@ def test_rebuild_frame_emits_frame_ready_once_per_window(app, tmp_path):
 
 
 def test_first_frame_pixmap_is_null_before_any_frame(app, tmp_path):
-    """根因留证：窗口刚建好、一帧都没跑时 icon_pixmap() 就是空图。"""
+    """根因留证：首帧未就绪时 icon_pixmap() 就是空图（帧序列 B 档下该
+    前提无法自然复现，显式模拟，见 _simulate_no_frame_yet）。"""
     win = PetWindow(MovieLibrary(), Config(base=tmp_path))
     win.show()
-    QApplication.instance().processEvents()  # 尚未跑到任何一帧
+    QApplication.instance().processEvents()
+    _simulate_no_frame_yet(win)
 
     assert win._frame_pixmap is None
     assert win.icon_pixmap(64).isNull()

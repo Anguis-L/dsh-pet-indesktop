@@ -4157,7 +4157,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._phys_vel[:] = [0.0, 0.0]
         # 4.4a：撞岛/撞飞落地停稳 → 通知边缘探头开始重进倒计时（原由
         # CollisionClient._submit_collision_state 承担；客户端退役后归窗口本侧）。
-        if self._reentry_after_throw_armed:
+        if getattr(self, '_reentry_after_throw_armed', False):
             self._reentry_after_throw_armed = False
             edge = getattr(self, '_edge_probe', None)
             _on_settled = getattr(edge, 'on_throw_settled', None)
