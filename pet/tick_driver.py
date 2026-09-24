@@ -162,6 +162,9 @@ class TickDriver(QObject):
         self._last_frame_notify: float | None = None
         self._elapsed = QElapsedTimer()
         self._tick_count = 0
+        # 空窗停表标记（M12c）：overlay 还在但聚合 sprite 数归零时停表，
+        # 有 sprite 加入才恢复（区分「本来就没 start 过」与「被空窗停掉」）
+        self._suspended_for_empty = False
         # tick 仪表（PET_TICK_METRICS=0 时不建实例；门控在调用点）
         self._metrics = TickMetrics(clock=clock) if TICK_METRICS_ENABLED else None
         self._timer = QTimer(self)
@@ -230,9 +233,28 @@ class TickDriver(QObject):
             return
         self._overlays.remove(overlay)
         if not self._overlays:
+            self._suspended_for_empty = False  # 空窗标记随成员清空失效
             self.stop()
         else:
             self.refresh_tick_interval()
+
+    # ---------------------------------------------------------------- 空窗停表（M12c）
+    def note_sprite_count_changed(self) -> None:
+        """sprite 生灭通知（``overlay.add_sprite`` / ``remove_sprite`` 调）。
+
+        聚合 sprite 数归零 → 停表（此前只有「再无 overlay」才停，主宠退出/
+        子宠全退/角色重建的空窗期 tick 仍在空转）；有 sprite 加入且此前正是
+        被空窗停掉的 → ``start()`` 恢复（同步回 T0，不吃停表期的历史流逝）。
+        档位机语义不变：恢复走既有 start 路径。
+        """
+        if self._all_sprites():
+            if self._suspended_for_empty and self._overlays:
+                self._suspended_for_empty = False
+                self.start()
+            return
+        if self._timer.isActive():
+            self._suspended_for_empty = True
+            self.stop()
 
     # ---------------------------------------------------------------- 时间基（V-6）
     @staticmethod
@@ -300,6 +322,12 @@ class TickDriver(QObject):
         self._elapsed.start()
         self._governor.notify_kinetic()  # 启动即 T0（首段仿真全速）
         self._sync_tier()
+        if not self._all_sprites():
+            # 空窗（M12c）：一只 sprite 都没有就不起表，等 note_sprite_count_changed
+            self._suspended_for_empty = True
+            self._timer.stop()
+            return
+        self._suspended_for_empty = False
         self._timer.start()
 
     def stop(self) -> None:

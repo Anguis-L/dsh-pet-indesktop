@@ -218,6 +218,8 @@ class OverlayWindow(QWidget):
             set_dpr(float(self._screen.devicePixelRatio()))
         if self.isVisible():
             self.update(QRegion(sprite.rect()))
+        # M12c：sprite 数从 0 恢复 → 驱动器重新起表
+        self._driver.note_sprite_count_changed()
 
     # ---------------------------------------------------------------- DPR 归一化（D2）
     def _feed_dpr(self) -> None:
@@ -378,6 +380,8 @@ class OverlayWindow(QWidget):
         for cb in list(self._sprite_removed_listeners):
             cb(sprite)
         self.update(QRegion(sprite.rect()))
+        # M12c：聚合 sprite 数归零 → 驱动器停表（空窗期不再空转）
+        self._driver.note_sprite_count_changed()
 
     def add_sprite_removed_listener(self, cb) -> None:
         """注册 sprite 移除通知（V-9 外部簿记注销挂点）；重复注册 no-op。"""

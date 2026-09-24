@@ -198,8 +198,9 @@ def test_attach_is_idempotent_and_detach_order_independent():
 def test_last_detach_stops_timer_others_keep_ticking():
     """V-12 + 多成员：摘最后一个才停表，其余成员继续被驱动。"""
     driver = TickDriver()
-    first = FakeOverlay(screen=FakeScreen(60.0))
-    second = FakeOverlay(screen=FakeScreen(60.0))
+    # M12c：空 overlay 不起表——每个成员都带一只 sprite（聚合数非 0）
+    first = FakeOverlay([FakeSprite()], screen=FakeScreen(60.0))
+    second = FakeOverlay([FakeSprite()], screen=FakeScreen(60.0))
     driver.attach(first)
     driver.attach(second)
     driver.start()
@@ -221,6 +222,7 @@ def test_overlay_start_reattaches_after_stop():
 
     driver = TickDriver()
     overlay = OverlayWindow(driver=driver)
+    overlay.add_sprite(FakeSprite())          # M12c：空 overlay 不起表
     overlay.start()
     assert driver.timer.isActive() and driver.overlays == [overlay]
 
