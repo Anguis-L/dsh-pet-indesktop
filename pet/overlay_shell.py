@@ -1179,6 +1179,15 @@ class OverlayShell(QObject):
                     return  # 已换代（清单热改）：旧批结果作废
                 img = QImage(path)
                 if not img.isNull():
+                    # 缓存按气泡显示盒 ~2× 预缩放（长边 ≤640）：气泡出图
+                    # 本来就 SmoothTransformation 缩到 220×140×scale 的盒
+                    # 子里，存原图是白占内存（24 张原图解码 = 114MB，
+                    # 预缩放后 ≈10MB——实机 +60~80MB 回压）。
+                    if img.width() > 640 or img.height() > 640:
+                        img = img.scaled(
+                            640, 640,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
                     cache[path] = img
 
         import threading

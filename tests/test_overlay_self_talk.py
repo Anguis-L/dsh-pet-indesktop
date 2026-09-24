@@ -360,3 +360,34 @@ def test_image_branch_cache_miss_falls_back_to_text(tmp_path):
         shell._delete_runtime_marker()
     finally:
         shell._delete_runtime_marker()
+
+
+def test_warm_self_talk_images_prescales_big_images(tmp_path):
+    """配图缓存按显示盒 ~2× 预缩放（长边 ≤640）：24 张原图解码 = 114MB
+    的内存回压（任务管理器实锤），预缩放后 ≈10MB。"""
+    import time as _time
+
+    shell, _config = _make_shell(tmp_path, _talk_values(self_talk_image_chance=100))
+    try:
+        big = QPixmap(2000, 1000)
+        big.fill(QColor(90, 120, 160))
+        d = tmp_path / "big-imgs"
+        d.mkdir()
+        path = d / "big.png"
+        assert big.save(str(path))
+        shell._self_talk_images = [path]
+        shell._self_talk_image_cache = {}
+
+        shell._warm_self_talk_images()
+        deadline = _time.monotonic() + 10.0
+        while str(path) not in shell._self_talk_image_cache \
+                and _time.monotonic() < deadline:
+            QApplication.instance().processEvents()
+            _time.sleep(0.02)
+
+        cached = shell._self_talk_image_cache[str(path)]
+        assert max(cached.width(), cached.height()) <= 640
+        assert not cached.isNull()
+        shell._delete_runtime_marker()
+    finally:
+        shell._delete_runtime_marker()
