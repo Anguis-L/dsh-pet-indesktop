@@ -335,6 +335,82 @@ def test_drag_state_returns_to_idle_when_drag_ends_without_release_callback():
     assert sprite._clip_name == "idle1"
 
 
+# ---------------------------------------------------------------- F2：多圈续播 re-arm
+def test_drag_finished_rearms_clip():
+    """F2：拖拽悬空动画过圈末必须原地续播（否则长拖拽动画冻结）。"""
+    lib = _make_library(drag="hang")
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+
+    sprite.on_press(QPointF(10, 10))
+    c.on_drag_started(sprite)
+    assert lib.clip("hang").start_count == 1
+
+    lib.clip("hang").finished.emit()                # WebMClip 圈末结束标记
+
+    assert lib.clip("hang").start_count == 2        # re-arm：不冻结在末帧
+
+
+def test_multi_loop_move_finished_rearms_clip():
+    """F2：多圈移动第 2 圈起动画冻结的根修——中间圈 finished 触发重播。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))  # 2 圈 × 60px
+    st = c._states[sprite]
+    assert c.state_of(sprite) == STATE_MOVE
+    assert st.duration > lib.duration("walk")       # 确实是多圈计划
+    assert lib.clip("walk").start_count == 1
+
+    _run(c, sprite, lib.duration("walk") + 0.05)    # 推进到第 1 圈末
+    assert c.state_of(sprite) == STATE_MOVE         # 移动尚未到点
+    lib.clip("walk").finished.emit()                # WebMClip 圈末结束标记
+
+    assert lib.clip("walk").start_count == 2        # 第 2 圈续播，不冻结
+    assert c.state_of(sprite) == STATE_MOVE
+
+    _run(c, sprite, st.duration)                    # 整段跑完仍正常收口
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite.pos == QPointF(920, 400)
+
+
+def test_clip_finished_ignored_when_no_remaining_time():
+    """末圈 finished 不续播（剩余时长为 0）：收口交给到点 snap。
+
+    否则已完成的移动会被重新起播一整圈，且 snap 后立刻绑待机 = 白起一
+    次解码。
+    """
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))
+    st = c._states[sprite]
+    st.elapsed = st.duration                        # 末圈已到点（tick 即将收口）
+
+    lib.clip("walk").finished.emit()
+
+    assert lib.clip("walk").start_count == 1        # 不续播
+
+
+def test_clip_finished_ignored_for_states_without_rearm():
+    """点击/待机等一次性的状态链不接 finished 续播（收口由墙钟到点负责）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+    assert c.state_of(sprite) == STATE_IDLE
+    assert lib.clip("idle1").start_count == 1
+
+    lib.clip("idle1").finished.emit()
+
+    assert lib.clip("idle1").start_count == 1
+
+
 # ---------------------------------------------------------------- 点击反应
 def test_click_plays_click_clip_then_idle():
     lib = _make_library()

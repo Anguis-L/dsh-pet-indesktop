@@ -63,6 +63,10 @@ STATE_DRAG = "drag"
 #: 却停在这些态 = 收尾接线缺失（看门狗/shell 分支没走到），必须自愈回待机
 _CAPTURED_STATES = (STATE_DRAG,)
 
+#: 圈末 finished 需要原地续播（re-arm）的状态（F2）：这些状态的时长可以
+#: 跨多圈（多圈移动 / 循环拖拽），中间圈结束必须重播，否则第 2 圈起冻结
+_REARM_STATES = (STATE_MOVE, STATE_DRAG, STATE_ACTS)
+
 
 class _SpriteState:
     """单个 sprite 的行为状态（控制器私有，不落在 sprite 上）。"""
@@ -126,6 +130,7 @@ class BehaviorController:
         绑对动画（F1 拖拽悬空 / F4 飞行循环），故仍进入本循环。
         """
         for sprite in sprites:
+            self._ensure_hooks(sprite)
             st = self._states.get(sprite)
             if st is None:
                 st = self._states[sprite] = _SpriteState()
@@ -146,6 +151,7 @@ class BehaviorController:
         （旧机 ``if self.drag:`` 同款回退，window.py:3175-3176）。拖拽期间
         位置由鼠标驱动，本方法绝不改写 velocity/pos。
         """
+        self._ensure_hooks(sprite)
         st = self._states.get(sprite)
         if st is None:
             st = self._states[sprite] = _SpriteState()
@@ -226,9 +232,37 @@ class BehaviorController:
         st = self._states.get(sprite)
         return st.state if st is not None else None
 
+    def on_clip_finished(self, sprite) -> None:
+        """clip 圈末结束（PetSprite.finished 转发）：本状态还有剩余时长就续圈。
+
+        WebMClip 圈末交付结束标记后停表，只有 start() 能 re-arm
+        （webm_clip.py:1521-1567），不续则多圈移动的第 2 圈起、长拖拽过圈末
+        全部冻结在末帧。等价旧 window.py:1802-1821 _restart_current_clip。
+
+        续圈判据用剩余时长（墙钟口径，见模块头）：末圈结束（剩余 ≤ 0）绝不
+        续——收口交给 tick 的到点 snap，否则已完成的移动会被重新起播一整圈。
+        """
+        st = self._states.get(sprite)
+        if st is None or st.state not in _REARM_STATES:
+            return
+        if st.duration - st.elapsed <= 0.0:
+            return
+        sprite.restart_clip()
+
     def forget(self, sprite) -> None:
         """sprite 从 overlay 移除时清理其状态（可选，防状态表只增不减）。"""
         self._states.pop(sprite, None)
+
+    def _ensure_hooks(self, sprite) -> None:
+        """把 clip 圈末回调挂到 sprite（F2），每个 sprite 只挂一次。
+
+        挂接方必须是本控制器：只有它知道当前状态的剩余时长（多圈移动的
+        中间圈续、末圈不续），sprite 侧只做转发（PetSprite._on_clip_finished）。
+        """
+        if getattr(sprite, "_clip_finished_owner", None) is self:
+            return
+        sprite._clip_finished_cb = self.on_clip_finished
+        sprite._clip_finished_owner = self
 
     # ---------------------------------------------------------------- 接管态画面
     def _tick_captured(self, sprite, st: _SpriteState) -> None:

@@ -99,6 +99,10 @@ class PetSprite(QObject):
         self.set_pos(pos if pos is not None else QPointF(0, 0))
         self._clip = None
         self._clip_name: str | None = None
+        # 圈末结束回调（F2）：行为控制器挂接（BehaviorController._ensure_hooks），
+        # clip 的 finished 直接转给它做多圈/长拖拽的原地续播
+        self._clip_finished_cb = None
+        self._clip_finished_owner = None
         self._frame_sig: tuple | None = None
         self._frame_dirty = False
         self._pixmap: QPixmap | None = None
@@ -488,10 +492,7 @@ class PetSprite(QObject):
         """
         clip = self._clip
         if clip is not None:
-            try:
-                clip.frameChanged.disconnect(self._on_frame_changed)
-            except (TypeError, RuntimeError):
-                pass  # 未连接过/对象已毁：忽略
+            self._disconnect_clip_signals(clip)
             stop = getattr(clip, "stop", None)
             if callable(stop):
                 stop()
@@ -502,26 +503,53 @@ class PetSprite(QObject):
         self._hit_image = None
         self._dirty_cb = None
         self._kinetic_cb = None
+        self._clip_finished_cb = None
+        self._clip_finished_owner = None
         self._last_reported_rect = None
 
-    # ---------------------------------------------------------------- clip 绑定
-    def bind_clip(self, name: str) -> None:
-        """绑定并起播一个动画 clip；旧 clip 断开信号并停止（不再后台解码）。
+    def _disconnect_clip_signals(self, clip) -> None:
+        """断开本 sprite 从该 clip 接的信号（换绑/释放共用；缺失即忽略）。
 
-        clip 的 frameChanged 本来就 emit 在 GUI 线程，且 sprite 由 overlay
-        持有（同线程），直接连接即可，无需 queued。
+        frameChanged/finished 必须成对断开：只断前者会让旧 clip 的圈末
+        finished 继续打到已换绑的 sprite 上（F2 续圈错绑）。
         """
-        if self._clip is not None:
+        for name, slot in (("frameChanged", self._on_frame_changed),
+                           ("finished", self._on_clip_finished)):
+            signal = getattr(clip, name, None)
+            if signal is None:
+                continue
             try:
-                self._clip.frameChanged.disconnect(self._on_frame_changed)
+                signal.disconnect(slot)
             except (TypeError, RuntimeError):
                 pass  # 未连接过/对象已毁：忽略
+
+    # ---------------------------------------------------------------- clip 绑定
+    def bind_clip(self, name: str) -> bool:
+        """绑定并起播一个动画 clip；旧 clip 断开信号并停止（不再后台解码）。
+
+        返回 clip.start() 是否被接受（``False`` = 拒绝；返 None 的播放器
+        ——如 GifClip.start——按接受处理，见 F6 的语义）。调用方可据此放弃
+        依赖该动画的状态（移动计划等），绝不把「动画状态已切换」与「动画
+        真的在播」当成同一件事（旧机 B7 审查 P1-1 同款契约）。
+
+        clip 的 frameChanged/finished 本来就 emit 在 GUI 线程，且 sprite 由
+        overlay 持有（同线程），直接连接即可，无需 queued。
+        """
+        if self._clip is not None:
+            self._disconnect_clip_signals(self._clip)
             stop = getattr(self._clip, "stop", None)
             if callable(stop):
                 stop()
         self._clip_name = name
         self._clip = self.library.movie(name)
-        self._clip.frameChanged.connect(self._on_frame_changed)
+        clip = self._clip
+        clip.frameChanged.connect(self._on_frame_changed)
+        # F2：圈末结束标记（WebMClip 圈末停表、帧序列播到尾）转发给行为
+        # 控制器做原地续播；WebMClip/GifClip/帧序列 clip 都有该信号，缺失时
+        # 静默跳过（只影响续圈，不影响单圈播放）
+        finished = getattr(clip, "finished", None)
+        if finished is not None:
+            finished.connect(self._on_clip_finished)
         # 换 clip 后签名/缓存作废；首帧到达前先按脏处理，保证首 tick 上屏。
         # **不清 self._pixmap**：旧 clip 的最后一帧留作兜底（_frame_sig=None
         # 已强制按新签名重建，新帧到货即覆盖）——清掉会让新 clip 首帧异步
@@ -529,18 +557,49 @@ class PetSprite(QObject):
         self._frame_sig = None
         self._hit_image = None
         self._frame_dirty = True
-        setter = getattr(self._clip, "set_playback_speed", None)
+        setter = getattr(clip, "set_playback_speed", None)
         if callable(setter):
             setter(self.playback_speed)
         # start() 前同步取第 0 帧（旧机 window.py:1549-1554 的
         # stop→jumpToFrame(0)→start 语义）：帧序列 clip 的 start 是异步交付
         # 首帧，先同步跳帧才能保证显示槽立刻有帧可画。
-        jump = getattr(self._clip, "jumpToFrame", None)
+        jump = getattr(clip, "jumpToFrame", None)
         if callable(jump):
             jump(0)
-        start = getattr(self._clip, "start", None)
-        if callable(start):
-            start()
+        start = getattr(clip, "start", None)
+        if not callable(start):
+            return True
+        return start() is not False
+
+    def restart_clip(self) -> bool:
+        """原地续播当前 clip（圈末 re-arm，F2）；返回是否被接受。
+
+        只调 ``clip.start()``：WebMClip 的 start 自身处理「圈末软停 → re-arm
+        续圈」，未驻留时走 fresh start 并复位 _ended_fired（webm_clip.py:
+        1521-1567，故下一圈仍会发 finished）；帧序列 clip 的 start 自带
+        ``_cur = 0`` 回首帧（frameseq_clip.py:201-226）。旧机
+        _restart_current_clip 里额外的 jumpToFrame(0) 与 _ended_fired 复位在
+        这两条 start 路径里已各自完成，这里不重复（避免二次解码）。
+        ``False`` = 起播被拒，调用方按各自场景降级（旧机同契约）。
+        """
+        clip = self._clip
+        if clip is None:
+            return False
+        start = getattr(clip, "start", None)
+        if not callable(start):
+            return False
+        return start() is not False
+
+    def _on_clip_finished(self) -> None:
+        """clip 圈末结束（F2）：转发给行为控制器决定是否续圈。
+
+        本回调不自行 restart：只有控制器知道「本状态的剩余时长」（多圈移动
+        的中间圈要续、末圈不能续），单一事实来源在 BehaviorController.
+        on_clip_finished。
+        """
+        cb = self._clip_finished_cb
+        if cb is not None:
+            cb(self)
 
     def _on_frame_changed(self, _frame: int) -> None:
         self._frame_dirty = True

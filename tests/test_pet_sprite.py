@@ -1,0 +1,203 @@
+# -*- coding: utf-8 -*-
+"""PetSprite clip 生命周期单测（QT_QPA_PLATFORM=offscreen 可跑）。
+
+覆盖「移动与动画匹配」层落在 sprite 侧的接缝：
+- F2 圈末 re-arm：restart_clip 只调 start()（WebMClip start 自带软停续圈 /
+  fresh start 复位 _ended_fired，帧序列 clip 的 start 自带回首帧）、
+  clip.finished 转发给挂接的控制器的回调；
+- F4 飞行期动画速率：set_flight_anim_speed 叠加、reset_playback_speed 复位
+  回用户速率（_clip_duration 会除以 playback_speed，不复位会让下一次
+  _plan_move 按加速后的时长建计划）；
+- F6 bind_clip 返回 bool：start() 明确拒绝（False）才算失败，返 None 的
+  播放器（GifClip.start）按接受处理。
+
+纪律（AGENTS.md 时序测试）：全部同步直调，不起真实 QTimer、不固定 sleep；
+假 clip 用纯 QImage + 显式信号，不依赖 webm 素材与 ffmpeg。
+"""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QObject, QPointF, Signal
+from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QApplication
+
+from pet.pet_sprite import PetSprite
+
+app = QApplication.instance() or QApplication([])
+
+
+class FakeClip(QObject):
+    """接口对齐 WebMClip 的假 clip：记录 start/stop 次数与播放速率。"""
+
+    frameChanged = Signal(int)
+    finished = Signal()
+
+    def __init__(self, *, accept_start=True, start_returns_none=False):
+        super().__init__()
+        self.frame = 0
+        self.image = QImage(64, 36, QImage.Format.Format_ARGB32)
+        self.image.fill(0xFF336699)
+        self.start_count = 0
+        self.stop_count = 0
+        self.accept_start = accept_start
+        self.start_returns_none = start_returns_none
+        self.playback_speed = 1.0
+        self.speed_calls: list[float] = []
+
+    def currentFrameNumber(self):
+        return self.frame
+
+    def currentImage(self):
+        return self.image
+
+    def frameCount(self):
+        return 1
+
+    def duration(self):
+        return 1.0
+
+    def start(self):
+        self.start_count += 1
+        if self.start_returns_none:
+            return None
+        return bool(self.accept_start)
+
+    def stop(self):
+        self.stop_count += 1
+
+    def jumpToFrame(self, _index):
+        return True
+
+    def set_playback_speed(self, speed):
+        self.playback_speed = float(speed)
+        self.speed_calls.append(float(speed))
+
+
+class NoFinishedClip(QObject):
+    """缺 finished 信号的播放器（旧测试替身）：bind 不得因此报错。"""
+
+    frameChanged = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.image = QImage(64, 36, QImage.Format.Format_ARGB32)
+        self.image.fill(0xFF336699)
+        self.starts = 0
+
+    def currentFrameNumber(self):
+        return 0
+
+    def currentImage(self):
+        return self.image
+
+    def start(self):
+        self.starts += 1
+        return True
+
+    def stop(self):
+        pass
+
+
+class FakeLibrary:
+    def __init__(self, clip):
+        self._clip = clip
+        self.no_mirror: set[str] = set()
+
+    def movie(self, _name):
+        return self._clip
+
+
+def _make_sprite(clip) -> PetSprite:
+    return PetSprite(FakeLibrary(clip), pos=QPointF(0, 0), scale=0.5)
+
+
+# ---------------------------------------------------------------- F2：圈末 re-arm
+def test_restart_clip_starts_current_clip_again():
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    assert clip.start_count == 1
+
+    assert sprite.restart_clip() is True
+
+    assert clip.start_count == 2            # 原地续播（走 clip 自身的 re-arm）
+    assert clip.stop_count == 0             # 不经过 stop：软停驻留留给 start 处理
+
+
+def test_restart_clip_without_clip_returns_false():
+    sprite = _make_sprite(FakeClip())
+    assert sprite.restart_clip() is False
+
+
+def test_restart_clip_reports_rejected_start():
+    clip = FakeClip(accept_start=False)
+    sprite = _make_sprite(clip)
+    sprite.bind_clip("walk")
+    assert sprite.restart_clip() is False
+
+
+def test_finished_signal_forwarded_to_attached_controller():
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    seen = []
+    sprite._clip_finished_cb = seen.append      # 控制器挂接点（_ensure_hooks）
+    sprite.bind_clip("walk")
+
+    clip.finished.emit()
+
+    assert seen == [sprite]
+
+
+def test_rebind_disconnects_finished_from_old_clip():
+    old = FakeClip()
+    new = FakeClip()
+    library = FakeLibrary(old)
+    sprite = PetSprite(library, scale=0.5)
+    seen = []
+    sprite._clip_finished_cb = seen.append
+    sprite.bind_clip("walk")
+
+    library._clip = new
+    sprite.bind_clip("run")
+    old.finished.emit()                          # 旧 clip 的迟到圈末
+
+    assert seen == []                            # 不得打到已换绑的 sprite 上
+    new.finished.emit()
+    assert seen == [sprite]
+
+
+def test_bind_clip_tolerates_clip_without_finished_signal():
+    clip = NoFinishedClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    assert clip.starts == 1
+
+
+def test_close_clears_clip_finished_hook():
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    seen = []
+    sprite._clip_finished_cb = seen.append
+    sprite.bind_clip("walk")
+
+    sprite.close()
+    clip.finished.emit()
+
+    assert seen == []                            # 释放后不再回调（sprite 已移除）
+
+
+# ---------------------------------------------------------------- F6：bind 结果
+def test_bind_clip_returns_false_when_start_rejected():
+    clip = FakeClip(accept_start=False)
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is False
+
+
+def test_bind_clip_treats_none_start_result_as_accepted():
+    """GifClip.start() 无返回值：None 不得被当成起播失败（否则 GIF 角色不走路）。"""
+    clip = FakeClip(start_returns_none=True)
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
