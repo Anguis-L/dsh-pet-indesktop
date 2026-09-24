@@ -1726,6 +1726,12 @@ class AppShell:
                 self.app, self.instance,
                 agent_link_manager=getattr(shared, "agent_link", None),
                 proactive_watcher=getattr(shared, "proactive", None))
+            # 点击自言自语的朗读走同一条音频通道（AppShell 持有，进程内唯一）；
+            # overlay 拓扑没有 PetWindow 可注入（app.py:481 的 legacy 落点是
+            # PetInstance._wire_window，那里用 self.shell），本类就是那个
+            # AppShell，故直接取 self.speak_self_talk——写 self.shell 会
+            # AttributeError（见 _precache 段同款注释）。
+            self._overlay_shell.on_self_talk_speak = self.speak_self_talk
             self._overlay_shell.start()
         else:
             self._create_ui_with_character_fallback(character_id)
