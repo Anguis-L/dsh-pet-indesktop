@@ -292,8 +292,10 @@ class SlingshotController:
             # grab（新 grab 偏移 = 当前光标 - 锚点），位置一步不跳。
             self._write(sprite, "set_pos", anchor)
             self._write(sprite, "on_press", cursor)
+            # M3 语义：on_press 只是点击候选（不置 _dragging/拖拽态），真拖拽
+            # 态由 begin_drag 升级——瞄准前的拖拽是已升级过的，恢复要补齐。
+            self._write(sprite, "begin_drag")
             self._write(sprite, "set_velocity", QPointF(0, 0))
-            sprite.interaction_state = INTERACTION_DRAG
         else:
             self._write(sprite, "set_velocity", QPointF(0, 0))
             self._write(sprite, "set_pos", anchor)
