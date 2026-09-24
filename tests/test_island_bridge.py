@@ -104,13 +104,16 @@ class RecordingWorld:
     def __init__(self):
         self.members: dict = {}
         self.circles: dict = {}
+        self.velocities: dict = {}
         self.add_calls = 0
         self.remove_calls = 0
         self.listeners: list = []
 
-    def add_static_member(self, member_id, left, top, width, height, *, circles=None):
+    def add_static_member(self, member_id, left, top, width, height, *,
+                          circles=None, vx=0.0, vy=0.0):
         self.add_calls += 1
         self.members[str(member_id)] = (left, top, width, height)
+        self.velocities[str(member_id)] = (vx, vy)
         if circles is not None:
             self.circles[str(member_id)] = [list(c) for c in circles]
 
@@ -118,6 +121,7 @@ class RecordingWorld:
         self.remove_calls += 1
         self.members.pop(str(member_id), None)
         self.circles.pop(str(member_id), None)
+        self.velocities.pop(str(member_id), None)
 
     def add_collision_listener(self, listener):
         if listener not in self.listeners:

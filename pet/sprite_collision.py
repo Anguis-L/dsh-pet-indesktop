@@ -13,6 +13,8 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
 - 拖拽中的 sprite 视为无限质量（撞得动别人，自己不动；FLAG_DRAGGING 语义）；
 - 静态成员（FLAG_STATIC 语义，为灵动岛预留）无限质量 + STATIC_RESTITUTION
   果冻墙弹性（collision.py 的 solve_collision_impulse 内部按 FLAG_STATIC 分支）；
+  静态成员速度经 add_static_member(vx=, vy=) 传入（岛速通道）——求解器只认
+  相对速度，速度恒 0 时拖岛撞宠只剩位置分离（平推），传真实岛速才有冲量弹开；
 - 高速防穿透：帧间圆链扫掠（swept_circle_chain_collision，TOI 语义）；
 - 纯位置分离（j==0 且 sep>0）按 pair 去抖 15 tick（防贴贴抖动）；
 - 真撞击阈值：普通对 dv >= 300px/s、撞静态成员放宽到 60px/s、已 thrown
@@ -153,6 +155,11 @@ class SpriteCollisionWorld:
         self._support_streak: Dict[str, int] = {}
         # 静态成员（灵动岛预留）：member_id -> (left, top, width, height)
         self._static_members: Dict[str, Tuple[float, float, float, float]] = {}
+        # 静态成员速度（岛速通道）：member_id -> (vx, vy)。无限质量的静态体
+        # 不参与位置积分，但速度要参与求解器的相对法向速度——岛速恒 0 时
+        # 拖岛撞宠只有位置分离（平推），传真实岛速才有冲量弹开。写速度与
+        # 写几何一样经 add_static_member 打脏 _static_dirty（静止豁免被唤醒）。
+        self._static_member_velocity: Dict[str, Tuple[float, float]] = {}
         self._listeners: List[Callable[[CollisionEvent], None]] = []
         # 静态成员自定义圆链（岛 stadium 口径，member_id -> circles）
         self._static_member_circles: Dict[str, list] = {}
@@ -164,15 +171,21 @@ class SpriteCollisionWorld:
     # ---------------------------------------------------------------- 静态成员（灵动岛预留 API）
     def add_static_member(self, member_id: str, left: float, top: float,
                           width: float, height: float,
-                          *, circles: Sequence[Sequence[float]] | None = None) -> None:
+                          *, circles: Sequence[Sequence[float]] | None = None,
+                          vx: float = 0.0, vy: float = 0.0) -> None:
         """注册静态碰撞成员（FLAG_STATIC 语义的矩形障碍/体育场）。
 
         默认碰撞体 = circles_from_rect 内切三圆；岛等宽扁胶囊应经
         circles=capsule_circles(...) 传入体育场等效圆链（D9 stadium 口径）。
         无限质量且保留 STATIC_RESTITUTION 果冻墙弹性（collision.py 内部分支）。
+
+        ``vx``/``vy`` = 静态成员当前速度（px/s，岛速估计经 ``island_bridge``
+        随几何一起喂入）：求解器只认相对速度，速度恒 0 时拖岛撞宠只剩位置
+        分离（平推）；传真实岛速才有冲量弹开。
         """
         self._static_members[str(member_id)] = (
             float(left), float(top), float(width), float(height))
+        self._static_member_velocity[str(member_id)] = (float(vx), float(vy))
         if circles is not None:
             self._static_member_circles[str(member_id)] = [
                 [float(c[0]), float(c[1]), float(c[2])] for c in circles]
@@ -183,6 +196,7 @@ class SpriteCollisionWorld:
     def remove_static_member(self, member_id: str) -> None:
         """注销静态成员；未注册过是 no-op。"""
         self._static_members.pop(str(member_id), None)
+        self._static_member_velocity.pop(str(member_id), None)
         self._static_member_circles.pop(str(member_id), None)
         self._prev_circles.pop(str(member_id), None)
         self._static_dirty = True
@@ -339,14 +353,15 @@ class SpriteCollisionWorld:
     def _static_member_state(self, member_id: str,
                              rect: Tuple[float, float, float, float]) -> collision.MemberState:
         left, top, w, h = rect
+        vx, vy = self._static_member_velocity.get(member_id, (0.0, 0.0))
         return collision.MemberState(
             runtime_id=member_id,
             x=left + w / 2.0,
             y=top + h / 2.0,
             radius_x=w / 2.0,
             radius_y=h / 2.0,
-            vx=0.0,
-            vy=0.0,
+            vx=vx,
+            vy=vy,
             mass=collision.calculate_mass(
                 w / 2.0, h / 2.0, collision_mass_scale=self.mass_scale),
             is_infinite_mass=True,

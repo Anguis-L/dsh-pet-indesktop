@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 
 from . import collision
 from .sprite_collision import STATIC_HIT_MIN_DV, capsule_circles
@@ -65,6 +66,20 @@ __all__ = ["IslandCollisionBridge", "IslandWindowBridge"]
 # bump 强度口径（旧架构 island_collision._apply_feedback: bump(min(3.0, j/400.0))）
 BUMP_STRENGTH_DIVISOR = 400.0
 BUMP_STRENGTH_MAX = 3.0
+
+# 岛速估计参数（口径整体沿用 island_collision._update_motion:204-266）：
+# 拖岛拍鱼靠岛速进求解器的相对法向速度，岛速恒 0 就只剩位置分离（平推）。
+# - 采样最小间隔（s）：拖拽时几何回调可达 100Hz+，dt 常低于它——"跳过"而不是
+#   "清零并刷新采样点"，否则拖拽全程岛速恒 0（实机教训）；
+# - 有效采样间隔上限（s）：超过它按首次接触处理，不估计；
+# - 瞬移跳变守卫：位移超过"极速×间隔 + 岛宽"即视为瞬移（换屏/夹回）；
+# - 采样最小位移（px）：低于它视为静止；
+# - 岛速上限（px/s）：仅拖拽中的快速甩动是合法拍鱼，钳到上限。
+_MOTION_MIN_DT = 0.01
+_MOTION_MAX_DT = 0.5
+_MOTION_JUMP_SPEED = 3000.0
+_MOTION_MIN_STEP = 1.0
+_MAX_ISLAND_SPEED = 1500.0
 
 
 def _validated_geometry(left, top, width, height):
@@ -109,16 +124,31 @@ class IslandCollisionBridge:
     几何状态与可见性在 ``detach`` 后保留：再次 ``attach`` 会按最新状态复墙。
     """
 
-    def __init__(self, *, bump=None, sound=None, member_id: str | None = None) -> None:
+    def __init__(self, *, bump=None, sound=None, member_id: str | None = None,
+                 island=None, clock=None) -> None:
         # bump 反馈挂点：callable(strength, dir_x, dir_y)；异常静默降级
         self._bump = bump
         # 音效 hook：对象需有 on_collision(event)（如 sprite_sound.SpriteSoundPlayer）
         self._sound = sound
         self._member_id = str(member_id or collision.ISLAND_MEMBER_ID)
+        # 岛对象（可空，鸭子类型）：岛速守卫读它的 ``_geo_to``（几何动画中）与
+        # ``_dragging``（拖拽中）。直接喂几何的非 QWidget 岛可不传（视为
+        # 非动画、非拖拽）。
+        self._island = island
+        # 采样时钟：默认 time.monotonic；测试注入假钟即可确定性推进，不 sleep。
+        self._clock = clock if callable(clock) else time.monotonic
         self._world = None
         self._visible = True
         self._geometry: tuple[float, float, float, float] | None = None
-        self._applied: tuple[float, float, float, float] | None = None
+        # _applied 含岛速：岛停下时 rect 不变但速度要归零，速度必须参与比较
+        # （否则早退分支留住旧速度，岛停了还在拍鱼）。
+        self._applied: tuple[float, float, float, float, float, float] | None = None
+        # 岛速估计采样状态（见 _update_motion）
+        self._last_center: tuple[float, float] | None = None
+        self._last_motion_ts = 0.0
+        self._last_size: tuple[float, float] | None = None
+        self._vx = 0.0
+        self._vy = 0.0
         self.bumps = 0
 
     # ---------------------------------------------------------------- 只读状态
@@ -162,6 +192,7 @@ class IslandCollisionBridge:
         """摘下监听器与静态成员（幂等，零残留）；几何/可见性状态保留。"""
         world, self._world = self._world, None
         self._applied = None
+        self.reset_motion()  # 摘线后重挂从静止起步，不把旧岛速带进新世界
         if world is None:
             return
         try:
@@ -179,36 +210,121 @@ class IslandCollisionBridge:
 
         返回几何是否有效（有效 = 已按当前可见性登记；无效 = 不作为墙，既有
         注册一并撤下）。
+
+        本入口也是岛速采样点（``sync_geometry``/``update_geometry`` 汇聚处）：
+        估计出的 (vx, vy) 随 ``_sync`` → ``add_static_member`` 一并传给世界，
+        求解器才有相对接近速度（拖岛拍鱼 = 冲量弹开，而不是只做位置分离）。
         """
-        self._geometry = _validated_geometry(left, top, width, height)
+        rect = _validated_geometry(left, top, width, height)
+        self._geometry = rect
+        if rect is None:
+            self.reset_motion()
+        else:
+            self._update_motion(rect)
         self._sync()
-        return self._geometry is not None
+        return rect is not None
 
     def set_visible(self, visible: bool) -> None:
         """岛显隐：隐藏 → 撤墙（不留幽灵墙），显示 → 按最近几何复墙。"""
         self._visible = bool(visible)
+        if not self._visible:
+            self.reset_motion()  # 隐藏期间不残留墙速，复墙从静止起步
         self._sync()
 
     def _sync(self) -> None:
-        """把「可见 + 几何有效」的目标状态落到碰撞世界（无变化则不打脏）。"""
+        """把「可见 + 几何有效」的目标状态落到碰撞世界（无变化则不打脏）。
+
+        目标态含岛速：同 rect 但速度变化（岛停下/起步）也必须重登记，否则
+        早退分支会把旧速度留在世界里继续拍鱼。
+        """
         world = self._world
         if world is None:
             return
-        target = self._geometry if (self._visible and self._geometry is not None) else None
+        target = None
+        if self._visible and self._geometry is not None:
+            target = (*self._geometry, self._vx, self._vy)
         if target == self._applied:
             return  # 幂等：同状态重复同步不重复登记、不打脏静止豁免
         try:
             if target is None:
                 world.remove_static_member(self._member_id)
             else:
-                left, top, width, height = target
+                left, top, width, height, vx, vy = target
                 world.add_static_member(
                     self._member_id, left, top, width, height,
-                    circles=capsule_circles(left, top, width, height))
+                    circles=capsule_circles(left, top, width, height),
+                    vx=vx, vy=vy)
         except Exception:
             logger.debug("island_bridge: 岛静态成员同步失败", exc_info=True)
             return
         self._applied = target
+
+    # ---------------------------------------------------------------- 岛速估计
+    def reset_motion(self) -> None:
+        """作废岛速采样基线并清零（换屏/原点迁移等坐标系跳变后调用）。"""
+        self._vx = 0.0
+        self._vy = 0.0
+        self._last_center = None
+        self._last_motion_ts = 0.0
+        self._last_size = None
+
+    def _update_motion(self, rect: tuple[float, float, float, float]) -> None:
+        """从相邻两次几何采样估计岛速（口径对齐 island_collision._update_motion）。
+
+        守卫逐条（旧代码注释记载的实机教训，一条都不能少）：
+
+        ① 几何动画期间（岛 ``_geo_to`` 非 None）速度清零不采样——展开动画
+           峰值约 2600px/s，会把旁边静止的鱼凭空拍飞；
+        ② 尺寸变化（展开/收起卡片、停靠切换、文本变长）只重置采样点不估计；
+        ③ dt<0.01s 的过密样本"跳过"而不是清零——拖拽几何回调可达 100Hz+，
+           清零刷新采样点会让拖拽全程岛速恒 0（实机教训）；
+        ④ 瞬移跳变守卫：位移超过"极速×间隔 + 岛宽"即视为瞬移，清零重置；
+        ⑤ 仅拖拽中允许把超速钳到 ``_MAX_ISLAND_SPEED``；非拖拽的极速位移
+           必是瞬移/尺寸变化残留，清零重置。
+        """
+        if getattr(self._island, "_geo_to", None) is not None:
+            self.reset_motion()
+            return
+        left, top, w, h = rect
+        size = (w, h)
+        if self._last_size is not None and size != self._last_size:
+            self._vx = self._vy = 0.0
+            self._last_center = None
+            self._last_size = size
+            return
+        self._last_size = size
+        cx, cy = left + w / 2.0, top + h / 2.0
+        now = self._clock()
+        if self._last_center is not None:
+            dt = now - self._last_motion_ts
+            if dt < _MOTION_MIN_DT:
+                return  # 高频回调样本太密：保留上次速度，不刷新采样点
+            dx, dy = cx - self._last_center[0], cy - self._last_center[1]
+            jump = math.hypot(dx, dy)
+            if jump > _MOTION_JUMP_SPEED * dt + w:
+                self._vx = self._vy = 0.0
+                self._last_center = (cx, cy)
+                self._last_motion_ts = now
+                return
+            if dt <= _MOTION_MAX_DT and jump >= _MOTION_MIN_STEP:
+                vx, vy = dx / dt, dy / dt
+                speed = math.hypot(vx, vy)
+                if speed > _MAX_ISLAND_SPEED:
+                    if getattr(self._island, "_dragging", False):
+                        # 拖拽中的快速甩动是合法拍鱼：钳到上限
+                        vx *= _MAX_ISLAND_SPEED / speed
+                        vy *= _MAX_ISLAND_SPEED / speed
+                    else:
+                        self._vx = self._vy = 0.0
+                        self._last_center = (cx, cy)
+                        self._last_motion_ts = now
+                        self._last_size = size
+                        return
+                self._vx, self._vy = vx, vy
+            else:
+                self._vx = self._vy = 0.0
+        self._last_center = (cx, cy)
+        self._last_motion_ts = now
 
     # ---------------------------------------------------------------- 撞击反馈
     def _hit_floor(self) -> float:
@@ -294,7 +410,7 @@ class IslandWindowBridge:
     """
 
     def __init__(self, island, world=None, overlay=None, *, sound=None,
-                 bump=None, member_id: str | None = None) -> None:
+                 bump=None, member_id: str | None = None, clock=None) -> None:
         self._island = island
         origin = overlay.geometry().topLeft() if overlay is not None else None
         self._origin = (float(origin.x()), float(origin.y())) if origin is not None else (0.0, 0.0)
@@ -302,7 +418,7 @@ class IslandWindowBridge:
         self._filter_installed = False
         self._core = IslandCollisionBridge(
             bump=bump if bump is not None else self._bump_island,
-            sound=sound, member_id=member_id)
+            sound=sound, member_id=member_id, island=island, clock=clock)
         self._wire_island()
         if world is not None:
             self.attach(world)
@@ -398,8 +514,13 @@ class IslandWindowBridge:
 
     # ---------------------------------------------------------------- 几何/反馈
     def set_origin(self, origin) -> None:
-        """overlay 重建/换屏后更新全局原点并重算局部几何（鸭子类型 x()/y()）。"""
+        """overlay 重建/换屏后更新全局原点并重算局部几何（鸭子类型 x()/y()）。
+
+        坐标系跳变不是岛在动：先作废岛速采样基线，避免把原点平移误当成
+        岛速（否则换屏瞬间会把旁边的鱼拍飞）。
+        """
         self._origin = (float(origin.x()), float(origin.y()))
+        self._core.reset_motion()
         self.sync_geometry()
 
     def update_geometry(self, left, top, width, height) -> bool:
