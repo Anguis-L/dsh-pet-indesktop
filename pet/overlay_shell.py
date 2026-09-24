@@ -1444,6 +1444,12 @@ class OverlayShell(QObject):
     def set_on_top(self, on: bool, *, persist: bool = True) -> None:
         """窗口置顶（window.py set_on_top 等价）。"""
         on = bool(on)
+        current = bool(self.overlay.windowFlags()
+                       & Qt.WindowType.WindowStaysOnTopHint)
+        if on == current:
+            # 同值早退（防御性）：setWindowFlag 会重建原生窗口并先隐藏，
+            # 重复调用（refresh_settings 每次都走这里）会造成可见闪烁。
+            return
         was_visible = self.overlay.isVisible()
         self.overlay.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         if was_visible:

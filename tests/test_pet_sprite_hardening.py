@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from pet import catalog
@@ -66,6 +66,50 @@ class FakeLibrary:
         return self._clip
 
 
+class DeferredFrameClip(QObject):
+    """首帧异步交付的假 clip：deliver() 前 currentImage() 为 None。
+
+    记录 jumpToFrame/start 调用顺序，验证 bind_clip 在 start() 前同步取帧 0
+    （旧机 window.py:1549-1554 语义）。
+    """
+
+    frameChanged = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.delivered = False
+        self.calls: list[str] = []
+        self.image = QImage(640, 360, QImage.Format.Format_ARGB32)
+        self.image.fill(Qt.GlobalColor.transparent)
+
+    def currentFrameNumber(self):
+        return 0
+
+    def currentImage(self):
+        return self.image if self.delivered else None
+
+    def currentPixmap(self):
+        return None
+
+    def frameCount(self):
+        return 1
+
+    def jumpToFrame(self, index):
+        self.calls.append(f"jump:{index}")
+        return True
+
+    def start(self):
+        self.calls.append("start")
+        return True
+
+    def stop(self):
+        self.calls.append("stop")
+
+    def deliver(self):
+        self.delivered = True
+        self.frameChanged.emit(0)
+
+
 class CountingPetSprite(PetSprite):
     """统计帧重建次数的 PetSprite（验证 dpr 变化触发重建）。"""
 
@@ -87,6 +131,43 @@ def _half_opaque_clip():
         for y in range(360):
             clip.image.setPixel(x, y, 0xFF112233)
     return clip
+
+
+# ---------------------------------------------------------------- clip 绑定（切动画不闪消失）
+def test_bind_clip_primes_frame_zero_and_keeps_previous_frame():
+    """换 clip：start() 前同步 jumpToFrame(0)，且显示槽从不清空（回归）。
+
+    旧行为 bind_clip 把 _pixmap 清空，新 clip 首帧异步到货前 paint 直接
+    return → sprite 区域画透明 = 桌宠闪消失一瞬。保留上一帧兜底 + 同步取
+    帧 0（旧机 window.py:1549-1554 的 stop→jumpToFrame(0)→start 语义）。
+    """
+    first = _half_opaque_clip()
+    sprite = PetSprite(FakeLibrary(first), pos=QPointF(100, 100), scale=0.5)
+    sprite.bind_clip("a")
+    sprite._rebuild_pixmap()
+    assert sprite._pixmap is not None
+
+    second = DeferredFrameClip()
+    sprite.library = FakeLibrary(second)
+    sprite.bind_clip("b")
+    # start() 前同步取帧 0（对齐 window.py:1554）
+    assert second.calls == ["jump:0", "start"]
+    # 首帧异步到货前：上一帧仍在显示槽，paint 不画空
+    assert sprite._pixmap is not None
+    canvas = QImage(200, 200, QImage.Format.Format_ARGB32)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    try:
+        sprite.paint(painter)
+    finally:
+        painter.end()
+    assert canvas.pixelColor(110, 110).alpha() > 0
+
+    # 新帧到货：按新签名重建并覆盖（保留的旧帧只是兜底）
+    second.deliver()
+    sprite._rebuild_pixmap()
+    assert sprite._frame_sig is not None
+    assert sprite._frame_sig[0] == id(second)
 
 
 # ---------------------------------------------------------------- D2：DPR 归一化

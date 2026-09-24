@@ -73,6 +73,33 @@ def test_start_delivers_first_frame_async(tmp_path):
         clip.close()
 
 
+def test_start_keeps_warm_frame_until_first_frame_arrives(tmp_path):
+    """切动画瞬间不清显示槽：start() 前预热的首帧必须活到帧 0 到货。
+
+    旧行为在 _pending 没有 0 号帧时把 _img/_pm 清空，帧 0 要等共享预取
+    线程异步交付；这期间 sprite.paint 取不到帧直接 return → sprite 区域
+    画透明 = 桌宠闪消失一瞬（回归）。旧架构语义见 window.py:1542-1557：
+    stop→jumpToFrame(0) 同步拿首帧→start，显示槽从不清空。
+    """
+    d = tmp_path / "clip"
+    _make_frames(d)
+    clip = FrameSeqClip(d)
+    hits = []
+    clip.frameChanged.connect(hits.append)
+    try:
+        clip.warm_first_frame()                 # 状态机切动画前的预热（同步首帧）
+        warm = clip.currentImage()
+        assert warm is not None
+        assert clip.start() is True
+        # 异步帧 0 到货前：显示槽保持预热帧，不得清空
+        assert clip.currentImage() is warm
+        assert clip.currentPixmap() is not None
+        _pump_until(lambda: hits == [0])        # 到货后自然被新帧覆盖
+        assert clip.currentImage() is not None
+    finally:
+        clip.close()
+
+
 def test_playthrough_ends_with_finished(tmp_path):
     d = tmp_path / "clip"
     _make_frames(d, count=3)

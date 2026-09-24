@@ -31,9 +31,23 @@ def _simulate_no_frame_yet(win):
     frame_ready），托盘图标 bug 的「首帧未就绪」前提已无法自然复现；
     这两个用例关心的是该前提下 icon_pixmap/frame_ready 的契约行为，
     因此显式清状态模拟。
+
+    fix 1 起「切动画不清显示槽」（FrameSeqClip.start 保留预热/同步跳帧的
+    首帧直到新帧到货），只清窗口缓存已不足以模拟「一帧都拿不到」——
+    ``icon_pixmap`` 在 ``_frame_pixmap`` 为空时会回退读 idle clip 的
+    ``currentPixmap()``，clip 侧显示槽也必须清空（FrameSeqClip/WebMClip
+    都提供 clear_display_frame；无该能力的替身 clip 用 getattr 跳过）。
     """
     win._frame_pixmap = None
     win._frame_ready_emitted = False
+    idle = getattr(win, "idle", None)
+    movies = [getattr(win, "movie", None)]
+    if idle:
+        movies.append(win.lib.movie(idle))
+    for movie in movies:
+        clear = getattr(movie, "clear_display_frame", None)
+        if callable(clear):
+            clear()
 
 
 class _FakeSignal:

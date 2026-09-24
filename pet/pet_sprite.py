@@ -522,14 +522,22 @@ class PetSprite(QObject):
         self._clip_name = name
         self._clip = self.library.movie(name)
         self._clip.frameChanged.connect(self._on_frame_changed)
-        # 换 clip 后签名/缓存作废；首帧到达前先按脏处理，保证首 tick 上屏
+        # 换 clip 后签名/缓存作废；首帧到达前先按脏处理，保证首 tick 上屏。
+        # **不清 self._pixmap**：旧 clip 的最后一帧留作兜底（_frame_sig=None
+        # 已强制按新签名重建，新帧到货即覆盖）——清掉会让新 clip 首帧异步
+        # 到货前 paint 画透明，桌宠闪消失一瞬。
         self._frame_sig = None
-        self._pixmap = None
         self._hit_image = None
         self._frame_dirty = True
         setter = getattr(self._clip, "set_playback_speed", None)
         if callable(setter):
             setter(self.playback_speed)
+        # start() 前同步取第 0 帧（旧机 window.py:1549-1554 的
+        # stop→jumpToFrame(0)→start 语义）：帧序列 clip 的 start 是异步交付
+        # 首帧，先同步跳帧才能保证显示槽立刻有帧可画。
+        jump = getattr(self._clip, "jumpToFrame", None)
+        if callable(jump):
+            jump(0)
         start = getattr(self._clip, "start", None)
         if callable(start):
             start()
