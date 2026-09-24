@@ -1423,6 +1423,7 @@ class OverlayShell(QObject):
         self.app.installEventFilter(self)  # Esc 全局兜底（弹弓取消）
         if self.tray is not None:
             self.tray.show()
+            self._arm_tray_icon_refresh()
         # 音乐（歌词）：配置开着才装/启（默认关 → 一行不跑，与 legacy 同纪律）
         self.sync_music_lyric()
 
@@ -1579,6 +1580,42 @@ class OverlayShell(QObject):
         if pm is not None:
             return QIcon(pm)
         return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+    def _arm_tray_icon_refresh(self) -> None:
+        """首帧就绪后把托盘图标从占位换成角色头像。
+
+        legacy 同款修复（app.py:3132-3148：占位图标 + frame_ready 换头像）的
+        sprite 壳等价物——sprite 没有 frame_ready 信号，用 500ms 短轮询。
+        必须有这一步：托盘图标只在建造时取一次，而 ``_build_tray`` 跑在
+        ``overlay.show()`` 之前，此刻 sprite 首帧尚未上屏、clip 也未起播，
+        ``icon_pixmap`` 只能回退系统占位图标，不刷新就永远显示不出鱼。
+        """
+        if self.tray is None:
+            return
+        if self._refresh_tray_icon_once():
+            return
+        self._tray_icon_retries = 0
+        timer = QTimer(self)
+        timer.setInterval(500)
+        timer.timeout.connect(self._poll_tray_icon)
+        self._tray_icon_timer = timer
+        timer.start()
+
+    def _poll_tray_icon(self) -> None:
+        """500ms 轮询槽：换头像成功或超过 20 次（10s，保占位不再刷）即停表。"""
+        self._tray_icon_retries += 1
+        if self._refresh_tray_icon_once() or self._tray_icon_retries >= 20:
+            timer = getattr(self, "_tray_icon_timer", None)
+            if timer is not None:
+                timer.stop()
+
+    def _refresh_tray_icon_once(self) -> bool:
+        """能拿到角色帧就把托盘图标换成它；返回是否已换（拿到帧）。"""
+        pm = self.icon_pixmap(64)
+        if pm is None or self.tray is None:
+            return False
+        self.tray.setIcon(QIcon(pm))
+        return True
 
     # ---------------------------------------------------------------- 图标面
     def _idle_first_frame_pixmap(self):
