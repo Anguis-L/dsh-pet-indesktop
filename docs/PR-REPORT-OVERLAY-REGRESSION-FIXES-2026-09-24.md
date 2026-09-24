@@ -123,6 +123,13 @@ arm 与「cancel 真取消活跃会话」原子绑定（edge_probe.py:283-287）
 - 修复 4 曲线路径 vs 线性路径：单 sprite 20 万 tick offscreen 实测
   21.515µs → 21.642µs（**+0.128µs/tick**，上界 ≤ T0 6ms 档的 0.04%）；
   `set_flight_anim_speed` 稳态 0.836µs/次。无新线程、无按 tick 增长内存。
+- **可复现命令（M16 补正，2026-09-24 下午主线补跑）**：
+  `QT_QPA_PLATFORM=offscreen PYTHONPATH=<repo> ./.venv/Scripts/python.exe
+  .scratch/bench_perf_overheads.py`（n=50000/项）。本机复跑输出：
+  `island_update_motion 1.123µs/次`、`curve_progress_at_time 1.834µs/次`
+  （linear fallback 0.365µs/次）、`set_flight_anim_speed(steady) 0.551µs/次`
+  ——与上文 DS 侧数字同量级（µs 级、不同机器负载下绝对值有差），结论不变：
+  新增路径成本可忽略。
 - 修复 1 的收益面：切动画不再有空窗，帧 0 同步磁盘读（frameseq B 档既有
   能力），预测预热首次真正生效（此前 start 清槽把预热帧一并清掉）。
 - 修复 5 稳态开销：self_talk 仅一个单发 QTimer（间隔 ≥5s），timeout 时一次
@@ -157,8 +164,14 @@ zip 与包内检查无 frameseq 残留。
 
 ## 遗留与登记
 
+- **B2 流程登记（DS 全量审查指出，显式接受待拍板）**：PHASE4_DESIGN.md §6
+  先决条件⑤「Qt6Gui 绘制重入崩溃完成归因（未结案不得切换；新路径需先布
+  等价哨兵）」在 T5 默认化时未满足——崩溃案至今未结案（门禁 4 轮 3 绿 1 次
+  0xC0000374 退出期崩溃同族待辨），且新路径无 `qInstallMessageHandler`
+  等价哨兵。当前状态 = 先决条件未满足且未声明。选项：(a) 结案 + 布哨兵后
+  再谈默认化；(b) 用户拍板显式接受该风险继续推进（本分支现状）。在拍板前，
+  本条作为**已登记未决风险**跟随每个 PR 报告。
 - 探头重进倒计时起点语义漂移（overlay 从 cancel 起算 vs 旧机落定起算，
   飞行 >5s 丢重进资格）——另案，需用户拍板是否对齐；
-- 气泡风格/字号热改仍需重启（字段热改已修，风格在 _bind_bubble 期应用）；
 - `_MAX_ISLAND_SPEED` 在 island_bridge 与 island_collision 各一份，口径人工同步；
 - PR 推送待用户确认（§13）。

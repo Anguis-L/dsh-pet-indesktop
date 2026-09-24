@@ -76,7 +76,7 @@ fanout 决议）为过程文档（gitignored）。
 | 指标 | 实测 | 口径 |
 |---|---|---|
 | 30 分钟碰碰车长稳（offscreen，fling+岛+气泡） | 1800s 零崩溃；**1200 次碰撞**；tick p50 16.04 / p90 17.33 / **p99 42.44ms（<50ms 达标）**；paint p50 0.33 / p99 2.0ms；CPU 24.5% 单核；WS 182.5MB | `run_overlay_demo.py` 指标 JSON，exit 0 |
-| 三宠真机稳态（T5 默认拓扑） | **WS 359.2MB 稳定零增长（≤ 旧三进程 ~400MB，进程 3→1）**；CPU ≈0.66 核（16 核 ~4.1%） | PowerShell 连续采样，pid 40684 |
+| 三宠真机稳态（T5 默认拓扑） | WS 359.2MB 采样点（≤ 旧三进程 ~400MB，进程 3→1）；CPU ≈0.66 核（16 核 ~4.1%）。**勘误**：初版「稳定零增长」不成立（采样点误当曲线，原始日志 `.scratch/_cpu_3pet.log` ≈+17MB/min）；斜率收口见瘦身报告，部署版 3h 曲线 193-213MB 才是有效口径 | PowerShell 连续采样，pid 40684 |
 | 帧序列化 A/B（系统总账） | webm 68.2% → frameseq 预取版 **59.9%（−12%）**；切动画/首帧 60-166ms → **~2.5ms**；热集 ffmpeg 进程归零（唯一 webm reader 为冷集 random，设计如此） | `.scratch/frame-seq-feasibility/FEASIBILITY.md` |
 | 退役删除收益 | `import pet.app` 3394→**1612ms（−52%）**；导入期 tracemalloc 峰值 −13.6MB；`pet.*` 模块 87→81 | DS-13 A/B worktree 同脚本 |
 | 音效异步化 | 碰撞 tick 从 ~60ms（同步 winmm）回到正常水位；音效延迟 +<16ms 无感 | 岛桥刀实测 62-157ms 同步阻塞驱动 |
