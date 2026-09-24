@@ -1772,6 +1772,14 @@ class OverlayShell(QObject):
         behavior = getattr(self, "behavior", None)
         if behavior is not None:
             behavior.no_move = bool(cfg.get("no_move", False))
+            # M5d：动画间隔（动作/移动播完后的强制氛围步）同步到控制器；
+            # 改 0 由 setter 立即取消在跑的 gap
+            try:
+                gap = max(0.0, min(
+                    3600.0, float(cfg.get("animation_gap_seconds", 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                gap = 0.0
+            behavior.animation_gap_seconds = gap
 
     def _apply_effective_mouse_through(self) -> None:
         """有效穿透 = 用户手动穿透 OR 光标自动穿透（window.py:4204 同式）。"""

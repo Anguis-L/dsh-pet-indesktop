@@ -29,7 +29,10 @@ bind_clip）；drag/thrown 期间位置归鼠标路由与物理控制器，本�
 - 拖拽悬空动画（F1）：按下命中即绑 drag（无素材回退 idle 池），松手切回
   待机池（window.py:3175-3176 / 3260-3264 语义）；
 - 点击反应 = 打断当前行为播 click 池随机 clip，播完回待机
-  （window.py:3438 _on_click 语义；音效/黄金回旋等外围效果不在本层）。
+  （window.py:3438 _on_click 语义；音效/黄金回旋等外围效果不在本层）；
+- 动画间隔（M5d，config ``animation_gap_seconds``）：动作/移动播完后强制插入
+  一段待机/转向氛围步并计时，计时内待机步播完继续播氛围步，到点才回掷骰链
+  （window.py:2547-2594 语义）；点击/拖拽/抛掷接管立即取消 gap。
 
 完成判定用墙钟（tick 累加 dt ≥ clip 时长），不连 clip.finished 做状态
 推进：clip 是 library 缓存的共享资源，bind_clip 已负责启停；墙钟与解码
@@ -77,7 +80,8 @@ class _SpriteState:
 
     __slots__ = ("state", "anim", "elapsed", "duration", "move_target",
                  "pending_move", "predictor", "curve", "frames_per_loop",
-                 "loops", "loop_duration", "move_start", "suspended")
+                 "loops", "loop_duration", "move_start", "suspended",
+                 "gap_remaining")
 
     def __init__(self) -> None:
         self.state = STATE_IDLE
@@ -97,6 +101,9 @@ class _SpriteState:
         # 被接管标记（F5）：tick 见过非 normal 即置位；回到 normal 的那一
         # tick 据此判断「接管前的移动/转向计划必须撤销，绝不 snap」
         self.suspended = False
+        # 动画间隔剩余时长（秒，0 = 不在 gap；M5d，window.py:2547-2594 语义）：
+        # 动作/移动播完后强制插入待机/转向氛围步，不让动作连着动作地刷
+        self.gap_remaining = 0.0
 
 
 class BehaviorController:
@@ -125,6 +132,9 @@ class BehaviorController:
         # 不移动开关（菜单/config 写入口）：移动桶并入动作池（window.py
         # _pick_next 的 no_move 语义）
         self.no_move = False
+        # 动画间隔（config animation_gap_seconds，壳 _sync_sprite_settings 注入）：
+        # 动作/移动播完后强制插入一段待机/转向氛围步（M5d，window.py:2561-2576）
+        self._animation_gap_seconds = 0.0
         # 预测式预热（批10-A1 语义移植）：每 sprite 一个 PredictivePrewarm
         # （预测是按 sprite 的素材池掷的，控制器级共享会跨池串名）。
         # 提前量沿用旧默认 350ms；消费规则单源在 predictive_prewarm.consume
@@ -136,6 +146,30 @@ class BehaviorController:
         # 被新库复用会命中陈旧分类池（换角色/多宠生灭时拿到错素材名），
         # 且条目只增不减；弱键字典在库销毁时自动回收
         self._cats_cache: WeakKeyDictionary = WeakKeyDictionary()
+
+    # ---------------------------------------------------------------- 动画间隔（M5d）
+    @property
+    def animation_gap_seconds(self) -> float:
+        """动作/移动播完后的强制间隔（秒；0 = 关，window.py:2561-2576 语义）。"""
+        return self._animation_gap_seconds
+
+    @animation_gap_seconds.setter
+    def animation_gap_seconds(self, value) -> None:
+        """写入口（壳按 config 同步）：改 0 立即取消在跑的 gap（旧机
+        ``_cancel_animation_gap`` 的 refresh 分支，window.py:3858-3867）。"""
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        self._animation_gap_seconds = max(0.0, min(3600.0, seconds))
+        if self._animation_gap_seconds <= 0.0:
+            for st in self._states.values():
+                st.gap_remaining = 0.0
+
+    @staticmethod
+    def _cancel_gap(st: _SpriteState) -> None:
+        """立即结束 gap（点击/拖拽接管打断氛围步，window.py:_cancel_animation_gap）。"""
+        st.gap_remaining = 0.0
 
     # ---------------------------------------------------------------- 对外 API
     def tick(self, sprites, dt: float) -> None:
@@ -216,6 +250,7 @@ class BehaviorController:
         st.elapsed = 0.0
         st.duration = self._clip_duration(sprite.library, name)
         st.pending_move = None
+        self._cancel_gap(st)  # 点击打断 gap（window.py:2532 点击动画结束取消 gap）
         self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
         self._bind_with_gen(sprite, st, name)
@@ -329,11 +364,19 @@ class BehaviorController:
         if not probing:
             self._clamp_into_bounds(sprite)
         st.elapsed += dt
+        if st.gap_remaining > 0.0:
+            # gap 按墙钟流逝（旧机 QTimer 口径；dt 由 tick 驱动，降档时同步放大）
+            st.gap_remaining = max(0.0, st.gap_remaining - dt)
         if st.state == STATE_IDLE:
             if st.anim is None:
                 self._enter_idle(sprite, st, self._categories(sprite.library))
             elif st.elapsed >= st.duration:
-                self._roll_next(sprite, st)
+                # gap 内待机步播完继续播氛围步；gap 到点才回掷骰链（旧机
+                # _on_anim_ended 的 _animation_gap_active 分支）
+                if st.gap_remaining > 0.0:
+                    self._play_animation_gap_step(sprite, st)
+                else:
+                    self._roll_next(sprite, st)
             else:
                 self._maybe_predict(sprite, st)
         elif st.state == STATE_MOVE:
@@ -342,7 +385,8 @@ class BehaviorController:
                 if st.move_target is not None:
                     sprite.set_pos(st.move_target)  # 到点 snap，消除积分残差
                 sprite.set_velocity(QPointF(0, 0))
-                self._enter_idle(sprite, st, self._categories(sprite.library))
+                if not self._start_animation_gap(sprite, st):
+                    self._enter_idle(sprite, st, self._categories(sprite.library))
         elif st.state == STATE_TURN:
             if st.elapsed >= st.duration:
                 if probing:
@@ -359,14 +403,19 @@ class BehaviorController:
                     pending = st.pending_move
                     st.pending_move = None
                     if pending is None:
-                        self._enter_idle(sprite, st, self._categories(sprite.library))
+                        # gap 步可能是转向素材（池 = idles+turns）：gap 内续播
+                        # 下一段氛围步，到点回待机
+                        if not self._start_animation_gap(sprite, st):
+                            self._enter_idle(
+                                sprite, st, self._categories(sprite.library))
                     elif not self._start_move(sprite, st, pending):
                         # 移动素材开播被拒（F6）：绝不能留在 turn 态——下一个
                         # 到点分支会把朝向再翻一次。直接回收待机
                         self._enter_idle(sprite, st, self._categories(sprite.library))
         elif st.state == STATE_ACTS:
             if st.elapsed >= st.duration:
-                self._roll_next(sprite, st)
+                if not self._start_animation_gap(sprite, st):
+                    self._roll_next(sprite, st)
             else:
                 self._maybe_predict(sprite, st)
         elif st.state == STATE_CLICK:
@@ -426,6 +475,40 @@ class BehaviorController:
             st.predictor.begin_anim(name)
         return bool(ok)
 
+    # ---------------------------------------------------------------- 动画间隔（M5d）
+    def _start_animation_gap(self, sprite, st: _SpriteState) -> bool:
+        """动作/移动播完后的强制间隔（window.py:2570-2576 ``_start_animation_gap``）。
+
+        返回 False = 未进 gap（开关关 / 无待机·转向池），调用方按原链继续
+        （动作回掷骰、移动回待机）。进入 gap 时先播一段氛围步（池 = idles +
+        turns 滤掉 moves，与旧机 ``_play_animation_gap_step`` 同口径）。
+        """
+        if self._animation_gap_seconds <= 0.0:
+            return False
+        cats = self._categories(sprite.library)
+        if not self._gap_pool(cats):
+            return False
+        st.gap_remaining = self._animation_gap_seconds
+        self._play_animation_gap_step(sprite, st)
+        return True
+
+    @staticmethod
+    def _gap_pool(cats: dict) -> list:
+        """gap 氛围步候选池（window.py:2582：待机 + 转向，滤出同名移动素材）。"""
+        return [n for n in (cats["idles"] + cats["turns"]) if n not in cats["moves"]]
+
+    def _play_animation_gap_step(self, sprite, st: _SpriteState) -> None:
+        """播一段 gap 氛围步（待机或转向）；池空回退待机（防御）。"""
+        cats = self._categories(sprite.library)
+        name = self._pick(self._gap_pool(cats), exclude=st.anim)
+        if name is None:
+            self._enter_idle(sprite, st, cats)
+            return
+        if name in cats["turns"]:
+            self._enter_turn(sprite, st, cats, forced_name=name)
+        else:
+            self._enter_idle(sprite, st, cats, forced_name=name)
+
     def _roll_next(self, sprite, st: _SpriteState) -> None:
         """待机播完掷骰：30% 待机 / 10% 转向 / 40% 待机（acts 桶让位）/ 20% 移动。
 
@@ -438,7 +521,7 @@ class BehaviorController:
         if st.predictor is not None and self.predict_enabled:
             predicted = st.predictor.consume(
                 context_anim=st.anim, exclude=st.anim,
-                gap_active=False, moves=set(cats["moves"]))
+                gap_active=st.gap_remaining > 0.0, moves=set(cats["moves"]))
             if predicted is not None:
                 self._play_predicted(sprite, st, cats, predicted)
                 return
@@ -520,6 +603,7 @@ class BehaviorController:
         name = cats["drag"][0] if cats["drag"] else self._pick(cats["idles"])
         st.state = STATE_DRAG
         st.pending_move = None
+        self._cancel_gap(st)  # 拖拽接管打断 gap（window.py:4178 同款取消点）
         self._clear_move_plan(st)
         st.elapsed = 0.0
         st.anim = name
@@ -540,6 +624,7 @@ class BehaviorController:
         name = cats["drag"][0] if cats["drag"] else self._pick(cats["idles"])
         st.state = STATE_THROWN
         st.pending_move = None
+        self._cancel_gap(st)  # 抛掷接管同款取消点（window.py:4178）
         self._clear_move_plan(st)
         st.elapsed = 0.0
         st.anim = name
