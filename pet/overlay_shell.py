@@ -320,12 +320,16 @@ class ShellOverlayWindow(OverlayWindow):
             return
         grab = self._mouse_grab
         committed = self._drag_committed  # super() 的 _finish_grab 会清旗标，先快照
+        click_only = self._press_click_only  # 锁定位/SHIFT 门（同样先快照）
         press, self._press_pos = self._press_pos, None
         super().mouseReleaseEvent(event)
         if grab is None or press is None or self.behavior is None:
             return
         threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
-        if not committed and (event.position() - press).manhattanLength() < threshold:
+        # click_only：锁定位/未按 SHIFT 的按下（M5a/M5b）——位移再大也只算点击，
+        # 与旧机两处闸门「取消拖拽但保留点击」语义一致
+        if click_only or (not committed
+                          and (event.position() - press).manhattanLength() < threshold):
             # 边缘探头消费点击（PEEKING 拉直/STRAIGHTENED 重置倒计时）时，
             # 抑制点击反应与点击音效——拉直本身就是反馈
             if self.edge_probe is not None and self.edge_probe.on_sprite_clicked(grab):
@@ -1691,6 +1695,12 @@ class OverlayShell(QObject):
         self.set_on_top(bool(self._config.get("on_top", True)), persist=False)
         self._user_mouse_through = bool(self._config.get("mouse_through", False))
         self._apply_effective_mouse_through()
+        # M5a/M5b：拖拽闸门（锁定位 / SHIFT 门）推到 overlay——命中按下不进
+        # 拖拽 grab，点击语义保留（legacy window.py:3126-3133 / :3172-3181）
+        self.overlay.lock_position = bool(self._config.get("lock_position", False))
+        self.overlay.shift_drag_required = bool(self._config.get("shift_drag", False))
+        # M5c：整窗不透明度（overlay 单窗 = legacy 单宠窗口语义）
+        self.overlay.apply_opacity(self._pet_opacity_percent())
         self._sync_sprite_settings()
         self._watcher.set_fullscreen_enabled(
             bool(self._config.get("auto_hide_fullscreen", True)))
@@ -1705,8 +1715,7 @@ class OverlayShell(QObject):
         self.behavior._predict_lead_s = lead_ms / 1000.0
         self.behavior.predict_enabled = lead_ms > 0
 
-    def set_on_top(self, on: bool, *, persist: bool = True) -> None:
-        """窗口置顶（window.py set_on_top 等价）。"""
+    def set_on_top(self, on: bool, *, persist: bool = True) -> None:        """窗口置顶（window.py set_on_top 等价）。"""
         on = bool(on)
         current = bool(self.overlay.windowFlags()
                        & Qt.WindowType.WindowStaysOnTopHint)
@@ -2306,9 +2315,13 @@ class OverlayShell(QObject):
 
     def _on_collision_squash(self, event) -> None:
         """碰撞 Q 弹（旧权威冲量路径的 squash 语义）：真撞击量级时
-        双方 sprite 各压一次。runtime_id 反查 sprite（成员少，线性即可）。"""
-        if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
-            return
+        双方 sprite 各压一次。runtime_id 反查 sprite（成员少，线性即可）。
+
+        不再用 hit_min_dv 二次过滤：CollisionEvent 只在真撞击时 fire，
+        且阈值已按 pair 类型分级（普通 300 / 撞静态成员 60 / thrown 任意）——
+        壳层再按 300 卡一刀会把 60-300 的岛撞（合法真撞击）整段截掉
+        （旧机低速撞岛也会挤压）。
+        """
         from .sprite_collision import SpriteCollisionWorld
         for sprite in self.overlay.sprites:
             if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
@@ -2322,9 +2335,10 @@ class OverlayShell(QObject):
 
         arm 只认「本次真取消了活跃探头会话」这个显式事实（探头入口的返回
         值）——探头侧的 5 秒重进倒计时会残留，不能反过来当证据。
+
+        同 _on_collision_squash：不按 hit_min_dv 二次过滤（事件的阈值已按
+        pair 分级，岛撞 60-300 也是合法真撞击，旧机同样取消探头会话）。
         """
-        if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
-            return
         probe = getattr(self, "_probe", None)
         egg = getattr(self, "_throw_egg", None)
         if probe is None and egg is None:

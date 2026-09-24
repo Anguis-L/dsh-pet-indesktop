@@ -2437,12 +2437,24 @@ class AppShell:
 
     def _aggregate_pet_visible(self) -> bool:
         """是否有任一窗可见（聚合可见态——灵动岛按它同步 set_pet_visible）。"""
+        overlay = getattr(self, "_overlay_shell", None)
+        if overlay is not None:
+            # overlay 拓扑：instances[].win 恒为 None（PetWindow 不构造），
+            # 聚合可见态由唯一合成窗承担。
+            return overlay.overlay.isVisible()
         return any(
             inst.win is not None and getattr(inst.win, "isVisible", lambda: True)()
             for inst in self._instances
         )
 
     def _toggle_pet_from_island(self) -> None:
+        # overlay 拓扑：inst.win 全为 None，旧循环拿不到任何窗——路由到
+        # OverlayShell（其 set_pet_visible 自带岛状态同步与共享子系统
+        # pause/resume，语义 = 下方 legacy 全窗 toggle 的单窗形态）。
+        overlay = getattr(self, "_overlay_shell", None)
+        if overlay is not None:
+            overlay._toggle_pet_visible()
+            return
         # 批5.2a §③.4：灵动岛单击 toggle **全部**窗（任一可见 → 全部隐藏；否则全部显示），
         # 并按聚合可见态同步 set_pet_visible（替代 spike 只 toggle 主窗的 P2-5 缺口）。
         wins = [inst.win for inst in self._instances if inst.win is not None]
