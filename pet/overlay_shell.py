@@ -94,6 +94,7 @@ from .speech_bubble import list_self_talk_images
 from .sprite_behavior import (
     STATE_ACTS,
     STATE_CLICK,
+    STATE_IDLE,
     STATE_MOVE,
     BehaviorController,
 )
@@ -197,6 +198,53 @@ class _GoldenSpinSpriteHost:
         apply = getattr(sprite, "set_throw_rotation", None)
         if callable(apply):
             apply(float(spin.current_angle_deg()))
+
+
+class _MusicSingChain:
+    """音乐唱歌续播（``window.py:2473-2481 _on_anim_ended`` 的 sprite 等价物）。
+
+    sprite 行为控制器没有动画结束回调面（``sprite_behavior`` 的收口在 tick），
+    改由驱动器 extras 每 tick 观测：唱歌 clip 自然播完回待机链时，只要音乐
+    还在放就立即无缝重播（旧机 ``_music_sing_enabled and _music_sing_active``
+    分支，不再每次查音频 COM）。用户点击/拖拽/掷骰接管唱歌时不再续播
+    （旧机点击动画结束没有唱歌分支，同款语义）。
+    """
+
+    def __init__(self, shell) -> None:
+        self._shell = shell
+        self._was_singing = False
+
+    def tick(self, sprites, dt: float) -> None:
+        shell = self._shell
+        sprite = getattr(shell, "sprite", None)
+        behavior = getattr(shell, "behavior", None)
+        if sprite is None or behavior is None:
+            return
+        if not bool(getattr(shell, "_music_sing_active", False)):
+            self._was_singing = False
+            return
+        state = behavior.state_of(sprite)
+        if state == STATE_ACTS and behavior.anim_of(sprite) == _sing_anim():
+            self._was_singing = True
+            return
+        if self._was_singing and state == STATE_IDLE:
+            # 唱歌 clip 播完 → 音乐仍在放则续播（同一 clip，首帧必热）
+            self._was_singing = False
+            shell.switch_clip(_sing_anim())
+            return
+        self._was_singing = False
+
+
+def _sing_anim() -> str:
+    """唱歌动画名（与旧架构同源常量，杜绝第二套字符串）。
+
+    惰性 import：``window_alerts.check_music_sing`` 本身就有
+    ``from .window import SING_ANIM``（共享实现的既定依赖），这里沿用同一
+    依赖面；只在功能真的启用（``_music_sing_active``）时才会被调用，未开启
+    该设置的普通 overlay 进程不多付一次 pet.window 导入。
+    """
+    from .window import SING_ANIM
+    return SING_ANIM
 
 
 class _LinkAnimChain:
@@ -652,6 +700,10 @@ class OverlayShell(QObject):
         # 自言自语族（周期气泡 / 点击台词 / 配图 / 朗读）：旧架构唯一宿主是
         # PetWindow（window.py:458-480 + :740），overlay 拓扑下必须由本壳装配
         self._init_self_talk()
+        # 音乐自动唱歌（M5f）：轮询定时器 + 唱歌续播链（extras 尾段观测唱歌结束）
+        self._init_music_sing()
+        self._music_sing_chain = _MusicSingChain(self)
+        self.driver.add_extra_controller(self._music_sing_chain)
         # 4.3 后半：联动动作链接续控制器（extras 尾段观测一次性动作结束边沿）
         self._link_chain = _LinkAnimChain(self)
         self.driver.add_extra_controller(self._link_chain)
@@ -1102,6 +1154,80 @@ class OverlayShell(QObject):
             if self._show_click_self_talk(click_name):
                 self._schedule_self_talk(after_display=True)
 
+    # ---- 音乐自动唱歌（M5f：window_alerts host 形函数复用 + 定时器 + 热改）----
+    def _init_music_sing(self) -> None:
+        """音乐检测轮询装配（``window.py:484-490`` 的 sprite 等价物）。
+
+        overlay 拓扑下 PetWindow 不构造，``music_sing_enabled`` 此前零消费。
+        检测/唱歌态/静音宽限期整体复用 ``window_alerts`` 的 host 形函数
+        （``start_music_sing_polling`` / ``check_music_sing``），本壳只补
+        host 面（定时器 + ``_switch`` / ``_is_one_shot_playing`` / 可见性）。
+        构造期与旧机一致：开关开着就先起表（不可见时判定自身早退）。
+        """
+        self._music_sing_enabled = bool(self._config.get("music_sing_enabled", False))
+        self._music_sing_active = False
+        self._music_sing_silent_since = None
+        self._instrumental_playing = False
+        timer = QTimer(self)
+        # 1s 轮询：兼顾 COM 开销与「识别到音频后尽快触发」的体验（旧机同值）
+        timer.setInterval(1000)
+        timer.timeout.connect(self._check_music_sing)
+        self._music_sing_timer = timer
+        if self._music_sing_enabled:
+            self._music_sing_timer.start()
+
+    def _check_music_sing(self) -> None:
+        """轮询槽（host 形转发 ``window_alerts.check_music_sing``）。"""
+        window_alerts.check_music_sing(self)
+
+    def _switch(self, name: str) -> None:
+        """``PetWindow._switch`` 的 sprite 等价物（唱歌入口 ``_switch(SING_ANIM)``）。"""
+        self.switch_clip(name)
+
+    def _is_one_shot_playing(self) -> bool:
+        """一次性动作/点击/移动是否在播（window.py ``_is_one_shot_playing`` 等价）。
+
+        检测到音乐时若正在播一次性动作，先不抢绑唱歌（旧机同款守卫）。
+        """
+        return self._link_anim_busy()
+
+    def set_instrumental_playing(self, on: bool) -> None:
+        """纯音乐标志（``window_optional_services.py:130-139`` 的 sprite 等价物）。
+
+        纯音乐没有可唱的句子，``window_alerts.check_music_sing`` 见标志即不唱；
+        置位时同步退出唱歌态，避免"一边关一边开"打架。
+        """
+        self._instrumental_playing = bool(on)
+        if on:
+            self._music_sing_active = False
+            self._music_sing_silent_since = None
+
+    def _stop_music_sing_polling(self) -> None:
+        """隐藏/退出：停轮询（``_pause_activity`` / ``aboutToQuit`` 同语义）。"""
+        timer = getattr(self, "_music_sing_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def sync_music_sing(self) -> None:
+        """按配置（+可见性）启停轮询（window.py:3868-3875 / :1241-1242 口径）。
+
+        - 开关关：停表并清唱歌态；
+        - 开关开且可见：``start_music_sing_polling``（含立即检查一次的 singleShot）；
+        - 开关开但隐藏：保持停止，恢复显示时由 ``set_pet_visible(True)`` 重启。
+        """
+        self._music_sing_enabled = bool(
+            self._config.get("music_sing_enabled", False))
+        timer = getattr(self, "_music_sing_timer", None)
+        if timer is None:
+            return
+        if not self._music_sing_enabled:
+            timer.stop()
+            self._music_sing_active = False
+            self._music_sing_silent_since = None
+            return
+        if self.isVisible():
+            window_alerts.start_music_sing_polling(self)
+
     # ---- 音乐（歌词）宿主（window_optional_services 四件套的 sprite 等价物）----
     def install_music_lyric(self):
         """安装歌词控制器（幂等）。
@@ -1540,6 +1666,8 @@ class OverlayShell(QObject):
             self._arm_tray_icon_refresh()
         # 音乐（歌词）：配置开着才装/启（默认关 → 一行不跑，与 legacy 同纪律）
         self.sync_music_lyric()
+        # M5f：音乐自动唱歌轮询（可见即按开关恢复；隐藏期间保持停止）
+        self.sync_music_sing()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt 命名)
         """应用级 Esc 兜底：overlay 是防抢焦点窗（WS_EX_NOACTIVATE），
@@ -1564,6 +1692,7 @@ class OverlayShell(QObject):
             timer.stop()  # M9：stop 后不再自我重排（引用环也让壳可被回收）
         self._teardown_settings_command_watch()
         self.shutdown_music_lyric()
+        self._stop_music_sing_polling()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
             bridge.close()
@@ -1585,6 +1714,7 @@ class OverlayShell(QObject):
         self._delete_runtime_marker()
         self._close_quick_chat()
         self.shutdown_music_lyric()
+        self._stop_music_sing_polling()
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
             bridge.close()
@@ -1790,6 +1920,8 @@ class OverlayShell(QObject):
                     or DEFAULT_SELF_TALK_BUBBLE_STYLE))
             self._apply_bubble_text_scale(bubble)
         self.sync_music_lyric()
+        # M5f：音乐自动唱歌开关热改（开→启轮询，关→停表并退出唱歌态）
+        self.sync_music_sing()
 
     def _apply_window_capabilities(self) -> None:
         """按当前配置应用窗口能力（4.1b parity）：on_top / 穿透复合 /
@@ -2386,6 +2518,9 @@ class OverlayShell(QObject):
 
         自言自语定时器与显隐对称（``window.py:1183`` / ``:1240``）：隐藏期间
         停表（不可见壳不冒泡），恢复显示时重排下一次。
+
+        音乐自动唱歌轮询同样对称（window.py:1145-1147 / :1241-1242）：隐藏
+        停表、恢复显示按开关重启。
         """
         if visible:
             self.overlay.show()
@@ -2396,10 +2531,12 @@ class OverlayShell(QObject):
             self._resume_shared_subsystems()
             if getattr(self, "_self_talk_timer", None) is not None:
                 self._schedule_self_talk()
+            self.sync_music_sing()
         else:
             timer = getattr(self, "_self_talk_timer", None)
             if timer is not None:
                 timer.stop()
+            self._stop_music_sing_polling()
             self._hide_bubble_for_visibility()
             self.overlay.hide()
             probe = getattr(self, "_probe", None)

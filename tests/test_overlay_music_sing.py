@@ -99,6 +99,41 @@ def test_music_sing_switches_to_sing_anim_and_back(tmp_path):
         shell._delete_runtime_marker()
 
 
+def test_music_sing_replays_clip_while_music_continues(tmp_path):
+    """唱歌 clip 播完而音乐仍在放 → 无缝续播（window.py:2473-2481 语义）。"""
+    shell, lib = _make_shell(tmp_path, {"music_sing_enabled": True})
+    from pet.window import SING_ANIM
+    lib._clips[SING_ANIM] = fac.FakeClip(SING_ANIM, 24)
+    try:
+        from pet.sprite_behavior import STATE_ACTS
+        from tests.test_sprite_behavior import ScriptedRng
+
+        shell.overlay.show()
+        app.processEvents()
+        sprite = shell.sprite
+        shell._music_sing_active = True
+        shell.switch_clip(SING_ANIM)
+        chain = shell._music_sing_chain
+        chain.tick([sprite], 0.016)                 # 观测到"正在唱歌"
+        assert chain._was_singing is True
+
+        # 唱歌 clip 到点 → 行为链回待机（确定性 rng：掷中待机桶）
+        shell.behavior.rng = ScriptedRng(rolls=[0.05])
+        shell.behavior.tick([sprite], 24 * 42 / 1000.0 + 0.1)
+        assert shell.behavior.state_of(sprite) == "idle"
+
+        chain.tick([sprite], 0.016)                 # 音乐仍在放 → 续播
+        assert shell.behavior.state_of(sprite) == STATE_ACTS
+        assert shell.behavior.anim_of(sprite) == SING_ANIM
+
+        # 纯音乐标志 / 音乐停止 → 不再续播
+        shell.set_instrumental_playing(True)
+        assert shell._music_sing_active is False
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
 def test_music_sing_config_hot_toggle(tmp_path):
     """设置页热改：开→启轮询，关→停表并退出唱歌态。"""
     shell, _lib = _make_shell(tmp_path)
