@@ -173,6 +173,32 @@ class _SpriteChatAnchor:
         self._shell.open_full_chat()
 
 
+class _GoldenSpinSpriteHost:
+    """``GoldenSpinController`` 的 sprite 宿主：``update()`` = 把当前角度写进 sprite。
+
+    旧路径由 ``PetWindow.paintEvent`` 读 ``current_angle_deg()`` 应用旋转
+    （window_effects.begin/end_rotation）；sprite 世界的绘制入口是
+    ``PetSprite.set_throw_rotation``，故控制器每次 ``win.update()`` 都等价地
+    写一次角度（0 = 回正）。目标 sprite 由 ``shell._golden_spin_target`` 指定
+    ——多宠时点击哪只转哪只（旧架构一窗一宠，天然只有一只）。
+    """
+
+    __slots__ = ("_shell",)
+
+    def __init__(self, shell) -> None:
+        self._shell = shell
+
+    def update(self) -> None:
+        shell = self._shell
+        spin = getattr(shell, "_golden_spin", None)
+        sprite = getattr(shell, "_golden_spin_target", None)
+        if spin is None or sprite is None:
+            return
+        apply = getattr(sprite, "set_throw_rotation", None)
+        if callable(apply):
+            apply(float(spin.current_angle_deg()))
+
+
 class _LinkAnimChain:
     """联动动作链接续（``window.py _on_anim_ended`` → ``_link_next_provider`` 等价物）。
 
@@ -192,7 +218,10 @@ class _LinkAnimChain:
         was_busy, self._was_busy = self._was_busy, busy
         if busy or not was_busy:
             return
-        # 一次性动作刚播完：待播优先，否则向 provider 要下一个
+        # 一次性状态（动作/点击/移动）刚播完：黄金回旋 armed 模式在此接续
+        # （旧机 _on_anim_ended → _effects_on_click_anim_finished，window.py:2533-2537）
+        shell._on_click_anim_finished()
+        # 待播优先，否则向 provider 要下一个
         # （顺序同 legacy _on_anim_ended：先消费待播，再问联动链）
         if shell._pending_link_anim:
             shell._play_pending_link_anim()
@@ -333,6 +362,11 @@ class ShellOverlayWindow(OverlayWindow):
             # 边缘探头消费点击（PEEKING 拉直/STRAIGHTENED 重置倒计时）时，
             # 抑制点击反应与点击音效——拉直本身就是反馈
             if self.edge_probe is not None and self.edge_probe.on_sprite_clicked(grab):
+                return
+            # M5e：点击触发黄金回旋（window.py:3356-3357 的同位置路由）。
+            # 返回 True = 本次点击被效果层消费（直连模式），不再播点击反应/音效
+            route_spin = getattr(self, "_click_route_spin", None)
+            if callable(route_spin) and route_spin(grab):
                 return
             clicked = self.behavior.on_sprite_clicked(grab)
             squash = getattr(grab, "squash", None)
@@ -503,9 +537,12 @@ class OverlayShell(QObject):
         self._look_busy = False
         self._last_look_ts = 0.0
         self.look_done.connect(self._on_look_done)
-        # 黄金回旋：一条表现用 QTimer（不进 tick 关键路径）
-        self._golden_spin_timer: QTimer | None = None
-        self._golden_spin_started = 0.0
+        # 黄金回旋：直接复用 golden_spin.GoldenSpinController（纯状态机：圈数
+        # 累计/逐圈加速/缓动），宿主适配器把角度写进 sprite 的整帧旋转通道。
+        # 懒建（默认关时不建对象、不 import golden_spin）。
+        self._golden_spin = None
+        self._golden_spin_host = _GoldenSpinSpriteHost(self)
+        self._golden_spin_target = None
         # 4.3 后半：共享子系统注入（等价 PetWindow 的构造参数；None = 惰性空转）
         self.agent_link_manager = agent_link_manager
         self.proactive_watcher = proactive_watcher
@@ -568,6 +605,8 @@ class OverlayShell(QObject):
         self.overlay.click_feedback = self._sound.on_click
         # 点击气泡族（余额/点击自言自语）：与 click_feedback 同位置注入
         self.overlay._on_sprite_click = self._on_sprite_click
+        # M5e：点击触发黄金回旋路由（与 _on_sprite_click 同位置注入）
+        self.overlay._click_route_spin = self._route_click_golden_spin
         # 4.1c 弹弓：controller 由 OverlayWindow 自持，这里只接 config
         # （slingshot_enabled 热读，设置页即改即生效）
         self.overlay.slingshot.config = self._config
@@ -1152,50 +1191,113 @@ class OverlayShell(QObject):
         if callable(sync):
             sync(user_text, text)
 
-    # ---- 黄金回旋（golden_spin.GoldenSpinController 的 sprite 等价物）----
-    def trigger_golden_spin(self) -> None:
-        """让主 sprite 原地逆时针转一圈。
+    # ---- 黄金回旋（复用 golden_spin.GoldenSpinController + sprite 宿主）----
+    def _golden_spin_capable(self, sprite) -> bool:
+        """sprite 是否支持整帧旋转通道（假 sprite/替身没有则整族静默降级）。"""
+        return callable(getattr(sprite, "set_throw_rotation", None))
 
-        sprite 世界的整帧旋转通道与抛掷彩蛋共用（``set_throw_rotation``），因此
-        探头激活 / 彩蛋会话在跑时让路——与 PetWindow「边缘探头激活时不叠加」
-        同一纪律。角度常量与缓动直接复用 ``golden_spin`` / ``window_effects``，
-        杜绝第二套数值。
+    def _ensure_golden_spin(self, sprite):
+        """懒建控制器（幂等）：角度写入目标切到本次的 sprite。"""
+        if not self._golden_spin_capable(sprite):
+            return None
+        spin = self._golden_spin
+        if spin is None:
+            from .golden_spin import GoldenSpinController
+
+            spin = GoldenSpinController(self._golden_spin_host)
+            self._golden_spin = spin
+        self._golden_spin_target = sprite
+        return spin
+
+    def _spin_direct(self, sprite) -> bool:
+        """立即开转（空闲开一圈；旋转中累计一圈并让当前圈快速收尾）。
+
+        语义 = ``GoldenSpinController.spin_direct``（golden_spin.py:75-82）：
+        累计圈数与逐圈加速都在控制器内部，本壳只负责选定目标 sprite。
+        """
+        spin = self._ensure_golden_spin(sprite)
+        if spin is None:
+            return False
+        spin.spin_direct()
+        return True
+
+    def trigger_golden_spin(self) -> None:
+        """右键菜单入口：让主 sprite 原地逆时针转一圈（探头/彩蛋在跑时让路）。
+
+        旧 PetWindow「边缘探头激活时不叠加」同纪律；角度状态机/缓动直接复用
+        ``golden_spin`` / ``window_effects``，杜绝第二套数值。
         """
         sprite = self.sprite
-        if sprite is None or not callable(getattr(sprite, "set_throw_rotation", None)):
+        if sprite is None or not self._golden_spin_capable(sprite):
             return
         if getattr(self._probe, "active", False) or self._throw_egg.active:
             return
-        timer = self._golden_spin_timer
-        if timer is None:
-            timer = QTimer(self)
-            timer.setInterval(16)
-            timer.timeout.connect(self._advance_golden_spin)
-            self._golden_spin_timer = timer
-        self._golden_spin_started = time.monotonic()
-        sprite.set_throw_rotation(0.0)
-        timer.start()
+        spin = self._ensure_golden_spin(sprite)
+        if spin is None:
+            return
+        spin.cancel_pending()
+        spin.start()
+
+    def _route_click_golden_spin(self, sprite) -> bool:
+        """点击触发黄金回旋路由（window_optional_services.py:242-265 的 sprite 版）。
+
+        - 直连模式（``golden_spin_direct``）或角色无点击素材：立即开转并返回
+          True，调用方不再播点击反应/音效（点击已被效果层消费）；
+        - armed 模式（有点击素材且未开直连）：记 pending 并返回 False，点击
+          动画播完后由 ``_on_click_anim_finished`` 接续（旧机同款两段式）。
+        - 开关关 / 探头激活 / sprite 不支持旋转：False（调用方走普通点击链路）。
+        """
+        if getattr(self._probe, "active", False):
+            return False
+        if not bool(self._config.get("golden_spin_on_click", False)):
+            return False
+        if not self._golden_spin_capable(sprite):
+            return False
+        spin = self._ensure_golden_spin(sprite)
+        if spin is None:
+            return False
+        direct = bool(self._config.get("golden_spin_direct", False))
+        has_clips = bool(self.cats.get("clicks"))
+        if not direct and has_clips:
+            spin.arm_after_click()
+            return False
+        spin.cancel_pending()
+        spin.spin_direct()
+        return True
+
+    def _on_click_anim_finished(self) -> None:
+        """点击动画自然结束（armed 回旋接续点，window.py:2533-2537 等价物）。"""
+        spin = getattr(self, "_golden_spin", None)
+        if spin is not None:
+            spin.consume_click_finished()
 
     def _advance_golden_spin(self) -> None:
-        from .golden_spin import GOLDEN_SPIN_DURATION_MS, GOLDEN_SPIN_END_ANGLE
-        from .window_effects import eased_progress
+        """兼容面（**deprecation**）：同步驱动控制器走一帧。
 
-        timer = self._golden_spin_timer
-        sprite = self.sprite
-        if timer is None or sprite is None:
-            return
-        elapsed_ms = (time.monotonic() - self._golden_spin_started) * 1000.0
-        if elapsed_ms >= GOLDEN_SPIN_DURATION_MS:
-            timer.stop()
-            clear = getattr(sprite, "clear_throw_rotation", None)
-            if callable(clear):
-                clear()
-            else:
-                sprite.set_throw_rotation(0.0)
-            return
-        angle = GOLDEN_SPIN_END_ANGLE * eased_progress(
-            elapsed_ms, GOLDEN_SPIN_DURATION_MS)
-        sprite.set_throw_rotation(angle)
+        M5e 后角度状态机归 ``GoldenSpinController``（16ms 自带 QTimer）；本方法
+        保留给旧调用点/测试手动推进（不等真实时钟）。
+        """
+        spin = getattr(self, "_golden_spin", None)
+        if spin is not None:
+            spin._update(time.monotonic())
+
+    @property
+    def _golden_spin_timer(self):
+        """兼容面（**deprecation**）：控制器内部计时器（无控制器 → None）。"""
+        spin = getattr(self, "_golden_spin", None)
+        return getattr(spin, "_timer", None)
+
+    @property
+    def _golden_spin_started(self) -> float:
+        """兼容面（**deprecation**）：当前圈的起算时刻（控制器私有字段映射）。"""
+        spin = getattr(self, "_golden_spin", None)
+        return float(getattr(spin, "_rev_started_at", 0.0))
+
+    @_golden_spin_started.setter
+    def _golden_spin_started(self, value: float) -> None:
+        spin = getattr(self, "_golden_spin", None)
+        if spin is not None:
+            spin._rev_started_at = float(value)
 
     # ---- 联动动作（agent_link 的 request_link_* 落点）----
     def _link_anim_busy(self) -> bool:
@@ -2527,6 +2629,7 @@ class OverlayShell(QObject):
         # 点击气泡族（余额/点击自言自语）：新 overlay 上必须重挂，否则屏迁移后
         # 点击静默丢失（与 click_feedback 同位置）
         self.overlay._on_sprite_click = self._on_sprite_click
+        self.overlay._click_route_spin = self._route_click_golden_spin
         self.overlay._full_menu_builder = (
             lambda target: build_sprite_full_menu(self, target))
         self.overlay._through_changed = self._on_user_through_changed
