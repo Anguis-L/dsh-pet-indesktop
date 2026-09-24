@@ -538,6 +538,15 @@ class OverlayWindow(QWidget):
         if self._input_controller is not None:
             self._input_controller.set_drag_active(True)
         target.on_press(event.position())
+        # F1：按下命中即播拖拽悬空动画（旧 window.py:3175-3176 进拖拽切 drag
+        # 的 sprite 版）。点击候选（松手未超 catalog.DRAG_THRESHOLD）与真拖拽
+        # 的判别仍留在壳层松手侧（overlay_shell.py:293-308），此处只负责
+        # 「按下 = 可能被拎起」的画面接管；判别为点击时 on_sprite_clicked /
+        # 控制器的接管态自愈会改绑回点击/待机动画。behavior 由集成层持有
+        # （demo / 产品壳挂在 overlay 上），未挂时 no-op。
+        behavior = getattr(self, "behavior", None)
+        if behavior is not None:
+            behavior.on_drag_started(target)
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:

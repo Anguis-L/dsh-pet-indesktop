@@ -306,6 +306,13 @@ class ShellOverlayWindow(OverlayWindow):
         elif self.edge_probe is not None:
             # 真拖拽释放（非单击）：通知探头按 tick 静止判定重新评估进入
             self.edge_probe.on_sprite_drag_released(grab)
+            # F1：真拖拽松手切回待机池（旧 window.py:3260-3264）。点击候选
+            # 分支不走这里——它由 on_sprite_clicked 改绑 click clip；无 click
+            # 素材时控制器的接管态自愈会在下一 tick 收回待机（不卡悬空动画）。
+            self.behavior.on_drag_released(grab)
+        else:
+            # 无探头世界：真拖拽松手的待机收尾同样要走到（F1）
+            self.behavior.on_drag_released(grab)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         feeding = getattr(self, "_feeding", None)

@@ -21,9 +21,10 @@ from PySide6.QtCore import QObject, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
-from pet.pet_sprite import INTERACTION_DRAG, INTERACTION_THROWN, PetSprite
+from pet.pet_sprite import INTERACTION_DRAG, INTERACTION_NORMAL, INTERACTION_THROWN, PetSprite
 from pet.sprite_behavior import (
     STATE_CLICK,
+    STATE_DRAG,
     STATE_IDLE,
     STATE_MOVE,
     STATE_TURN,
@@ -76,16 +77,22 @@ class FakeClip(QObject):
 class FakeLibrary:
     """轻量库协议：直接暴露 idles/turns/moves/clicks 池属性（无 names()）。"""
 
-    def __init__(self, *, idles, turns, moves, clicks, frames=None, strides=None):
+    def __init__(self, *, idles, turns, moves, clicks, drag=None, frames=None,
+                 strides=None, curves=None):
         self.idles = list(idles)
         self.turns = list(turns)
         self.moves = list(moves)
         self.clicks = list(clicks)
+        self.drag = drag
         frames = frames or {}
         self._clips = {}
-        for name in self.idles + self.turns + self.moves + self.clicks:
+        names = self.idles + self.turns + self.moves + self.clicks
+        if drag:
+            names = names + [drag]
+        for name in names:
             self._clips[name] = FakeClip(name, frames.get(name, 24))
         self.move_strides = dict(strides or {})
+        self.move_curves = dict(curves or {})
         self.no_mirror: set[str] = set()
 
     def movie(self, name):
@@ -241,20 +248,91 @@ def test_outward_facing_idle_roll_turns_inward():
 
 
 # ---------------------------------------------------------------- 非 normal 状态
-def test_non_normal_sprites_are_not_driven():
-    for state in (INTERACTION_DRAG, INTERACTION_THROWN):
-        lib = _make_library()
-        sprite = _make_sprite(lib)
-        sprite.interaction_state = state
-        sprite.set_velocity(QPointF(50, 0))
-        c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
-        c.predict_enabled = False
-        _run(c, sprite, 3.0)
-        assert c.state_of(sprite) is None           # 从未接管
-        assert lib.clip("idle1").start_count == 0   # 未绑定任何 clip
-        assert sprite.velocity == QPointF(50, 0)    # velocity 不被改写
-        assert c.on_sprite_clicked(sprite) is False
-        assert lib.clip("click1").start_count == 0
+def test_captured_sprites_bind_owned_clip_not_rolls():
+    """F1 语义：拖拽态只接受 drag 绑定，不接受掷骰驱动。
+
+    旧断言（「非 normal 精灵从不被接管、不绑任何 clip」）在本刀补齐悬空
+    动画后不再成立：接管期间画面归本控制器（绑 drag clip），但掷骰状态机
+    绝不推进、velocity 绝不被改写（位置归鼠标/物理）。
+    """
+    lib = _make_library(drag="hang")
+    sprite = _make_sprite(lib)
+    sprite.interaction_state = INTERACTION_DRAG
+    sprite.set_velocity(QPointF(50, 0))
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    _run(c, sprite, 3.0)
+    assert c.state_of(sprite) == STATE_DRAG
+    assert sprite._clip_name == "hang"          # 只绑 drag（悬空），不掷骰
+    assert sprite.velocity == QPointF(50, 0)    # velocity 不被改写
+    assert lib.clip("walk").start_count == 0    # 掷骰驱动的移动从未发生
+    assert c.on_sprite_clicked(sprite) is False
+    assert lib.clip("click1").start_count == 0
+
+
+# ---------------------------------------------------------------- F1：拖拽悬空动画
+def test_drag_started_binds_drag_and_release_returns_idle():
+    lib = _make_library(drag="hang")
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)                         # 先接管进待机
+    assert c.state_of(sprite) == STATE_IDLE
+
+    sprite.on_press(QPointF(10, 10))                # overlay 接线点：按下
+    c.on_drag_started(sprite)
+
+    assert c.state_of(sprite) == STATE_DRAG
+    assert sprite._clip_name == "hang"
+    assert sprite.velocity == QPointF(0, 0)
+
+    _run(c, sprite, 0.5)                            # 拖拽期间掷骰绝不改绑
+    assert c.state_of(sprite) == STATE_DRAG
+    assert sprite._clip_name == "hang"
+    assert lib.clip("walk").start_count == 0
+
+    sprite.on_release(QPointF(12, 12))              # 真拖拽松手（非甩出）
+    c.on_drag_released(sprite)
+
+    assert sprite.interaction_state == INTERACTION_NORMAL
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite._clip_name == "idle1"
+
+
+def test_drag_without_drag_asset_falls_back_to_idle_pool():
+    lib = _make_library()                           # 无 drag 素材
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+
+    sprite.on_press(QPointF(10, 10))
+    c.on_drag_started(sprite)
+
+    assert c.state_of(sprite) == STATE_DRAG
+    assert sprite._clip_name == "idle1"             # 回退 idle 池
+
+
+def test_drag_state_returns_to_idle_when_drag_ends_without_release_callback():
+    """防御：接线缺失（看门狗收尾/shell 分支没走到）时也绝不能卡在拖拽态。
+
+    sprite 已回 normal 却仍是 STATE_DRAG：tick 必须自愈回待机（绑 idle、
+    清 velocity），否则悬空动画无限循环。
+    """
+    lib = _make_library(drag="hang")
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+    sprite.interaction_state = INTERACTION_DRAG
+    c.tick([sprite], 0.016)
+    assert c.state_of(sprite) == STATE_DRAG
+
+    sprite.interaction_state = INTERACTION_NORMAL  # 看门狗已收尾，无人回调
+
+    c.tick([sprite], 0.016)
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite._clip_name == "idle1"
 
 
 # ---------------------------------------------------------------- 点击反应

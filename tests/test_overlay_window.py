@@ -235,6 +235,77 @@ def test_mouse_routing_hit_grab_and_miss():
     assert len(top.press_events) == 1 and not bottom.press_events
 
 
+# ---------------------------------------------------------------- F1：拖拽悬空动画接线
+class PoolLibrary:
+    """行为控制器可用的池协议假库（全不透明帧，便于逐像素命中）。"""
+
+    def __init__(self, *, idles, drag=None):
+        self.idles = list(idles)
+        self.turns: list = []
+        self.moves: list = []
+        self.clicks: list = []
+        self.acts: list = []
+        self.drag = drag
+        self.no_mirror: set[str] = set()
+        self._clips = {}
+        for name in self.idles + ([drag] if drag else []):
+            clip = FakeClip()
+            clip.image.fill(0xFF336699)
+            self._clips[name] = clip
+
+    def movie(self, name):
+        return self._clips[name]
+
+    def duration(self, name):
+        return 1.0
+
+    def clip(self, name):
+        return self._clips[name]
+
+
+def test_press_binds_drag_clip_and_release_self_heals_to_idle():
+    """F1：按下命中 sprite → behavior.on_drag_started 绑 drag 悬空动画。
+
+    基类 release 只做 grab 收尾（点击/拖拽判别在壳层），松手后控制器靠
+    接管态自愈回待机——这条路径覆盖「看门狗收尾 / 壳层分支没走到」。
+    """
+    from pet.sprite_behavior import STATE_DRAG, STATE_IDLE, BehaviorController
+
+    overlay = OverlayWindow()
+    lib = PoolLibrary(idles=["idle"], drag="hang")
+    sprite = PetSprite(lib, pos=QPointF(100, 100), scale=0.5)
+    sprite.bind_clip("idle")
+    sprite._rebuild_pixmap()
+    sprite._clock = lambda: 1000.0                     # 假钟：松手判静止放下
+    overlay.add_sprite(sprite)
+    behavior = BehaviorController(QRect(0, 0, 1000, 1000))
+    overlay.behavior = behavior
+
+    overlay.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, (150, 150)))
+
+    assert sprite.interaction_state == INTERACTION_DRAG
+    assert behavior.state_of(sprite) == STATE_DRAG
+    assert sprite._clip_name == "hang"                 # 按下即绑悬空动画
+
+    overlay.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, (150, 150)))
+    assert sprite.interaction_state == INTERACTION_NORMAL
+
+    behavior.tick([sprite], 0.016)                     # 接管结束自愈
+    assert behavior.state_of(sprite) == STATE_IDLE
+    assert sprite._clip_name == "idle"
+
+
+def test_press_without_behavior_is_noop():
+    """未挂 behavior 的裸 overlay（demo/旧装配）：按下不得抛异常。"""
+    overlay = OverlayWindow()
+    sprite = FakeSprite((0, 0), (100, 100))
+    overlay.add_sprite(sprite)
+    overlay.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, (30, 30)))
+    assert overlay._mouse_grab is sprite
+    assert len(sprite.press_events) == 1
+    overlay.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, (30, 30)))
+
+
 # ---------------------------------------------------------------- PetSprite
 def test_pet_sprite_frame_signature_cache():
     clip = FakeClip()
