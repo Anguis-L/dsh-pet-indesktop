@@ -28,6 +28,7 @@ from pet.pet_sprite import (
     PetSprite,
 )
 from pet.sprite_behavior import (
+    STATE_ACTS,
     STATE_CLICK,
     STATE_DRAG,
     STATE_IDLE,
@@ -49,7 +50,7 @@ class FakeClip(QObject):
     frameChanged = Signal(int)
     finished = Signal()
 
-    def __init__(self, name, frames=24):
+    def __init__(self, name, frames=24, accept_start=True):
         super().__init__()
         self.name = name
         self._frames = frames
@@ -58,6 +59,9 @@ class FakeClip(QObject):
         self.frame = 0
         self.started = False
         self.start_count = 0
+        # 开播拒绝开关（F6）：WebMClip.start() 在 reader 拒启/已 cleanup 时
+        # 返回 False，调用方必须据此放弃依赖该动画的状态
+        self.accept_start = accept_start
 
     def currentFrameNumber(self):
         return self.frame
@@ -74,7 +78,7 @@ class FakeClip(QObject):
     def start(self):
         self.started = True
         self.start_count += 1
-        return True
+        return bool(self.accept_start)
 
     def stop(self):
         self.started = False
@@ -402,6 +406,80 @@ def test_drag_release_not_taken_over_when_thrown():
     c.tick([sprite], 0.016)
     assert c.state_of(sprite) == STATE_THROWN
     assert sprite._clip_name == "hang"
+
+
+# ---------------------------------------------------------------- F6：开播失败不建计划
+def _roll_once_after_idle(c, sprite, lib):
+    """让 sprite 走完当前待机进下一次掷骰（不预设结果状态）。"""
+    c.tick([sprite], 0.016)
+    _run(c, sprite, lib.duration("idle1") + 0.1)
+
+
+def test_bind_failure_builds_no_move_plan():
+    """F6：移动素材开播被拒 → 不建立移动计划（绝不按没播的动画位移）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,), ints=(100, 0), choices=(1,)))
+    c.predict_enabled = False
+    lib.clip("walk").accept_start = False
+    _roll_once_after_idle(c, sprite, lib)
+
+    st = c._states[sprite]
+    assert lib.clip("walk").start_count == 1        # 确实尝试过开播
+    assert c.state_of(sprite) == STATE_IDLE         # acts 空 → 回退待机
+    assert st.move_target is None
+    assert st.curve is None
+    assert sprite.velocity == QPointF(0, 0)
+    assert sprite.pos == QPointF(800, 400)          # 位置一丝不动
+
+
+def test_bind_failure_falls_back_to_acts_pool():
+    """F6：开播失败走旧机同款回退链（window.py:2740 _switch 失败 → acts 池）。"""
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,), ints=(100, 0), choices=(1,)))
+    c.predict_enabled = False
+    lib.clip("walk").accept_start = False
+    _roll_once_after_idle(c, sprite, lib)
+
+    assert c.state_of(sprite) == STATE_ACTS
+    assert sprite._clip_name in ("act1", "act2")
+    assert c._states[sprite].move_target is None
+    assert sprite.velocity == QPointF(0, 0)
+
+
+def test_bind_failure_after_turn_collects_to_idle_without_double_flip():
+    """F6：转向完成时移动开播被拒 → 收口待机（不留在 turn 态二次翻朝向）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="left")       # 朝左却要向右走 → 先转向
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,), ints=(100, 0), choices=(1,)))
+    c.predict_enabled = False
+    _roll_once_after_idle(c, sprite, lib)
+    assert c.state_of(sprite) == STATE_TURN
+    lib.clip("walk").accept_start = False
+
+    _run(c, sprite, lib.duration("turn1") + 0.05)   # 转向播完 → 移动开播被拒
+
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite.facing == "right"                 # 只翻这一次
+    _run(c, sprite, lib.duration("turn1") * 2)
+    assert sprite.facing == "right"                 # 绝不二次翻转
+    assert sprite.pos == QPointF(800, 400)
+
+
+def test_play_move_once_bind_failure_returns_false():
+    """F6：菜单「移动」入口同样不建计划（返回 False，回退链兜底）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="left")       # 与默认方向（左）一致 → 直接起步
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.tick([sprite], 0.016)
+    lib.clip("walk").accept_start = False
+
+    assert c.play_move_once(sprite, "walk") is False
+
+    assert c.state_of(sprite) == STATE_IDLE
+    assert c._states[sprite].move_target is None
+    assert sprite.velocity == QPointF(0, 0)
 
 
 # ---------------------------------------------------------------- F5：接管撤销移动计划
