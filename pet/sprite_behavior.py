@@ -72,7 +72,8 @@ class _SpriteState:
     """单个 sprite 的行为状态（控制器私有，不落在 sprite 上）。"""
 
     __slots__ = ("state", "anim", "elapsed", "duration", "move_target",
-                 "pending_move", "predictor")
+                 "pending_move", "predictor", "curve", "frames_per_loop",
+                 "loops", "loop_duration", "move_start")
 
     def __init__(self) -> None:
         self.state = STATE_IDLE
@@ -82,6 +83,13 @@ class _SpriteState:
         self.move_target: QPointF | None = None
         self.pending_move: dict | None = None  # 反向前先转向的移动计划
         self.predictor = None                  # tick 创建状态时挂 PredictivePrewarm
+        # 移动计划（F3）：圈内逐帧位移曲线的位置解算输入。无 curve 的角色
+        # 保持线性（curve=None，velocity 在 _start_move 一次算好）
+        self.curve: list | None = None    # 圈内累计进度曲线（curve[i] = 源帧 i）
+        self.frames_per_loop = 0          # 每圈源帧数（曲线相位折算用）
+        self.loops = 1                    # 计划整圈数
+        self.loop_duration = 0.0          # 单圈墙钟时长（秒）
+        self.move_start: QPointF | None = None  # 计划起点（曲线绝对位置锚点）
 
 
 class BehaviorController:
@@ -192,7 +200,7 @@ class BehaviorController:
         st.elapsed = 0.0
         st.duration = self._clip_duration(sprite.library, name)
         st.pending_move = None
-        st.move_target = None
+        self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
         self._bind_with_gen(sprite, st, name)
         return True
@@ -205,7 +213,7 @@ class BehaviorController:
         st = self._states.setdefault(sprite, _SpriteState())
         st.state = STATE_ACTS
         st.pending_move = None
-        st.move_target = None
+        self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
         st.elapsed = 0.0
         st.anim = name
@@ -301,6 +309,7 @@ class BehaviorController:
             else:
                 self._maybe_predict(sprite, st)
         elif st.state == STATE_MOVE:
+            self._apply_move_curve(sprite, st, dt)
             if st.elapsed >= st.duration:
                 if st.move_target is not None:
                     sprite.set_pos(st.move_target)  # 到点 snap，消除积分残差
@@ -313,9 +322,11 @@ class BehaviorController:
                 sprite.facing = "right" if sprite.facing == "left" else "left"
                 pending = st.pending_move
                 st.pending_move = None
-                if pending is not None:
-                    self._start_move(sprite, st, pending)
-                else:
+                if pending is None:
+                    self._enter_idle(sprite, st, self._categories(sprite.library))
+                elif not self._start_move(sprite, st, pending):
+                    # 移动素材开播被拒（F6）：绝不能留在 turn 态——下一个到点
+                    # 分支会把朝向再翻一次。直接回收待机
                     self._enter_idle(sprite, st, self._categories(sprite.library))
         elif st.state == STATE_ACTS:
             if st.elapsed >= st.duration:
@@ -367,12 +378,17 @@ class BehaviorController:
             st.anim, n, 1000, 1000.0, 1, self._predict_lead_s,
             exclude=st.anim)
 
-    def _bind_with_gen(self, sprite, st: _SpriteState, name: str) -> None:
+    def _bind_with_gen(self, sprite, st: _SpriteState, name: str) -> bool:
         """bind + 预测代次推进（begin_anim 每次切换自增；作废由 consume 的
-        context/gen 校验完成，不手动清预测——GLM A4 单规则）。"""
-        sprite.bind_clip(name)
-        if st.predictor is not None:
+        context/gen 校验完成，不手动清预测——GLM A4 单规则）。
+
+        返回 ``sprite.bind_clip`` 是否被接受（F6）：起播被拒时不推进预测
+        代次，调用方据此放弃依赖该动画的状态（移动计划等）。
+        """
+        ok = sprite.bind_clip(name)
+        if ok and st.predictor is not None:
             st.predictor.begin_anim(name)
+        return bool(ok)
 
     def _roll_next(self, sprite, st: _SpriteState) -> None:
         """待机播完掷骰：30% 待机 / 10% 转向 / 40% 待机（acts 桶让位）/ 20% 移动。
@@ -416,11 +432,26 @@ class BehaviorController:
             self._enter_idle(sprite, st, cats)
 
     # ---------------------------------------------------------------- 状态进入
+    @staticmethod
+    def _clear_move_plan(st: _SpriteState) -> None:
+        """清移动计划残留（含 curve 通道）。
+
+        任何非移动态都必须调它：残留的 move_start/curve 会让「回到移动态
+        之前」的路径读到上一段计划的曲线相位（算出错位置），F5 的「接管后
+        绝不 snap」也依赖 move_target 已被清掉。
+        """
+        st.move_target = None
+        st.move_start = None
+        st.curve = None
+        st.frames_per_loop = 0
+        st.loops = 1
+        st.loop_duration = 0.0
+
     def _enter_idle(self, sprite, st: _SpriteState, cats: dict,
                     forced_name: str | None = None) -> None:
         st.state = STATE_IDLE
         st.pending_move = None
-        st.move_target = None
+        self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
         name = forced_name if forced_name is not None else self._pick(cats["idles"], exclude=st.anim)
         st.elapsed = 0.0
@@ -453,7 +484,7 @@ class BehaviorController:
         name = cats["drag"][0] if cats["drag"] else self._pick(cats["idles"])
         st.state = STATE_DRAG
         st.pending_move = None
-        st.move_target = None
+        self._clear_move_plan(st)
         st.elapsed = 0.0
         st.anim = name
         st.duration = self._clip_duration(sprite.library, name) if name else 0.0
@@ -470,7 +501,7 @@ class BehaviorController:
             return
         st.state = STATE_ACTS
         st.pending_move = None
-        st.move_target = None
+        self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
         st.elapsed = 0.0
         st.anim = name
@@ -489,7 +520,7 @@ class BehaviorController:
         st.elapsed = 0.0
         st.duration = self._clip_duration(sprite.library, name)
         st.pending_move = pending_move
-        st.move_target = None
+        self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
         self._bind_with_gen(sprite, st, name)
 
@@ -502,6 +533,10 @@ class BehaviorController:
         入口用 _effects_probe_active 整体拦住位移（防止挂着探头姿态被平移出
         屏幕边缘），sprite 世界把闸门收在这一处——掷骰、预测产物、菜单移动
         三条路径都经此，调用方按既有回退链进动作池/待机。
+
+        计划带上「圈内逐帧位移曲线」的全部解算输入（curve / frames_per_loop
+        / loops / loop_duration，F3）：旧架构 window.py:2753-2768 的计划键
+        同款，位置由曲线（而非平均速度）决定，静帧段不位移。
         """
         if getattr(sprite, "probe_active", False):
             return False
@@ -529,42 +564,108 @@ class BehaviorController:
             return False
         # 步幅整圈量化：位移锁到步态整圈，velocity=位移/时长 ⇒ 平均速度
         # 恒等于动画步态速度（防脚滑）；越界时 quantize 内部递减圈数/夹到 room。
-        _loops, distance, duration = movement.quantize_move(distance, stride, room, loop_duration)
+        loops, distance, duration = movement.quantize_move(distance, stride, room, loop_duration)
         target_cx = cx + dir_sign * distance
         target_x = target_cx - bw / 2 - off_x
         target_y = movement.wander_target_y(
             sprite.pos.y() + off_y, self.bounds.top(), self.bounds.bottom(),
             bh, self.margin, self.rng) - off_y
+        curve = (getattr(lib, "move_curves", None) or {}).get(name)
         plan = {
             "anim": name,
             "target": QPointF(target_x, target_y),
             "duration": duration,
             "facing": "right" if dir_sign > 0 else "left",
+            # 圈内逐帧位移曲线（动帧才动、静帧不动）；无曲线 → None → 线性
+            "curve": curve,
+            "frames_per_loop": self._frames_per_loop(lib, name, curve),
+            "loops": loops,
+            "loop_duration": loop_duration,
         }
         if plan["facing"] != sprite.facing and cats["turns"]:
             # 需要反向：先播 turn clip，翻朝向后由 turn 完成分支执行本计划
             self._enter_turn(sprite, st, cats, pending_move=plan)
-        else:
-            self._start_move(sprite, st, plan)
-        return True
+            return True
+        return self._start_move(sprite, st, plan)
 
-    def _start_move(self, sprite, st: _SpriteState, plan: dict) -> None:
+    @staticmethod
+    def _frames_per_loop(lib, name: str, curve) -> int:
+        """每圈源帧数：优先库的权威帧数，缺该接口时回退曲线长度。
+
+        曲线本就是「逐源帧」等长的（curve[i] = 源帧 i 的圈内进度），长度即
+        每圈帧数；仅当库未暴露 frames() 时才用（测试假库/轻量替身）。
+        """
+        frames_fn = getattr(lib, "frames", None)
+        if callable(frames_fn):
+            try:
+                count = int(frames_fn(name) or 0)
+            except (TypeError, ValueError, KeyError):
+                count = 0
+            if count > 0:
+                return count
+        return len(curve) if curve else 0
+
+    def _start_move(self, sprite, st: _SpriteState, plan: dict) -> bool:
+        """启动移动计划；返回 False = 开播被拒、计划未建立（F6）。
+
+        无 curve：velocity = 位移/时长 一次算好的匀速直线（旧语义不变）。
+        有 curve（F3）：本 tick 先不动，下一 tick 起由 _apply_move_curve 按
+        曲线**绝对目标位置**反算 velocity——起步若先按平均速度积分一帧，
+        静帧段会被提前推开一帧位移，而曲线位置只增不减、永不回退。
+        """
+        # 开播确认前不提交任何计划字段：被拒时调用方按既有回退链进动作池/
+        # 待机，绝不会出现「动画没播却在按它的 duration 位移」（window.py:
+        # 2739-2744 的 _switch 失败语义）
+        if not self._bind_with_gen(sprite, st, plan["anim"]):
+            return False
+        # 开播确认后才提交朝向（朝向只跟随真实发生的移动）。镜像在 paint
+        # 重建首帧时才取用 facing，此刻写入不产生首帧镜像错误。
+        sprite.facing = plan["facing"]
         st.state = STATE_MOVE
         st.anim = plan["anim"]
         st.elapsed = 0.0
         st.duration = plan["duration"]
         st.move_target = plan["target"]
+        st.move_start = QPointF(sprite.pos)
         st.pending_move = None
-        # 朝向先于 bind：bind 重建首帧时已按新朝向镜像，无首帧镜像错误
-        sprite.facing = plan["facing"]
-        self._bind_with_gen(sprite, st, plan["anim"])
-        if plan["duration"] > 0:
+        st.curve = plan.get("curve")
+        st.frames_per_loop = plan.get("frames_per_loop", 0)
+        st.loops = plan.get("loops", 1)
+        st.loop_duration = plan.get("loop_duration", 0.0)
+        if plan["duration"] <= 0:
+            sprite.set_pos(plan["target"])
+            sprite.set_velocity(QPointF(0, 0))
+        elif st.curve:
+            sprite.set_velocity(QPointF(0, 0))  # 下一 tick 起由曲线接管
+        else:
             vx = (plan["target"].x() - sprite.pos.x()) / plan["duration"]
             vy = (plan["target"].y() - sprite.pos.y()) / plan["duration"]
             sprite.set_velocity(QPointF(vx, vy))
-        else:
-            sprite.set_pos(plan["target"])
-            sprite.set_velocity(QPointF(0, 0))
+        return True
+
+    def _apply_move_curve(self, sprite, st: _SpriteState, dt: float) -> None:
+        """曲线驱动每 tick 目标位置 → 反算 velocity（F3）。
+
+        desired 由曲线进度（锚在计划起点的**绝对**位置）算得，故
+        ``v = (desired - pos) / dt`` 积分后恰好落在 desired：既无残差累积，
+        也不会因某 tick 的 dt 抖动而失步。静帧段 desired == 当前 pos →
+        velocity 归零 → 位置一丝不动（旧 window.py:1773-1778 的帧驱动位移）。
+
+        相位源取舍见 movement.curve_progress_at_time：旧架构用解码帧号，
+        新架构用墙钟，漂移上界亚像素。无 curve / 无计划起点 / 无 dt 时
+        no-op（线性路径的 velocity 在 _start_move 已设好）。
+        """
+        if dt <= 0 or st.curve is None or st.move_target is None or st.move_start is None:
+            return
+        progress = movement.curve_progress_at_time(
+            st.curve, st.frames_per_loop, st.loops, st.elapsed, st.loop_duration)
+        sx, sy = st.move_start.x(), st.move_start.y()
+        dx = st.move_target.x() - sx
+        dy = st.move_target.y() - sy
+        sprite.set_velocity(QPointF(
+            (sx + dx * progress - sprite.pos.x()) / dt,
+            (sy + dy * progress - sprite.pos.y()) / dt,
+        ))
 
     # ---------------------------------------------------------------- 边界
     def _clamp_into_bounds(self, sprite) -> None:

@@ -485,6 +485,73 @@ def test_clamp_pulls_out_of_bounds_sprite_back():
     assert BOUNDS.contains(sprite.rect())
 
 
+# ---------------------------------------------------------------- F3：圈内逐帧位移曲线
+def _flat_head_curve(frames=48, still_ratio=0.25):
+    """前 still_ratio 圈长走平（静帧段）、其余线性推进到 1.0 的曲线。
+
+    素材实测：左转奔跑前 23% 圈长是静止蓄力段，位移必须为 0。
+    """
+    still = max(1, int(frames * still_ratio))
+    tail = frames - still
+    return [0.0] * still + [i / (tail - 1) for i in range(tail)]
+
+
+def test_move_curve_holds_position_on_still_frames():
+    """F3：有曲线的移动——静帧段位置一丝不动，动帧段正常推进，到点仍 snap。"""
+    lib = _make_library(curves={"walk": _flat_head_curve(48, 0.25)})
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))
+    st = c._states[sprite]
+    assert c.state_of(sprite) == STATE_MOVE
+    assert st.curve is not None                 # 计划确实带回曲线（旧实现零引用）
+    start = QPointF(sprite.pos)
+
+    _run(c, sprite, lib.duration("walk") * 0.2)
+    assert sprite.pos == start                  # 静帧段：位移恒为 0
+    assert sprite.velocity == QPointF(0, 0)
+
+    _run(c, sprite, lib.duration("walk") * 0.6)
+    assert sprite.pos.x() > start.x()           # 动帧段：正常推进
+
+    _run(c, sprite, st.duration)
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite.pos == QPointF(920, 400)      # 到点仍 snap 到目标
+
+
+def test_move_without_curve_stays_linear():
+    """无曲线素材保持线性（与旧语义一致）：半程 ≈ 半位移。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))
+    st = c._states[sprite]
+    assert st.curve is None
+
+    _run(c, sprite, st.duration / 2)
+
+    assert abs(sprite.pos.x() - 860.0) <= 5.0   # 目标 920：半程 860
+
+
+def test_move_curve_multi_loop_reaches_target():
+    """多圈 + 曲线：每圈曲线各自跑满，总进度按圈数折算，终点不漂。"""
+    curve = _flat_head_curve(24, 0.25)
+    lib = _make_library(curves={"walk": curve}, frames={"walk": 24, "idle1": 24,
+                                                        "turn1": 12, "click1": 12})
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))
+    st = c._states[sprite]
+    assert st.loops == 2
+
+    _run(c, sprite, st.duration)
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite.pos == QPointF(920, 400)
+
+
 # ---------------------------------------------------------------- 分类路径
 def test_categories_via_build_categories_when_names_available():
     class NamedLibrary(FakeLibrary):
