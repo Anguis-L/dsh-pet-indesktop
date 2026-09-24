@@ -92,6 +92,11 @@ SEPARATION_DEBOUNCE_SECS = 0.24
 # 岛上的桌宠拍进 THROWN）。取值≈拖拽手势的采样间隙上界，远小于人的
 # 「按住停顿」体感（0.15s ≈ 25 tick@T0）。
 STATIC_VELOCITY_TTL_SECS = 0.15
+# 拖拽成员速度上限（px/s）：拖拽中的 sprite 自身 velocity 恒 0（on_press
+# 清零、on_move 只 set_pos），碰撞世界按相邻 tick 位置差估速度喂给求解器
+# ——否则拖鱼撞鱼/撞岛 vn≈0 只剩位置平推（与岛速缺失同族）。上限防光标
+# 瞬移把速度放大成荒诞值（与岛速 _MOTION_JUMP_SPEED 同量级口径）。
+DRAG_VELOCITY_CAP = 3000.0
 
 # 静态成员支撑落定（"落在岛上"= 落地）：抛掷物理的 is_at_rest 只认屏幕地板
 # （pet/physics.is_at_rest 的 bottom 判据），被岛托住的 thrown 永远满足不了
@@ -177,6 +182,12 @@ class SpriteCollisionWorld:
         # （零回调）或松手样本落进桥侧死区时旧速度会残留——静止的岛把贴上
         # 来的桌宠拍进 THROWN 的「幽灵速度」通道，过期是最后一道闸。
         self._static_member_velocity: Dict[str, Tuple[float, float]] = {}
+        # 拖拽成员速度估计：member_id -> (vx, vy)。拖拽中的 sprite 自身
+        # velocity 恒 0（on_press 清零、on_move 只 set_pos），碰撞世界按相邻
+        # tick 位置差估出真实拖拽速度喂给求解器——拖鱼撞鱼/撞岛才有冲量。
+        self._drag_velocities: Dict[str, Tuple[float, float]] = {}
+        # 位置差分采样点：member_id -> (x, y, 时刻)
+        self._prev_sprite_pos: Dict[str, Tuple[float, float, float]] = {}
         self._listeners: List[Callable[[CollisionEvent], None]] = []
         # 静态成员自定义圆链（岛 stadium 口径，member_id -> circles）
         self._static_member_circles: Dict[str, list] = {}
@@ -252,6 +263,7 @@ class SpriteCollisionWorld:
             # 支撑落定进行中（_support_streak 非空）不可跳过：它按 tick 计数
             return []
         self._tick += 1
+        self._sample_drag_velocities(sprites)
         members: List[collision.MemberState] = []
         sprite_by_id: Dict[str, object] = {}
         for sprite in sprites:
@@ -328,6 +340,39 @@ class SpriteCollisionWorld:
         return bool(getattr(sprite, "dragging", False)) or \
             getattr(sprite, "interaction_state", INTERACTION_NORMAL) == INTERACTION_DRAG
 
+    def _sample_drag_velocities(self, sprites: Sequence) -> None:
+        """按相邻 tick 位置差估拖拽成员速度（喂求解器的相对法向速度）。
+
+        拖拽中的 sprite 自身 velocity 恒 0（on_press 清零、on_move 只
+        set_pos），不估速度拖鱼撞鱼/撞岛只剩位置平推（与岛速缺失同族）。
+        只对拖拽成员计算；退出拖拽即清（松手后的抛掷速度由
+        estimate_release_velocity 写回 sprite.velocity，不走本通道）。
+        """
+        now = self._clock()
+        new_prev: Dict[str, Tuple[float, float, float]] = {}
+        for sprite in sprites:
+            mid = self._member_id(sprite)
+            pos = getattr(sprite, "pos", None)
+            if pos is None:
+                continue
+            x, y = float(pos.x()), float(pos.y())
+            dragging = self._is_dragging(sprite)
+            prev = self._prev_sprite_pos.get(mid)
+            if dragging and prev is not None:
+                dtw = now - prev[2]
+                if dtw > 1e-3:
+                    vx = (x - prev[0]) / dtw
+                    vy = (y - prev[1]) / dtw
+                    speed = math.hypot(vx, vy)
+                    if speed > DRAG_VELOCITY_CAP:
+                        vx *= DRAG_VELOCITY_CAP / speed
+                        vy *= DRAG_VELOCITY_CAP / speed
+                    self._drag_velocities[mid] = (vx, vy)
+            elif not dragging:
+                self._drag_velocities.pop(mid, None)
+            new_prev[mid] = (x, y, now)
+        self._prev_sprite_pos = new_prev
+
     def _member_from_sprite(self, sprite) -> collision.MemberState:
         # V-2：碰撞体口径 = 稳定身体框（body_box×scale），与旧架构
         # 7ee8a34「鱼-鱼碰撞体改用身体框」一致；此前用整 canvas 矩形，
@@ -349,14 +394,20 @@ class SpriteCollisionWorld:
             flags |= collision.FLAG_THROWN
         scale = float(getattr(sprite, "scale", 0.0) or collision.DEFAULT_BASE_SCALE)
         velocity = sprite.velocity
+        vx, vy = float(velocity.x()), float(velocity.y())
+        if dragging:
+            # 拖拽成员：自身 velocity 恒 0，用位置差分估计的真实拖拽速度
+            # （拖鱼撞鱼/撞岛的相对速度来源；未拖拽成员不受本通道影响）。
+            vx, vy = self._drag_velocities.get(
+                self._member_id(sprite), (0.0, 0.0))
         return collision.MemberState(
             runtime_id=self._member_id(sprite),
             x=left + w / 2.0,
             y=top + h / 2.0,
             radius_x=w / 2.0,
             radius_y=h / 2.0,
-            vx=float(velocity.x()),
-            vy=float(velocity.y()),
+            vx=vx,
+            vy=vy,
             mass=collision.calculate_mass(
                 w / 2.0, h / 2.0, scale=scale,
                 collision_mass_scale=self.mass_scale),
