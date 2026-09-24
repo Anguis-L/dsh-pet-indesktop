@@ -204,9 +204,10 @@ WINDOW_PY_LINE_BUDGET = 4671
 # overlay 拓扑下子肥鱼是进程内 sprite，跨进程 taskkill 回退（child_pet_cleanup）
 # 找不到目标、按钮静默失效，改为写指令文件由主进程消费；legacy 回退逐行不变。
 # 拓扑判定/写指令/校验的实现全在零 Qt 的 pet/overlay_settings_command.py，
-# 本文件只做一次分支与身份回填（slot_from_instance_id）。实测 2377；按文件约定
-# 只随实测校准，不为达标压行（拆分仍是待办）。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2377
+# 本文件只做一次分支与身份回填（slot_from_instance_id）。
+# 2026-09-24 上调到 2391：合入上游更新页接线（更新页主体在 pet/update_settings.py）。
+# 实测 2391；按文件约定只随实测校准，不为达标压行（拆分仍是待办）。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2391
 
 
 def _read(name: str) -> str:
