@@ -408,6 +408,63 @@ def test_drag_release_not_taken_over_when_thrown():
     assert sprite._clip_name == "hang"
 
 
+# ---------------------------------------------------------------- F7：探头会话闸门
+def test_probe_session_degrades_acts_bucket_to_idle():
+    """F7：探头会话期间 acts 桶降级 idle（只允许待机/转向）。
+
+    旧实现 window_optional_services.py:223-233 _effects_filter_switch：会话
+    期间非 idle/turn 的动画请求一律降级随机待机。
+    """
+    lib = _library_with_acts()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.5,)))   # 0.5 ∈ acts 桶
+    c.predict_enabled = False
+    sprite.set_probe_pose(45.0, 0.5)
+    assert sprite.probe_active is True
+
+    _run(c, sprite, lib.duration("idle1") + 0.1)
+
+    assert c.state_of(sprite) == STATE_IDLE
+    assert lib.clip("act1").start_count == 0
+    assert lib.clip("act2").start_count == 0
+
+
+def test_probe_session_freezes_turn_facing():
+    """F7：探头会话冻结朝向（window_optional_services.py:349-350）。
+
+    转向仍允许播（会话只放行 idle/turn），但播完绝不翻 facing；排定的
+    移动计划随之作废（探头期间位置归探头控制器）。
+    """
+    lib = _make_library()
+    sprite = _make_sprite(lib, pos=(0, 400), facing="left")   # 贴左缘朝外
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.1,)))
+    c.predict_enabled = False
+    sprite.set_probe_pose(60.0, 0.4)
+
+    _run(c, sprite, lib.duration("idle1") + 0.1)
+    assert c.state_of(sprite) == STATE_TURN               # 朝外 → 改播转向（允许）
+    assert lib.clip("turn1").start_count == 1
+
+    _run(c, sprite, lib.duration("turn1") + 0.1)
+
+    assert sprite.facing == "left"                        # 朝向被冻结
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite.velocity == QPointF(0, 0)
+
+
+def test_turn_facing_still_flips_without_probe():
+    """对照：非探头会话时转向照常翻朝向（闸门只在会话期间生效）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, pos=(0, 400), facing="left")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.1,)))
+    c.predict_enabled = False
+
+    _run(c, sprite, lib.duration("idle1") + 0.1)
+    _run(c, sprite, lib.duration("turn1") + 0.1)
+
+    assert sprite.facing == "right"
+
+
 # ---------------------------------------------------------------- F6：开播失败不建计划
 def _roll_once_after_idle(c, sprite, lib):
     """让 sprite 走完当前待机进下一次掷骰（不预设结果状态）。"""

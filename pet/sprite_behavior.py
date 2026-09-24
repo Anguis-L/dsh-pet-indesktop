@@ -335,17 +335,25 @@ class BehaviorController:
                 self._enter_idle(sprite, st, self._categories(sprite.library))
         elif st.state == STATE_TURN:
             if st.elapsed >= st.duration:
-                # 转向播完才翻朝向（window.py:2631-2633）：turn clip 播完
-                # 即画面已转向，此刻翻 facing 无跳变。
-                sprite.facing = "right" if sprite.facing == "left" else "left"
-                pending = st.pending_move
-                st.pending_move = None
-                if pending is None:
+                if probing:
+                    # 探头会话只允许待机/转向且冻结朝向（F7，
+                    # window_optional_services.py:223-233/349-350）：turn 播完
+                    # 不翻 facing；排定的移动计划一并作废（会话期间位置归
+                    # 探头控制器，绝不起步——起步会同时把朝向翻过去）
+                    st.pending_move = None
                     self._enter_idle(sprite, st, self._categories(sprite.library))
-                elif not self._start_move(sprite, st, pending):
-                    # 移动素材开播被拒（F6）：绝不能留在 turn 态——下一个到点
-                    # 分支会把朝向再翻一次。直接回收待机
-                    self._enter_idle(sprite, st, self._categories(sprite.library))
+                else:
+                    # 转向播完才翻朝向（window.py:2631-2633）：turn clip 播完
+                    # 即画面已转向，此刻翻 facing 无跳变。
+                    sprite.facing = "right" if sprite.facing == "left" else "left"
+                    pending = st.pending_move
+                    st.pending_move = None
+                    if pending is None:
+                        self._enter_idle(sprite, st, self._categories(sprite.library))
+                    elif not self._start_move(sprite, st, pending):
+                        # 移动素材开播被拒（F6）：绝不能留在 turn 态——下一个
+                        # 到点分支会把朝向再翻一次。直接回收待机
+                        self._enter_idle(sprite, st, self._categories(sprite.library))
         elif st.state == STATE_ACTS:
             if st.elapsed >= st.duration:
                 self._roll_next(sprite, st)
@@ -533,7 +541,16 @@ class BehaviorController:
     def _enter_acts(self, sprite, st: _SpriteState, cats: dict,
                     forced_name: str | None = None) -> None:
         """随机动作（40% acts 桶）：acts 池随机一段，播完回掷骰
-        （window.py _pick_next 的 acts 分支语义）；池空回退待机。"""
+        （window.py _pick_next 的 acts 分支语义）；池空回退待机。
+
+        探头会话（F7）把动作桶整体降级待机：会话期间只允许待机/转向
+        （window_optional_services.py:223-233 _effects_filter_switch 的 sprite
+        版）。闸门收在这一处而不是只收在掷骰分支——预测产物、移动失败回退
+        同样经此进入动作池，三处口径必须一致。
+        """
+        if getattr(sprite, "probe_active", False):
+            self._enter_idle(sprite, st, cats)
+            return
         name = forced_name if forced_name is not None else self._pick(cats["acts"], exclude=st.anim)
         if name is None:
             self._enter_idle(sprite, st, cats)
