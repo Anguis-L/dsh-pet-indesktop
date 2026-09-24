@@ -341,6 +341,8 @@ class SpriteMenuFacade:
         setter = getattr(clip, "set_playback_speed", None)
         if callable(setter):
             setter(float(value))
+        self.cfg.set("playback_speed", float(value))
+        self._save()
 
     # ---------------------------------------------------------------- 窗口能力
     def change_scale(self, scale: float) -> None:

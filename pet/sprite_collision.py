@@ -537,6 +537,12 @@ class SpriteCollisionWorld:
                 del self._support_streak[member.runtime_id]
                 held.discard(member.runtime_id)
                 sprite.set_velocity(type(velocity)(0.0, 0.0))
+                # 落岛收尾同样要复位飞行播放速率（M7）：rate 除进 duration()，
+                # 不复位会让后续 _plan_move 按加速时长量化位移；sprite_physics
+                # 的落地分支不是「唯一出口」，这里也是。
+                reset = getattr(sprite, "reset_playback_speed", None)
+                if callable(reset):
+                    reset()
                 sprite.interaction_state = INTERACTION_NORMAL
             else:
                 self._support_streak[member.runtime_id] = streak

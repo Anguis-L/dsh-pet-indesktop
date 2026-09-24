@@ -78,6 +78,7 @@ from . import overlay_settings_command
 from . import overlay_spawn_state
 from . import slot_manager
 from . import window_alerts
+from .physics import throw_speed_cap
 from .config import (
     DEFAULT_SELF_TALK_BUBBLE_STYLE,
     DEFAULT_SELF_TALK_DURATION_SECONDS,
@@ -1452,6 +1453,9 @@ class OverlayShell(QObject):
             return
         self._started = False
         self.app.removeEventFilter(self)
+        timer = getattr(self, "_self_talk_timer", None)
+        if timer is not None:
+            timer.stop()  # M9：stop 后不再自我重排（引用环也让壳可被回收）
         self._teardown_settings_command_watch()
         self.shutdown_music_lyric()
         bridge = getattr(self, "island_bridge", None)
@@ -1667,9 +1671,18 @@ class OverlayShell(QObject):
         self._apply_window_capabilities()
         # self_talk 族热改：重读字段并按新口径重排程（schedule_self_talk
         # 先停表再按 enabled 早退，开/关/改间隔都收敛到这一条路径）。
-        # 气泡风格/字号（_bind_bubble 期应用）不在此列，变更需重启。
         self._load_self_talk_settings()
         self._schedule_self_talk()
+        # 气泡风格/字号热改（M10，legacy window.py:3879-3895 在
+        # refresh_pet_settings 里热生效，不走重建）：直接对活气泡下手。
+        bubble = self._speech_bubble
+        if bubble is not None:
+            set_style = getattr(bubble, "set_style", None)
+            if callable(set_style):
+                set_style(str(self._config.get(
+                    "self_talk_bubble_style", DEFAULT_SELF_TALK_BUBBLE_STYLE)
+                    or DEFAULT_SELF_TALK_BUBBLE_STYLE))
+            self._apply_bubble_text_scale(bubble)
         self.sync_music_lyric()
 
     def _apply_window_capabilities(self) -> None:
@@ -1678,6 +1691,7 @@ class OverlayShell(QObject):
         self.set_on_top(bool(self._config.get("on_top", True)), persist=False)
         self._user_mouse_through = bool(self._config.get("mouse_through", False))
         self._apply_effective_mouse_through()
+        self._sync_sprite_settings()
         self._watcher.set_fullscreen_enabled(
             bool(self._config.get("auto_hide_fullscreen", True)))
         self._watcher.set_cursor_enabled(
@@ -1709,6 +1723,37 @@ class OverlayShell(QObject):
             save = getattr(self._config, "save", None)
             if callable(save):
                 save()
+
+    def _sync_sprite_settings(self) -> None:
+        """config → sprite/behavior 同步点（legacy ``window.py``
+        ``refresh_pet_settings`` 的等价物）：启动、``refresh_settings`` 与
+        spawn 后各走一次。
+
+        缺了它（DS 全量审查 M6）：``drag_physics``/``throw_strength``/
+        ``no_move``/``playback_speed`` 只在右键菜单里能改——启动不读 config
+        （上次保存的重启即丢）、设置页改了没反应；且 sprite 侧默认值
+        （``drag_physics=True``、``throw_speed_cap=MAX_THROW_SPEED=6000``）与
+        config 默认（``False``、standard=4800）**相反**，开箱行为就不一致。
+        """
+        cfg = self._config
+        cap = throw_speed_cap(cfg.get("throw_strength"))
+        drag_physics = bool(cfg.get("drag_physics", False))
+        try:
+            playback = max(0.25, min(3.0, float(cfg.get("playback_speed", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            playback = 1.0
+        for sprite in list(getattr(self.overlay, "sprites", []) or []):
+            sprite.throw_speed_cap = cap
+            sprite.drag_physics = drag_physics
+            if float(getattr(sprite, "playback_speed", 1.0)) != playback:
+                sprite.playback_speed = playback
+                clip = getattr(sprite, "_clip", None)
+                setter = getattr(clip, "set_playback_speed", None)
+                if callable(setter):
+                    setter(playback)
+        behavior = getattr(self, "behavior", None)
+        if behavior is not None:
+            behavior.no_move = bool(cfg.get("no_move", False))
 
     def _apply_effective_mouse_through(self) -> None:
         """有效穿透 = 用户手动穿透 OR 光标自动穿透（window.py:4204 同式）。"""
@@ -1912,6 +1957,7 @@ class OverlayShell(QObject):
         self._spawned.append(sprite)
         self._spawned_libs[sprite] = lib
         self._spawned_slots[sprite] = slot
+        self._sync_sprite_settings()  # 新 sprite 一并应用 config（M6）
         if config_dir:
             # 生成/复活即落一次几何：未及优雅退出（崩溃/断电）也能按清单复活
             geometry = self._sprite_geometry(sprite, self._bounds)
@@ -2511,11 +2557,13 @@ class OverlayShell(QObject):
         if self._session_end_done:
             return
         self._session_end_done = True
-        stop_all = getattr(self.lib, "stop_all_clips", None)
-        if callable(stop_all):
-            try:
-                stop_all()
-            except Exception:
-                logging.exception("overlay: 会话结束停止素材库 clip 失败")
+        libs = [self.lib] + [lib for lib in getattr(self, "_spawned_libs", {}).values()]
+        for lib in libs:  # 每只子肥鱼各持独立库（M8）：关机窗口一并停 reader
+            stop_all = getattr(lib, "stop_all_clips", None)
+            if callable(stop_all):
+                try:
+                    stop_all()
+                except Exception:
+                    logging.exception("overlay: 会话结束停止素材库 clip 失败")
         if self.overlay is not None:
             self.overlay.stop()
