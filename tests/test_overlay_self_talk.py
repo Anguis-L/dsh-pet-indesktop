@@ -21,6 +21,7 @@ PetSprite 复用既有测试件；全部 offscreen。
 from __future__ import annotations
 
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -145,7 +146,12 @@ def _write_png(directory, name="angry.png"):
 
 
 def test_image_branch_reaches_follower_show_image(tmp_path):
-    """出图概率 100% → 走刀 1 的 ``show_image``（而不是文本分支）。"""
+    """出图概率 100% + 缓存已热 → 走刀 1 的 ``show_image``（而不是文本分支）。
+
+    慢帧修复后配图只走 worker 预热缓存（GUI 零磁盘税）；冷缓存回退文本
+    是设计行为（另有专测）。这里先等后台预热把缓存填上（条件等待，不赌
+    固定 sleep），再断言稳态出图路径。
+    """
     image_dir = tmp_path / "talk-images"
     _write_png(image_dir)
     shell, _config = _make_shell(tmp_path, _talk_values(
@@ -157,6 +163,13 @@ def test_image_branch_reaches_follower_show_image(tmp_path):
         shell.overlay.show()
         assert shell._self_talk_images, "配置的图片目录必须装进载荷"
         assert shell._self_talk_image_scale == 1.5
+
+        deadline = time.monotonic() + 10.0
+        while (not getattr(shell, "_self_talk_image_cache", {})
+                and time.monotonic() < deadline):
+            QApplication.instance().processEvents()
+            time.sleep(0.02)
+        assert shell._self_talk_image_cache, "后台配图预热超时未完成"
 
         assert shell._show_random_self_talk() is True
         assert shell._speech_bubble is not None
