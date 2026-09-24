@@ -129,3 +129,22 @@ def test_settle_supported_resets_flight_playback_speed():
 
     assert sprite.interaction_state == "normal"
     assert resets, "支撑落定收尾未复位飞行播放速率（M7）"
+
+
+def test_island_hit_below_300_still_squashes(tmp_path):
+    """GPT 审查阻断：岛撞 60-300 是合法真撞击（静态阈值 60），壳层不得再按
+    hit_min_dv=300 二次过滤——低速撞岛的挤压/反馈链不再被截断。"""
+    import types
+
+    shell, _config = _make_shell(tmp_path, {})
+    try:
+        sprite = shell.sprite
+        squashed: list = []
+        sprite.squash = lambda: squashed.append(1)
+        cid = sprite.collision_id
+        event = types.SimpleNamespace(a="island", b=cid, j=100.0)  # 60<100<300
+        shell._on_collision_squash(event)
+        assert squashed == [1]
+        shell._delete_runtime_marker()
+    finally:
+        shell._delete_runtime_marker()

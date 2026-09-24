@@ -162,3 +162,34 @@ def test_quiet_balance_refresh_paths(tmp_path, monkeypatch):
         shell._balance_busy = False
         _teardown_shell(shell)
         app.processEvents()
+
+
+def test_toggle_pet_from_island_routes_to_overlay_shell():
+    """GPT 审查阻断：overlay 拓扑 instances[].win 恒为 None，岛单击显隐
+    必须路由到 OverlayShell._toggle_pet_visible（否则岛永远调不动桌宠）。"""
+    shell = AppShell.__new__(AppShell)
+    calls: list = []
+
+    class _OverlayShell:
+        def _toggle_pet_visible(self):
+            calls.append(1)
+
+    shell._overlay_shell = _OverlayShell()
+    shell._instances = []  # overlay 拓扑：win 全 None，旧路径必静默失效
+    shell.island = None
+    AppShell._toggle_pet_from_island(shell)
+    assert calls == [1]
+
+
+def test_aggregate_pet_visible_reads_overlay_window():
+    """聚合可见态在 overlay 拓扑读唯一合成窗（不再恒 False）。"""
+    import types
+
+    shell = AppShell.__new__(AppShell)
+    overlay = types.SimpleNamespace(
+        overlay=types.SimpleNamespace(isVisible=lambda: True))
+    shell._overlay_shell = overlay
+    shell._instances = []
+    assert AppShell._aggregate_pet_visible(shell) is True
+    overlay.overlay = types.SimpleNamespace(isVisible=lambda: False)
+    assert AppShell._aggregate_pet_visible(shell) is False

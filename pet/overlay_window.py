@@ -97,6 +97,15 @@ class OverlayWindow(QWidget):
         self.mouse_through = False
         self._press_global: QPoint | None = None
         self._drag_committed = False  # 过 DRAG_THRESHOLD 才升级真拖拽（点击候选期 False）
+        # 拖拽闸门（config 写入口，壳层经 _apply_window_capabilities 注入）：
+        # 锁定位（lock_position）/ 必须按住 SHIFT 才能拖（shift_drag）。命中按下
+        # 不进拖拽 grab，但松手仍按点击处理（旧 window.py:3126-3133 锁定 /
+        # :3172-3181 SHIFT 门语义）。_press_click_only = 本次按下只算点击。
+        self.lock_position = False
+        self.shift_drag_required = False
+        self._press_click_only = False
+        # 最近一次已写入系统的不透明度（None = 还没写过；M5c）
+        self._applied_opacity: float | None = None
         self._input_controller = None
         # sprite 移除通知（V-9）：行为控制器状态表等外部簿记的注销挂点
         self._sprite_removed_listeners: list = []
@@ -454,6 +463,20 @@ class OverlayWindow(QWidget):
         painter.end()
 
     # ---------------------------------------------------------------- 命中与鼠标路由
+    def apply_opacity(self, percent: int) -> None:
+        """整窗不透明度（M5c）：overlay 是单合成窗，对齐 legacy 单宠语义。
+
+        旧 ``PetWindow.set_pet_opacity``（window.py:4134-4146）只对宠窗口
+        ``setWindowOpacity``；单窗 overlay 承载全部 sprite，故整窗一个值
+        （与 legacy 单宠窗口的观感一致）。值未变时跳过系统调用
+        （``_applied_opacity`` 容差 0.005，同旧实现）。
+        """
+        value = max(10, min(100, int(percent)))
+        opacity = value / 100.0
+        if self._applied_opacity is None or abs(self._applied_opacity - opacity) >= 0.005:
+            self.setWindowOpacity(opacity)
+            self._applied_opacity = opacity
+
     def set_mouse_through(self, on: bool) -> None:
         """用户手动穿透开关的统一直写点（菜单/集成层）；shell 可挂
         _through_changed 回调收编为"用户穿透 + 自动穿透"的复合语义。"""
@@ -533,15 +556,39 @@ class OverlayWindow(QWidget):
         target = self.sprite_at(event.position())
         if target is None:
             self._mouse_grab = None
+            self._press_click_only = False
             event.ignore()  # 未命中：忽略（Windows 穿透轮询会把点击让给下层）
             return
         self._mouse_grab = target
+        if self._press_drag_blocked(event):
+            # 锁定位 / 未按 SHIFT（shift_drag）：不进拖拽 grab——不记按压锚点、
+            # 不 on_press（点击候选不挪窝、不置拖拽态）。这里**不** event.ignore：
+            # 忽略按下会让 Qt 不建立隐式 grab、连松手一起丢，点击互动随之静默
+            # 失效（legacy 两处闸门都保留点击，见 window.py:3126-3133/:3172-3181）。
+            # 松手由壳层的 click-only 判别走点击分支。
+            self._press_click_only = True
+            event.accept()
+            return
+        self._press_click_only = False
         self._press_global = event.globalPosition().toPoint()
         self._drag_committed = False
         if self._input_controller is not None:
             self._input_controller.set_drag_active(True)
         target.on_press(event.position())
         event.accept()
+
+    def _press_drag_blocked(self, event) -> bool:
+        """本次按下是否禁止拖拽（锁定位 / 未按 SHIFT 的 shift_drag）。
+
+        旧机两处闸门的共同语义（window.py:3126-3133 锁定位置；:3172-3181
+        SHIFT 门）：命中按下不进拖拽 grab，松手仍走点击。本架构按下只是点击
+        候选、过阈值才升级，闸门提前到按下可省掉一次无谓的 on_press/悬空准备。
+        """
+        if self.lock_position:
+            return True
+        if self.shift_drag_required:
+            return not bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        return False
 
     def _commit_drag_if_threshold_crossed(self, global_pos) -> None:
         """位移过 ``DRAG_THRESHOLD`` 把点击候选升级为真拖拽（幂等）。
@@ -577,6 +624,11 @@ class OverlayWindow(QWidget):
             event.accept()
             return
         if self._mouse_grab is None:
+            event.ignore()
+            return
+        if self._press_click_only:
+            # click-only 按下（锁定位 / 未按 SHIFT）：不升级拖拽、不转发移动
+            # ——位置绝不跟随光标（锁定语义），松手仍按点击收口
             event.ignore()
             return
         self._note_kinetic()  # M-1：拖拽移动保持 T0
@@ -647,6 +699,7 @@ class OverlayWindow(QWidget):
         grab, self._mouse_grab = self._mouse_grab, None
         self._press_global = None
         self._drag_committed = False
+        self._press_click_only = False
         if self._input_controller is not None:
             self._input_controller.set_drag_active(False)
         if grab is not None and forward:

@@ -1715,7 +1715,16 @@ class OverlayShell(QObject):
         self.behavior._predict_lead_s = lead_ms / 1000.0
         self.behavior.predict_enabled = lead_ms > 0
 
-    def set_on_top(self, on: bool, *, persist: bool = True) -> None:        """窗口置顶（window.py set_on_top 等价）。"""
+    def _pet_opacity_percent(self) -> int:
+        """``pet_opacity`` 配置读数（10-100 钳制，口径同 window.py:3853-3857）。"""
+        try:
+            value = int(float(self._config.get("pet_opacity", 100)))
+        except (TypeError, ValueError):
+            value = 100
+        return max(10, min(100, value))
+
+    def set_on_top(self, on: bool, *, persist: bool = True) -> None:
+        """窗口置顶（window.py set_on_top 等价）。"""
         on = bool(on)
         current = bool(self.overlay.windowFlags()
                        & Qt.WindowType.WindowStaysOnTopHint)
