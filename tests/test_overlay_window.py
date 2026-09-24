@@ -263,8 +263,9 @@ class PoolLibrary:
         return self._clips[name]
 
 
-def test_press_binds_drag_clip_and_release_self_heals_to_idle():
-    """F1：按下命中 sprite → behavior.on_drag_started 绑 drag 悬空动画。
+def test_press_is_candidate_and_threshold_drag_binds_drag_clip():
+    """M3 语义：按下只是点击候选（不绑 drag）；mouseMove 过 DRAG_THRESHOLD
+    才升级真拖拽并绑悬空动画（旧 window.py:3169-3171/3192-3193）。
 
     基类 release 只做 grab 收尾（点击/拖拽判别在壳层），松手后控制器靠
     接管态自愈回待机——这条路径覆盖「看门狗收尾 / 壳层分支没走到」。
@@ -283,15 +284,46 @@ def test_press_binds_drag_clip_and_release_self_heals_to_idle():
 
     overlay.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, (150, 150)))
 
+    assert sprite.interaction_state != INTERACTION_DRAG   # 点击候选：不置态
+    assert sprite._clip_name == "idle"                    # 不切悬空动画（M3 闪姿回归）
+    assert behavior.state_of(sprite) != STATE_DRAG
+
+    # 位移 100px ≫ DRAG_THRESHOLD×scale：move 升级真拖拽
+    overlay.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, (250, 150)))
+
     assert sprite.interaction_state == INTERACTION_DRAG
     assert behavior.state_of(sprite) == STATE_DRAG
-    assert sprite._clip_name == "hang"                 # 按下即绑悬空动画
+    assert sprite._clip_name == "hang"                 # 过阈值才绑悬空动画
 
-    overlay.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, (150, 150)))
+    overlay.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, (250, 150)))
     assert sprite.interaction_state == INTERACTION_NORMAL
 
     behavior.tick([sprite], 0.016)                     # 接管结束自愈
     assert behavior.state_of(sprite) == STATE_IDLE
+    assert sprite._clip_name == "idle"
+
+
+def test_click_below_threshold_never_binds_drag_clip():
+    """全程不超阈值 = 单击：sprite 不挪窝、不置拖拽态、不绑 drag clip。"""
+    from pet.sprite_behavior import STATE_DRAG, BehaviorController
+
+    overlay = OverlayWindow()
+    lib = PoolLibrary(idles=["idle"], drag="hang")
+    sprite = PetSprite(lib, pos=QPointF(100, 100), scale=0.5)
+    sprite.bind_clip("idle")
+    sprite._rebuild_pixmap()
+    sprite._clock = lambda: 1000.0
+    overlay.add_sprite(sprite)
+    behavior = BehaviorController(QRect(0, 0, 1000, 1000))
+    overlay.behavior = behavior
+
+    overlay.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, (150, 150)))
+    overlay.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, (151, 151)))  # 1px
+    overlay.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, (151, 151)))
+
+    assert sprite.pos == QPointF(100, 100)             # 未跟随光标（点击候选不挪窝）
+    assert sprite.interaction_state != INTERACTION_DRAG
+    assert behavior.state_of(sprite) != STATE_DRAG
     assert sprite._clip_name == "idle"
 
 
@@ -386,6 +418,8 @@ def test_pet_sprite_drag_protocol():
     sprite._clock = lambda: 1000.0
 
     sprite.on_press(QPointF(60, 60))                       # grab 偏移 (10, 10)
+    assert not sprite.dragging                             # 点击候选期不置拖拽态（M3）
+    sprite.begin_drag()                                    # 过阈值升级真拖拽
     assert sprite.dragging
     assert sprite.interaction_state == INTERACTION_DRAG
     assert sprite.velocity == QPointF(0, 0)                # 拖拽期间 velocity 停

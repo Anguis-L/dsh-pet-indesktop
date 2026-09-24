@@ -290,6 +290,7 @@ def test_drag_started_binds_drag_and_release_returns_idle():
     assert c.state_of(sprite) == STATE_IDLE
 
     sprite.on_press(QPointF(10, 10))                # overlay 接线点：按下
+    sprite.begin_drag()                             # 过阈值升级（真拖拽序列）
     c.on_drag_started(sprite)
 
     assert c.state_of(sprite) == STATE_DRAG

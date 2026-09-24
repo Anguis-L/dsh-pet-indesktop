@@ -107,8 +107,12 @@ def _make_sprite(pos=(100.0, 100.0), *, clock: FakeClock | None = None) -> PetSp
 
 def _drag_steps(sprite: PetSprite, clock: FakeClock, start: tuple[float, float],
                 steps: list[tuple[float, float, float]]) -> QPointF:
-    """press 后按 (dx, dy, dt) 序列拖动，返回松手位置（不 release）。"""
+    """press 后按 (dx, dy, dt) 序列拖动，返回松手位置（不 release）。
+
+    真拖拽序列 = on_press（点击候选）→ begin_drag（过阈值升级）→ on_move…
+    """
     sprite.on_press(QPointF(*start))
+    sprite.begin_drag()
     x, y = start
     for dx, dy, dt in steps:
         clock.advance(dt)
@@ -191,7 +195,8 @@ def test_controller_ignores_non_thrown_sprites():
     normal = _make_sprite((50.0, 50.0))
     normal.set_velocity(QPointF(300, 0))                   # normal：advance 管
     dragged = _make_sprite((300.0, 50.0))
-    dragged.on_press(QPointF(310.0, 60.0))                 # drag：光标管
+    dragged.on_press(QPointF(310.0, 60.0))
+    dragged.begin_drag()                                     # drag：光标管
 
     controller.tick([normal, dragged], 0.016)
 
@@ -343,6 +348,7 @@ def test_drag_trail_sampling_and_pruning():
     clock = FakeClock()
     sprite = _make_sprite((100.0, 100.0), clock=clock)
     sprite.on_press(QPointF(110.0, 110.0))
+    sprite.begin_drag()
     assert len(sprite.drag_trail) == 1                     # press 即首个样本
 
     for i in range(5):
@@ -363,15 +369,24 @@ def test_drag_trail_sampling_and_pruning():
     assert sprite.drag_trail == []                         # 松手后清空
 
 
-def test_press_sets_drag_state_and_stops_velocity():
+def test_press_is_click_candidate_until_begin_drag():
+    """M3 语义：按下只是点击候选（不置拖拽态、不动画、探头不取消），
+    过 DRAG_THRESHOLD 的 begin_drag 才升级真拖拽（旧 window.py:3169-3171）。"""
     sprite = _make_sprite((100.0, 100.0))
     sprite.set_velocity(QPointF(200, 50))
 
     sprite.on_press(QPointF(110.0, 120.0))
 
+    assert not sprite.dragging
+    assert sprite.interaction_state != INTERACTION_DRAG
+    assert sprite.velocity == QPointF(0, 0)          # 按下即刹停（点击候选也停）
+
+    sprite.begin_drag()
     assert sprite.dragging
     assert sprite.interaction_state == INTERACTION_DRAG
-    assert sprite.velocity == QPointF(0, 0)
+
+    sprite.begin_drag()                              # 幂等：重复升级不二次置态
+    assert sprite.interaction_state == INTERACTION_DRAG
 
 
 # ---------------------------------------------------------------- V-2：body_box 口径

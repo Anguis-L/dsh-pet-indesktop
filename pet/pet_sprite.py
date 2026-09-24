@@ -833,16 +833,29 @@ class PetSprite(QObject):
         return list(self._drag_trail)
 
     def on_press(self, pos: QPointF) -> None:
-        """按下：进入拖拽态——记录 grab 偏移、velocity 归零、开始轨迹采样。
+        """按下：记录 grab 偏移、velocity 归零、开始轨迹采样——**只是点击候选**。
 
-        轨迹样本（时间戳 + 光标位置）是松手时
+        旧机语义（window.py:3169-3171）：位移过 ``catalog.DRAG_THRESHOLD`` 才
+        算真拖拽，按下瞬间不置拖拽态（不挪窗、不切悬空动画、探头会话不取消、
+        碰撞世界不当无限质量）。拖拽态的升级入口是 ``begin_drag``（由 overlay
+        在过阈值时调用）。轨迹样本（时间戳 + 光标位置）是松手时
         physics.estimate_release_velocity 估算甩出初速的输入。
         """
-        self._dragging = True
-        self.interaction_state = INTERACTION_DRAG
         self._drag_offset = QPointF(pos) - self.pos
         self.velocity = QPointF(0, 0)
         self._drag_trail = [(self._clock(), pos.x(), pos.y())]
+
+    def begin_drag(self) -> None:
+        """过 ``DRAG_THRESHOLD`` 升级为真拖拽（幂等）。
+
+        碰撞无限质量（``_is_dragging``）、探头「drag_away」取消、拖拽悬空
+        动画全部以这一刻为准——按下即生效会让每次点击闪悬空姿态、探头
+        点击拉直失效、按住未动的宠在碰撞世界变成无限质量（旧机三者都不是）。
+        """
+        if self._dragging:
+            return
+        self._dragging = True
+        self.interaction_state = INTERACTION_DRAG
 
     def on_move(self, pos: QPointF) -> None:
         if not self._dragging or self._drag_offset is None:

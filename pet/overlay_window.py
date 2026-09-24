@@ -41,6 +41,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QCursor, QPainter, QRegion, QScreen
 from PySide6.QtWidgets import QApplication, QWidget
 
+from . import catalog
 from .sprite_menu import build_sprite_menu
 from .sprite_slingshot import SlingshotController
 from .tick_driver import TickDriver
@@ -95,6 +96,7 @@ class OverlayWindow(QWidget):
         # 非 Windows 平台的联合 QRegion setMask 穿透为后续阶段。
         self.mouse_through = False
         self._press_global: QPoint | None = None
+        self._drag_committed = False  # 过 DRAG_THRESHOLD 才升级真拖拽（点击候选期 False）
         self._input_controller = None
         # sprite 移除通知（V-9）：行为控制器状态表等外部簿记的注销挂点
         self._sprite_removed_listeners: list = []
@@ -535,19 +537,36 @@ class OverlayWindow(QWidget):
             return
         self._mouse_grab = target
         self._press_global = event.globalPosition().toPoint()
+        self._drag_committed = False
         if self._input_controller is not None:
             self._input_controller.set_drag_active(True)
         target.on_press(event.position())
-        # F1：按下命中即播拖拽悬空动画（旧 window.py:3175-3176 进拖拽切 drag
-        # 的 sprite 版）。点击候选（松手未超 catalog.DRAG_THRESHOLD）与真拖拽
-        # 的判别仍留在壳层松手侧（overlay_shell.py:293-308），此处只负责
-        # 「按下 = 可能被拎起」的画面接管；判别为点击时 on_sprite_clicked /
-        # 控制器的接管态自愈会改绑回点击/待机动画。behavior 由集成层持有
-        # （demo / 产品壳挂在 overlay 上），未挂时 no-op。
+        event.accept()
+
+    def _commit_drag_if_threshold_crossed(self, global_pos) -> None:
+        """位移过 ``DRAG_THRESHOLD`` 把点击候选升级为真拖拽（幂等）。
+
+        旧机 window.py:3169-3171/3192-3193 语义：按下只是点击候选，过阈值
+        才置拖拽态——sprite.begin_drag（碰撞无限质量/探头取消的判定面）、
+        拖拽悬空动画（behavior.on_drag_started）、壳层探头取消
+        （``_drag_committed_cb``）全部挂在这一刻，不是按下即生效。
+        """
+        grab = self._mouse_grab
+        if grab is None or self._drag_committed or self._press_global is None:
+            return
+        threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
+        if (global_pos - self._press_global).manhattanLength() < threshold:
+            return
+        self._drag_committed = True
+        begin = getattr(grab, "begin_drag", None)
+        if callable(begin):
+            begin()
         behavior = getattr(self, "behavior", None)
         if behavior is not None:
-            behavior.on_drag_started(target)
-        event.accept()
+            behavior.on_drag_started(grab)
+        cb = getattr(self, "_drag_committed_cb", None)
+        if callable(cb):
+            cb(grab)
 
     def mouseMoveEvent(self, event) -> None:
         if self.slingshot.aiming:
@@ -561,6 +580,8 @@ class OverlayWindow(QWidget):
             event.ignore()
             return
         self._note_kinetic()  # M-1：拖拽移动保持 T0
+        # 先判升级再喂移动：on_move 在 begin_drag 之前是 no-op（点击候选不挪窝）
+        self._commit_drag_if_threshold_crossed(event.globalPosition().toPoint())
         # grab 期间事件直达被按住的 sprite（光标移出/落到别的 sprite 上不换手）
         self._mouse_grab.on_move(event.position())
         event.accept()
@@ -625,6 +646,7 @@ class OverlayWindow(QWidget):
         """
         grab, self._mouse_grab = self._mouse_grab, None
         self._press_global = None
+        self._drag_committed = False
         if self._input_controller is not None:
             self._input_controller.set_drag_active(False)
         if grab is not None and forward:

@@ -297,14 +297,19 @@ class ShellOverlayWindow(OverlayWindow):
         self._press_pos = None
         self.behavior = None  # OverlayShell 挂载；contextMenuEvent 查表读它
         self.edge_probe = None  # OverlayShell 挂载；拖拽/点击事件接线
+        # 真拖拽升级（过 DRAG_THRESHOLD）才通知探头取消会话（旧机语义：
+        # 按下只是点击候选，探头会话的点击拉直因此才有机会生效——按下即
+        # 取消会让 on_sprite_clicked 永远遇到 mode==OFF）。
+        self._drag_committed_cb = self._on_real_drag_started
         self.setAcceptDrops(True)  # 4.1c 投喂（命中 sprite 才 accept）
+
+    def _on_real_drag_started(self, sprite) -> None:
+        if self.edge_probe is not None:
+            self.edge_probe.on_sprite_drag_started(sprite)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         self._press_pos = event.position()
         super().mousePressEvent(event)
-        if (self._mouse_grab is not None and self.edge_probe is not None
-                and not self.slingshot.aiming):
-            self.edge_probe.on_sprite_drag_started(self._mouse_grab)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         if self.slingshot.aiming:
@@ -313,17 +318,18 @@ class ShellOverlayWindow(OverlayWindow):
             super().mouseReleaseEvent(event)
             return
         grab = self._mouse_grab
+        committed = self._drag_committed  # super() 的 _finish_grab 会清旗标，先快照
         press, self._press_pos = self._press_pos, None
         super().mouseReleaseEvent(event)
         if grab is None or press is None or self.behavior is None:
             return
         threshold = catalog.DRAG_THRESHOLD * getattr(grab, "scale", 1.0)
-        if (event.position() - press).manhattanLength() < threshold:
+        if not committed and (event.position() - press).manhattanLength() < threshold:
             # 边缘探头消费点击（PEEKING 拉直/STRAIGHTENED 重置倒计时）时，
             # 抑制点击反应与点击音效——拉直本身就是反馈
             if self.edge_probe is not None and self.edge_probe.on_sprite_clicked(grab):
                 return
-            self.behavior.on_sprite_clicked(grab)
+            clicked = self.behavior.on_sprite_clicked(grab)
             squash = getattr(grab, "squash", None)
             if callable(squash):
                 squash()  # 4.1c 点击 Q 弹（window.py:3473 语义）
@@ -331,12 +337,13 @@ class ShellOverlayWindow(OverlayWindow):
             if callable(cb):
                 cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
             # 点击气泡族（余额/自言自语）：回调由壳注入（与 click_feedback 同位置）。
-            # click_name = 本次点击实际绑定的动画名，取不到传 ""（未绑定 → 调用方
-            # 自动回退全局随机自言自语，window_alerts.py:474-477）。
+            # click_name = 本次点击实际绑定的动画名——只有 on_sprite_clicked 真改绑
+            # 了 click clip（返回 True）anim_of 才是点击动画名；无 click 素材时它
+            # 读到的是按下前/拖拽名的残留，按契约传 ""（调用方回退全局随机台词）。
             click_cb = getattr(self, "_on_sprite_click", None)
             if callable(click_cb):
                 anim_of = getattr(self.behavior, "anim_of", None)
-                click_name = anim_of(grab) if callable(anim_of) else None
+                click_name = anim_of(grab) if (clicked and callable(anim_of)) else None
                 click_cb(grab, str(click_name or ""))
         elif self.edge_probe is not None:
             # 真拖拽释放（非单击）：通知探头按 tick 静止判定重新评估进入

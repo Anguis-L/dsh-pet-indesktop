@@ -342,6 +342,7 @@ def test_drag_on_move_is_clamped(body_box):
     sprite.set_pos(QPointF(100, 100))
     sprite._clock = lambda: 1000.0                     # 固定假钟（时序纪律）
     sprite.on_press(QPointF(110, 110))                 # grab 偏移 (10, 10)
+    sprite.begin_drag()                                # 过阈值升级（on_move 才跟随）
     sprite.on_move(QPointF(5000, 5000))                # 拖出界
     # on_move 走 set_pos：光标 - 偏移后的请求位置被钳回
     assert sprite.pos == QPointF(600, 435)
