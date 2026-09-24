@@ -404,6 +404,82 @@ def test_drag_release_not_taken_over_when_thrown():
     assert sprite._clip_name == "hang"
 
 
+# ---------------------------------------------------------------- F5：接管撤销移动计划
+def test_capture_marks_suspended_and_drops_move_plan_on_return():
+    """F5：接管期间打 suspended；回到 normal 后移动态收口回待机，绝不 snap。
+
+    旧实现 window.py:4174-4177 _enter_physics_mode→_cancel_move：物理接管
+    即撤销自主移动计划，否则松手后 elapsed 继续累加、一到 duration 就
+    set_pos(旧目标) 瞬移。
+    """
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))
+    st = c._states[sprite]
+    assert c.state_of(sprite) == STATE_MOVE
+    _run(c, sprite, 0.5)
+    assert 800 < sprite.pos.x() < 920
+
+    sprite.interaction_state = INTERACTION_DRAG
+    c.tick([sprite], 0.05)
+    assert st.suspended is True                     # 接管标记（收口依据）
+
+    sprite.interaction_state = INTERACTION_NORMAL
+    c.tick([sprite], 0.05)
+
+    assert st.suspended is False
+    assert c.state_of(sprite) == STATE_IDLE
+    assert st.move_target is None                   # 计划已撤销
+    assert st.pending_move is None
+    assert sprite.velocity == QPointF(0, 0)
+
+
+def test_drag_interrupt_move_never_snaps_to_old_target():
+    """验收 ④：拖拽打断移动后不瞬移不 snap（拖到别处松手，位置就地保留）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, ints=(100, 0))
+    _run(c, sprite, 0.5)
+
+    sprite.interaction_state = INTERACTION_DRAG      # 鼠标接管
+    c.tick([sprite], 0.05)
+    sprite.set_pos(QPointF(1500, 400))               # 拖到别处
+    sprite.interaction_state = INTERACTION_NORMAL    # 松手（无回调，看门狗收尾）
+    c.tick([sprite], 0.05)
+
+    assert c.state_of(sprite) == STATE_IDLE
+    assert sprite.pos == QPointF(1500, 400)          # 绝不回到 920/旧路线
+    assert sprite.velocity == QPointF(0, 0)
+
+    _run(c, sprite, 5.0)                             # 长跑：也不会突然瞬移
+    assert sprite.pos.x() >= 1500 - 320              # 只可能被正常游荡带走
+
+
+def test_capture_during_turn_drops_pending_move():
+    """F5：转向途中被接管 → pending_move 作废，回到 normal 不执行该移动。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, facing="left")        # 朝左却要向右走 → 先转向
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    _roll_into_move(c, sprite, lib, choices=(1,))
+    st = c._states[sprite]
+    assert c.state_of(sprite) == STATE_TURN
+    assert st.pending_move is not None
+
+    sprite.interaction_state = INTERACTION_DRAG
+    c.tick([sprite], 0.05)
+    sprite.interaction_state = INTERACTION_NORMAL
+    c.tick([sprite], 0.05)
+
+    assert c.state_of(sprite) == STATE_IDLE
+    assert st.pending_move is None
+    assert lib.clip("walk").start_count == 0         # 被撤销的移动绝不启动
+
+
 # ---------------------------------------------------------------- F2：多圈续播 re-arm
 def test_drag_finished_rearms_clip():
     """F2：拖拽悬空动画过圈末必须原地续播（否则长拖拽动画冻结）。"""

@@ -77,7 +77,7 @@ class _SpriteState:
 
     __slots__ = ("state", "anim", "elapsed", "duration", "move_target",
                  "pending_move", "predictor", "curve", "frames_per_loop",
-                 "loops", "loop_duration", "move_start")
+                 "loops", "loop_duration", "move_start", "suspended")
 
     def __init__(self) -> None:
         self.state = STATE_IDLE
@@ -94,6 +94,9 @@ class _SpriteState:
         self.loops = 1                    # 计划整圈数
         self.loop_duration = 0.0          # 单圈墙钟时长（秒）
         self.move_start: QPointF | None = None  # 计划起点（曲线绝对位置锚点）
+        # 被接管标记（F5）：tick 见过非 normal 即置位；回到 normal 的那一
+        # tick 据此判断「接管前的移动/转向计划必须撤销，绝不 snap」
+        self.suspended = False
 
 
 class BehaviorController:
@@ -148,8 +151,17 @@ class BehaviorController:
                 st = self._states[sprite] = _SpriteState()
                 st.predictor = self._make_predictor(sprite)
             if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL:
+                st.suspended = True
                 self._tick_captured(sprite, st)
                 continue
+            if st.suspended:
+                # 接管结束后的收口（F5，window.py:4174-4177 _enter_physics_mode
+                # →_cancel_move 的 sprite 版）：接管期间位置已被鼠标/物理改写，
+                # 接管前的移动/转向计划一律作废——绝不 set_pos(旧目标) snap，
+                # 否则松手后一到 duration 就瞬移回原路线终点
+                st.suspended = False
+                if st.state in (STATE_MOVE, STATE_TURN):
+                    self._enter_idle(sprite, st, self._categories(sprite.library))
             if st.state in _CAPTURED_STATES:
                 # 接管已结束却停在接管态（看门狗收尾/shell 分支没走到）：
                 # 自愈回待机链，否则悬空动画无限循环
