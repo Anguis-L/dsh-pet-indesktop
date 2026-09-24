@@ -330,6 +330,14 @@ class ShellOverlayWindow(OverlayWindow):
             cb = getattr(self, "click_feedback", None)
             if callable(cb):
                 cb()  # 4.1c 点击音效（有无 click 素材都发声，同旧架构）
+            # 点击气泡族（余额/自言自语）：回调由壳注入（与 click_feedback 同位置）。
+            # click_name = 本次点击实际绑定的动画名，取不到传 ""（未绑定 → 调用方
+            # 自动回退全局随机自言自语，window_alerts.py:474-477）。
+            click_cb = getattr(self, "_on_sprite_click", None)
+            if callable(click_cb):
+                anim_of = getattr(self.behavior, "anim_of", None)
+                click_name = anim_of(grab) if callable(anim_of) else None
+                click_cb(grab, str(click_name or ""))
         elif self.edge_probe is not None:
             # 真拖拽释放（非单击）：通知探头按 tick 静止判定重新评估进入
             self.edge_probe.on_sprite_drag_released(grab)
@@ -546,6 +554,8 @@ class OverlayShell(QObject):
         self.overlay.behavior = self.behavior
         self.overlay.edge_probe = self._probe
         self.overlay.click_feedback = self._sound.on_click
+        # 点击气泡族（余额/点击自言自语）：与 click_feedback 同位置注入
+        self.overlay._on_sprite_click = self._on_sprite_click
         # 4.1c 弹弓：controller 由 OverlayWindow 自持，这里只接 config
         # （slingshot_enabled 热读，设置页即改即生效）
         self.overlay.slingshot.config = self._config
@@ -1017,6 +1027,23 @@ class OverlayShell(QObject):
         ``host.on_self_talk_speak``（朗读通道），自己不做 window 私面 import。
         """
         return bool(window_alerts.show_click_self_talk(self, click_name))
+
+    def _on_sprite_click(self, sprite, click_name: str) -> None:
+        """单击 sprite 后的点击气泡分支（``window.py:3370-3377`` 的 sprite 等价物）。
+
+        由 ``ShellOverlayWindow.mouseReleaseEvent`` 注入调用（``click_name`` =
+        本次点击实际绑定的动画名，取不到为 ""）。余额优先于自言自语，二者都不
+        开就什么都不做；自言自语显示成功后按 ``after_display`` 重排周期定时器
+        （避免与刚弹出的点击气泡叠在一起）。
+        """
+        if self.click_show_balance:
+            handler = getattr(getattr(self._instance, "shell", None),
+                              "show_balance", None)
+            if callable(handler):
+                handler(self)  # 余额气泡锚在本壳（本壳就是那个 sprite 的宿主窗）
+        elif self.click_show_self_talk:
+            if self._show_click_self_talk(click_name):
+                self._schedule_self_talk(after_display=True)
 
     # ---- 音乐（歌词）宿主（window_optional_services 四件套的 sprite 等价物）----
     def install_music_lyric(self):
@@ -1979,6 +2006,8 @@ class OverlayShell(QObject):
         self.overlay.add_position_listener(self.sprite, self._on_main_sprite_moved)
         self._bind_feeding()
         self._bind_bubble()
+        # 点击气泡族：主身份提升后回调仍指本壳（overlay 未变，重挂=幂等对齐）
+        self.overlay._on_sprite_click = self._on_sprite_click
         self._sync_runtime_marker()
 
     # ---------------------------------------------------------------- D7 设置进程避让标记
@@ -2363,6 +2392,9 @@ class OverlayShell(QObject):
         # （slingshot_enabled 热读，设置页即改即生效）
         self.overlay.slingshot.config = self._config
         from .sprite_menu_facade import build_sprite_full_menu
+        # 点击气泡族（余额/点击自言自语）：新 overlay 上必须重挂，否则屏迁移后
+        # 点击静默丢失（与 click_feedback 同位置）
+        self.overlay._on_sprite_click = self._on_sprite_click
         self.overlay._full_menu_builder = (
             lambda target: build_sprite_full_menu(self, target))
         self.overlay._through_changed = self._on_user_through_changed

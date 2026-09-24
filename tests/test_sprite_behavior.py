@@ -732,6 +732,19 @@ def test_click_without_click_pool_returns_false():
     assert c.on_sprite_clicked(sprite) is False
 
 
+def test_anim_of_reports_bound_clip_without_changing_click_contract():
+    """只读访问器：点击台词按当前绑定动画查表（on_sprite_clicked 仍返回 bool）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+
+    assert c.anim_of(sprite) is None          # 未接管过 → 调用方回退全局随机
+    c.tick([sprite], 0.016)
+    assert c.anim_of(sprite) == "idle1"
+    assert c.on_sprite_clicked(sprite) is True
+    assert c.anim_of(sprite) == "click1"      # 点击 clip 已绑定
+
+
 # ---------------------------------------------------------------- 边界
 def test_move_targets_stay_inside_bounds():
     # 随机长跑：真实 random 播种，任何时刻 sprite 矩形不得出活动边界

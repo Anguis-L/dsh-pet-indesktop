@@ -256,6 +256,16 @@ class BehaviorController:
         st = self._states.get(sprite)
         return st.state if st is not None else None
 
+    def anim_of(self, sprite) -> str | None:
+        """当前绑定的 clip 名（None = 尚未接管/未起播）。
+
+        只读访问器：点击台词绑定（``config.click_talk_texts_for``）要按"这次
+        点中了哪条 click 动画"查表，而 ``on_sprite_clicked`` 的返回值是
+        「是否消费点击」契约，不能挪用；故单开这一面，不改变点击语义。
+        """
+        st = self._states.get(sprite)
+        return st.anim if st is not None else None
+
     def on_clip_finished(self, sprite) -> None:
         """clip 圈末结束（PetSprite.finished 转发）：本状态还有剩余时长就续圈。
 

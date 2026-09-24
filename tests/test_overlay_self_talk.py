@@ -24,7 +24,8 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QColor, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QApplication
 
 import tests.test_overlay_window_capabilities as cap
@@ -72,6 +73,10 @@ def _make_shell(tmp_path, values=None, *, bindings=None):
     lib = fac.RichLibrary()
     shell.lib = lib
     shell.sprite.library = lib
+    # 点击音效有独立用例（test_sprite_sound.py 的 click_feedback 接线）；这里关掉，
+    # 否则点击路径投递的 0ms 延迟播放队列会跨用例泄漏（被下一条用例的 play_sound
+    # 打桩收走，变成伪失败）。
+    shell.overlay.click_feedback = None
     return shell, config
 
 
@@ -174,5 +179,97 @@ def test_deleted_absolute_image_dir_degrades_to_text(tmp_path):
         shell.overlay.show()
         assert shell._show_random_self_talk() is True
         assert shell._speech_bubble._raw_text == "自言自语台词"
+    finally:
+        _cleanup(shell)
+
+
+# ---------------------------------------------------------------- 2/3. 点击链路
+def _click_sprite(shell):
+    """走真实 overlay 鼠标路由：同一位置 press→release = 单击 sprite。"""
+    sprite = shell.sprite
+    center = QPointF(sprite.rect().center())
+    shell.overlay._mouse_grab = sprite
+    shell.overlay._press_pos = QPointF(center)
+    event = QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(center), QPointF(center),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier)
+    shell.overlay.mouseReleaseEvent(event)
+
+
+def test_click_shows_self_talk_and_reschedules(tmp_path):
+    """点击 sprite → 出气泡 + after_display 重排定时器（window.py:3370-3377 语义）。"""
+    shell, _config = _make_shell(
+        tmp_path, _talk_values(click_show_self_talk=True))
+    try:
+        shell.overlay.show()
+        assert shell.behavior.anim_of(shell.sprite) is None  # 尚未接管
+
+        _click_sprite(shell)
+
+        assert shell._speech_bubble is not None
+        assert shell._speech_bubble._raw_text == "自言自语台词"
+        assert shell._self_talk_timer.interval() == 6000  # after_display=True
+    finally:
+        _cleanup(shell)
+
+
+def test_click_uses_bound_talk_text_for_current_anim_and_speaks(tmp_path):
+    """逐动画台词：绑定过的 click 动画名出绑定文本，并把同一句交给朗读通道。"""
+    shell, _config = _make_shell(
+        tmp_path,
+        _talk_values(click_show_self_talk=True),
+        bindings={"click1": ["绑定台词"]},
+    )
+    spoken: list[str] = []
+    shell.on_self_talk_speak = spoken.append
+    try:
+        shell.overlay.show()
+        _click_sprite(shell)
+
+        assert shell.behavior.anim_of(shell.sprite) == "click1"  # 点击 clip 已绑定
+        assert shell._speech_bubble._raw_text == "绑定台词"
+        assert spoken == ["绑定台词"]  # 听到的 == 看到的
+    finally:
+        _cleanup(shell)
+
+
+def test_click_without_binding_falls_back_to_random_self_talk(tmp_path):
+    """未绑定当前动画 → 回退全局随机自言自语（window_alerts.py:474-477）。"""
+    shell, _config = _make_shell(
+        tmp_path, _talk_values(click_show_self_talk=True))
+    try:
+        shell.overlay.show()
+        _click_sprite(shell)
+        assert shell._speech_bubble._raw_text == "自言自语台词"
+    finally:
+        _cleanup(shell)
+
+
+def test_click_with_self_talk_off_keeps_bubble_quiet(tmp_path):
+    """点击自言自语关闭 → 点击只出动画，不出气泡也不排程。"""
+    shell, _config = _make_shell(
+        tmp_path, _talk_values(self_talk_enabled=False, click_show_self_talk=False))
+    try:
+        shell.overlay.show()
+        _click_sprite(shell)
+        assert shell._self_talk_timer.isActive() is False
+        assert getattr(shell._speech_bubble, "_raw_text", "") != "自言自语台词"
+    finally:
+        _cleanup(shell)
+
+
+def test_click_show_balance_routes_to_shell_show_balance(tmp_path):
+    """click_show_balance 优先：转 ``AppShell.show_balance``（window.py:3370-3371）。"""
+    shell, _config = _make_shell(
+        tmp_path, _talk_values(click_show_balance=True, click_show_self_talk=True))
+    calls: list = []
+    shell._instance.shell = type(
+        "_Shell", (), {"show_balance": lambda self, parent=None: calls.append(parent)})()
+    try:
+        shell.overlay.show()
+        _click_sprite(shell)
+        assert calls == [shell]                 # 余额气泡锚在本壳（有 show_bubble）
+        assert shell._self_talk_timer.interval() == 5000  # 走余额分支，不重排自言自语
     finally:
         _cleanup(shell)
