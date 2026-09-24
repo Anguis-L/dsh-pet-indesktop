@@ -203,8 +203,21 @@ def test_scale_setter_rejects_non_positive():
 
 
 # ---------------------------------------------------------------- V-12
+class _TickSprite:
+    """够 add_sprite/advance 的最小 sprite（M12c 起空 overlay 不起表）。"""
+
+    visible = True
+
+    def rect(self):
+        return QRect(0, 0, 10, 10)
+
+    def advance(self, dt):
+        return None
+
+
 def test_close_event_stops_tick_timer():
     overlay = OverlayWindow()
+    overlay.add_sprite(_TickSprite())
     overlay.start()
     assert overlay._timer.isActive()
     overlay.closeEvent(QCloseEvent())
