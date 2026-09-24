@@ -66,6 +66,7 @@ import logging
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import shiboken6
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QTimer, Qt, Signal
@@ -77,10 +78,18 @@ from . import overlay_settings_command
 from . import overlay_spawn_state
 from . import slot_manager
 from . import window_alerts
+from .config import (
+    DEFAULT_SELF_TALK_BUBBLE_STYLE,
+    DEFAULT_SELF_TALK_DURATION_SECONDS,
+    DEFAULT_SELF_TALK_MAX_INTERVAL,
+    DEFAULT_SELF_TALK_MIN_INTERVAL,
+)
+from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
 from .overlay_peripherals import FullscreenCursorWatcher
 from .overlay_window import OverlayWindow
 from .pet_sprite import INTERACTION_DRAG, INTERACTION_THROWN, PetSprite
 from .session_watcher import install_session_watcher
+from .speech_bubble import list_self_talk_images
 from .sprite_behavior import (
     STATE_ACTS,
     STATE_CLICK,
@@ -99,6 +108,24 @@ TOPOLOGY_OVERLAY = overlay_settings_command.TOPOLOGY_OVERLAY
 # 联动动作链里「一次性动作正在播」（window.py _is_one_shot_playing 的 sprite 等价物）：
 # 动作池 / 点击回应 / 移动三类都不可被打断，联动请求排进待播槽。
 _LINK_ONESHOT_STATES = (STATE_ACTS, STATE_CLICK, STATE_MOVE)
+
+
+def _resolve_self_talk_image_dir(raw: str) -> str:
+    """解析自言自语配图目录（语义逐行对齐 ``window.py:123``）。
+
+    为什么不直接 import 那个私有函数：overlay 拓扑不构造 PetWindow，壳不该
+    为了一个 8 行路径换算去依赖 ``pet.window`` 的私有面；这里按源实现的语义
+    逐行镜像，行为差异一眼可查。用户显式配置的外部目录被删除后不再回退内置
+    彩蛋池（用户删目录的意图就是"不要再看图"），相对路径（内置 assets）保留
+    回退以兼容便携包目录迁移。
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute() and not candidate.is_dir():
+        return ""
+    return str(resolve_fun_asset(raw, oijingjing_image_path().parent))
 
 
 def _import_quick_chat():
@@ -561,6 +588,9 @@ class OverlayShell(QObject):
         self._apply_window_capabilities()
         # 4.1c 气泡跟随（真实 PetSpeechBubble；静默降级）
         self._bind_bubble()
+        # 自言自语族（周期气泡 / 点击台词 / 配图 / 朗读）：旧架构唯一宿主是
+        # PetWindow（window.py:458-480 + :740），overlay 拓扑下必须由本壳装配
+        self._init_self_talk()
         # 4.3 后半：联动动作链接续控制器（extras 尾段观测一次性动作结束边沿）
         self._link_chain = _LinkAnimChain(self)
         self.driver.add_extra_controller(self._link_chain)
@@ -613,14 +643,22 @@ class OverlayShell(QObject):
         4.3 后半：跟随器接上点击回调（快速对话入口）+ ``hidden_signal``
         （提醒队列推进/粘滞气泡恢复，``window_alerts.on_speech_bubble_hidden``），
         并按聊天可用性切换气泡的可点状态。
+
+        自言自语族：气泡风格（``self_talk_bubble_style``）与「气泡文字大小」
+        （``bubble_text_scale``）此前在 overlay 拓扑下被静默降级成默认值——
+        旧架构由 PetWindow 构造期注入（window.py:454-478），这里补齐同一注入。
         """
         follower = getattr(self, "_bubble_follower", None)
         if follower is not None:
             follower.close()
         self._bubble_follower = SpriteBubbleFollower(
-            self.overlay, self.sprite, on_clicked=self._on_bubble_clicked)
+            self.overlay, self.sprite, on_clicked=self._on_bubble_clicked,
+            style_id=str(self._config.get(
+                "self_talk_bubble_style", DEFAULT_SELF_TALK_BUBBLE_STYLE)
+                or DEFAULT_SELF_TALK_BUBBLE_STYLE))
         bubble = self._speech_bubble
         if bubble is not None:
+            self._apply_bubble_text_scale(bubble)
             try:
                 bubble.hidden_signal.connect(self._on_speech_bubble_hidden)
             except (AttributeError, RuntimeError, TypeError):
@@ -630,6 +668,59 @@ class OverlayShell(QObject):
             # 可点状态；否则等首次冒泡时由 show_bubble 的
             # _apply_bubble_interactive 惰性解析（与 legacy 触点一致）。
             self._apply_bubble_interactive()
+
+    def _apply_bubble_text_scale(self, bubble) -> None:
+        """把「气泡文字大小」注入气泡控件（window.py:472-478 的 sprite 等价物）。
+
+        getattr 守卫保留：测试替身气泡（``_BubbleStub`` 等）不实现
+        ``set_text_scale``，守卫缺失会把无关用例打红。
+        """
+        setter = getattr(bubble, "set_text_scale", None)
+        if not callable(setter):
+            return
+        try:
+            scale = float(self._config.get("bubble_text_scale", 100) or 100) / 100.0
+            setter(max(0.5, min(3.0, scale)))
+        except Exception:
+            logging.debug("overlay: 气泡文字缩放注入失败", exc_info=True)
+
+    def _init_self_talk(self) -> None:
+        """自言自语状态装配 + 周期定时器（``window.py:458-480`` / ``:740`` 对齐）。
+
+        overlay 拓扑下 PetWindow 不构造，这一族（周期气泡、点击台词、配图、
+        朗读）没有别的宿主，缺这一步就整族静默失效。文本池走
+        ``window_alerts.read_self_talk_texts``（host 形共享实现）；DEFAULT
+        常量取 ``pet/config.py``（不在壳里依赖 ``pet.window`` 的再导出面）。
+        """
+        config = self._config
+        self._self_talk_enabled = bool(config.get("self_talk_enabled", False))
+        self._self_talk_texts = window_alerts.read_self_talk_texts(
+            config.get("self_talk_texts"))
+        self._self_talk_duration_seconds = max(
+            1.0, min(300.0, float(config.get(
+                "self_talk_duration_seconds", DEFAULT_SELF_TALK_DURATION_SECONDS))))
+        self._self_talk_image_dir = str(config.get("self_talk_image_dir", "") or "")
+        self._self_talk_images = list_self_talk_images(
+            _resolve_self_talk_image_dir(self._self_talk_image_dir))
+        self._self_talk_image_scale = max(
+            0.5, min(3.0, float(config.get("self_talk_image_scale", 100)) / 100.0))
+        self._self_talk_min_interval = max(
+            5.0, float(config.get(
+                "self_talk_min_interval", DEFAULT_SELF_TALK_MIN_INTERVAL)))
+        self._self_talk_max_interval = max(
+            self._self_talk_min_interval,
+            float(config.get(
+                "self_talk_max_interval", DEFAULT_SELF_TALK_MAX_INTERVAL)))
+        # 点击路径共享：实际显示的文本（图片气泡显式记 None，朗读据此静默）
+        self._last_self_talk_text: str | None = None
+        # 表达风格 picker：window_alerts.expression_style_text 惰性建，先占位
+        self._expression_picker = None
+        self.click_show_balance = bool(config.get("click_show_balance", False))
+        self.click_show_self_talk = bool(config.get("click_show_self_talk", False))
+        self._self_talk_timer = QTimer(self)
+        self._self_talk_timer.setSingleShot(True)
+        self._self_talk_timer.timeout.connect(self._on_self_talk_timeout)
+        self._schedule_self_talk()  # 首次排程（window.py:740）
 
     def _install_shared_link(self) -> None:
         """把本壳接进共享联动链（``AppShell._wire_shared_subsystems`` 的等价物）。
@@ -856,6 +947,76 @@ class OverlayShell(QObject):
         self._sticky_text = ""
         self._sticky_subtitle = ""
         self._sticky_buttons = None
+
+    # ---- 自言自语族（window.py:3686-3708 的 sprite 等价 host 面）----
+    def _schedule_self_talk(self, *, after_display: bool = False) -> None:
+        """排下一次自言自语（``window_alerts.schedule_self_talk`` host 形转发）。"""
+        window_alerts.schedule_self_talk(self, after_display=after_display)
+
+    def _on_self_talk_timeout(self) -> None:
+        """周期定时器到点（``window_alerts.on_self_talk_timeout`` host 形转发）。"""
+        window_alerts.on_self_talk_timeout(self)
+
+    def _show_self_talk_text(self, text: str) -> bool:
+        """自言自语文本落地（sprite 版，**不可**直接复用 window_alerts 同名函数）。
+
+        差异点：``window_alerts.show_self_talk_text`` 会
+        ``from .window import _set_speech_bubble_interactive``，而那个实现判的是
+        ``host.on_open_quick_chat``——旧 PetWindow 的快速对话回调名。sprite 壳上
+        叫 ``open_quick_chat``（见 ``_apply_bubble_interactive``），直接复用会把
+        气泡每次置为「不可点」，快速对话入口静默失效。这里改用壳自己的可点态
+        切换，文本交给跟随器，锚点由 follower 自算（气泡锚 sprite 身体框）。
+        """
+        if self._bubble_suppressed:
+            return False
+        self._apply_bubble_interactive()
+        return self._show_bubble_text(
+            str(text), int(self._self_talk_duration_seconds * 1000))
+
+    def _show_random_self_talk(self) -> bool:
+        """随机一条自言自语（文本或配图）。
+
+        抽样与出图概率复用 ``window_alerts`` 的纯逻辑函数
+        （``pick_self_talk_choice`` / ``self_talk_image_chance``，无 host 依赖）；
+        落地走 sprite 版气泡面（配图 = 刀 1 的 ``SpriteBubbleFollower.show_image``），
+        不触碰 window 私面。
+        """
+        if self._bubble_suppressed:
+            return False
+        # 审批等一直挂着的气泡优先，自言自语不覆盖（window_alerts 同款守卫）
+        if self._sticky_bubble_active or self._alert_current is not None:
+            return False
+        # 惰性剔除运行期间被删除的图片
+        live_images = [path for path in self._self_talk_images if path.is_file()]
+        if len(live_images) != len(self._self_talk_images):
+            self._self_talk_images = live_images
+        picked = window_alerts.pick_self_talk_choice(
+            self._self_talk_texts, live_images,
+            window_alerts.self_talk_image_chance(self))
+        if picked is None:
+            return False
+        kind, value = picked
+        duration_ms = int(round(self._self_talk_duration_seconds * 1000))
+        self._apply_bubble_interactive()
+        if kind == "image":
+            # 图片气泡没有可朗读的文本：显式记 None，点击路径据此保持安静
+            self._last_self_talk_text = None
+            follower = getattr(self, "_bubble_follower", None)
+            if follower is None:
+                return False
+            return follower.show_image(
+                value, duration_ms, image_scale=self._self_talk_image_scale)
+        self._last_self_talk_text = value
+        return self._show_self_talk_text(value)
+
+    def _show_click_self_talk(self, click_name: str = "") -> bool:
+        """点击自言自语（``window_alerts.show_click_self_talk`` host 形转发）。
+
+        可安全转发：该实现只调用 ``host._show_self_talk_text`` /
+        ``host._show_random_self_talk``（本类覆写的 sprite 版）与
+        ``host.on_self_talk_speak``（朗读通道），自己不做 window 私面 import。
+        """
+        return bool(window_alerts.show_click_self_talk(self, click_name))
 
     # ---- 音乐（歌词）宿主（window_optional_services 四件套的 sprite 等价物）----
     def install_music_lyric(self):
@@ -1964,6 +2125,9 @@ class OverlayShell(QObject):
         4.3 后半：显隐钩子上接主动识屏/联动监视器的 pause/resume
         （``window.py:1214-1250`` 语义）。隐藏时也收起气泡；恢复时把仍挂着的
         粘滞提醒重新挂上（legacy ``_resume_activity`` 同款）。
+
+        自言自语定时器与显隐对称（``window.py:1183`` / ``:1240``）：隐藏期间
+        停表（不可见壳不冒泡），恢复显示时重排下一次。
         """
         if visible:
             self.overlay.show()
@@ -1972,7 +2136,12 @@ class OverlayShell(QObject):
                 probe.resume()
             self._restore_sticky_bubble()
             self._resume_shared_subsystems()
+            if getattr(self, "_self_talk_timer", None) is not None:
+                self._schedule_self_talk()
         else:
+            timer = getattr(self, "_self_talk_timer", None)
+            if timer is not None:
+                timer.stop()
             self._hide_bubble_for_visibility()
             self.overlay.hide()
             probe = getattr(self, "_probe", None)
