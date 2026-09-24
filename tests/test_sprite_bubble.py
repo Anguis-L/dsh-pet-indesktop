@@ -2,7 +2,7 @@
 """SpriteBubbleFollower offscreen 单测（4.1c 气泡）。
 
 覆盖：锚点 = 身体框全局换算（非整画布）、30Hz 节流 + 尾部补发、
-say 走真实 PetSpeechBubble.show_text 形参、close 静默。
+say 走真实 PetSpeechBubble.show_text 形参、show_image 配图通道、close 静默。
 """
 from __future__ import annotations
 
@@ -84,5 +84,48 @@ def test_say_passes_anchor_and_kwargs(tmp_path):
         assert follower.say("") is False
         follower.close()
         assert follower.bubble is None
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_show_image_delegates_anchor_and_scale(tmp_path):
+    """配图自言自语：形参面对齐 PetSpeechBubble.show_image，锚点/缩放由本层补齐。"""
+    shell, follower = _make(tmp_path)
+    try:
+        calls = []
+
+        def _show_image(path, anchor, duration_ms, **kw):
+            calls.append((path, QRect(anchor), duration_ms, kw))
+            return True
+
+        follower.bubble.show_image = _show_image
+        assert follower.show_image("cat.png", 1500, image_scale=1.6) is True
+        path, anchor, duration_ms, kw = calls[0]
+        assert path == "cat.png" and duration_ms == 1500
+        assert kw["image_scale"] == 1.6
+        assert kw["pet_scale"] == shell.sprite.scale
+        body = (shell.sprite.body_rect() if hasattr(shell.sprite, "body_rect")
+                else shell.sprite.rect())
+        assert anchor == QRect(shell.overlay.geometry().topLeft() + body.topLeft(),
+                               body.size())
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_show_image_degrades_quietly(tmp_path):
+    """气泡不可用 / 底层不支持配图 / 底层抛异常 → False，绝不抛到调用方。"""
+    shell, follower = _make(tmp_path)
+    try:
+        follower.bubble = None
+        assert follower.show_image("cat.png", 1000) is False
+
+        follower.bubble = FakeBubble()  # 无 show_image：按失败降级
+        assert follower.show_image("cat.png", 1000) is False
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("pixmap decode failed")
+
+        follower.bubble.show_image = _boom
+        assert follower.show_image("cat.png", 1000) is False
     finally:
         shell._delete_runtime_marker()

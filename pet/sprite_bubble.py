@@ -15,6 +15,10 @@ fanout 游走期每 tick 一次 SetWindowPos ≈1.5ms 的 WM 移动税不能再�
 无按钮气泡可点开对话栏，交互（buttons）/告警气泡的主体点击是 no-op。
 点击能力复用既有 ``PetSpeechBubble`` 公开面（``clicked`` 信号 +
 ``set_interactive`` + ``show_text``），不新造控件、不复制气泡实现。
+
+自言自语配图（本刀）：``show_image`` 补齐 ``PetSpeechBubble.show_image``
+的锚点/缩放面——旧架构唯一宿主 PetWindow 在 overlay 拓扑下不构造，没有
+这一步配图自言自语（``self_talk_image_chance``）在 sprite 世界无路可走。
 """
 from __future__ import annotations
 
@@ -127,6 +131,28 @@ class SpriteBubbleFollower:
             return True
         except Exception:
             logger.debug("overlay: 气泡播放失败", exc_info=True)
+            return False
+
+    def show_image(self, image_path, duration_ms: int = 3200,
+                   image_scale: float = 1.0) -> bool:
+        """播一张配图气泡（配图自言自语；``PetSpeechBubble.show_image`` 形参面）。
+
+        形参对齐 ``speech_bubble.py:960`` 的 ``show_image(path, anchor,
+        duration_ms, *, pet_scale, image_scale)``：锚点由跟随器自算（气泡
+        锚定 sprite 而非 window 的可见内容矩形），``pet_scale`` 取 sprite
+        缩放，故调用方只关心图与显示时长/缩放。图片路径无效、气泡不可用
+        或底层抛异常都返回 False——与 ``show`` 同款静默降级，配图失败绝
+        不冒泡出异常到自言自语链路。
+        """
+        if self.bubble is None:
+            return False
+        try:
+            return bool(self.bubble.show_image(
+                image_path, self.anchor(), duration_ms,
+                pet_scale=getattr(self._sprite, "scale", None),
+                image_scale=image_scale))
+        except Exception:
+            logger.debug("overlay: 气泡配图播放失败", exc_info=True)
             return False
 
     def set_interactive(self, on: bool) -> None:
