@@ -297,3 +297,53 @@ def test_refresh_settings_hot_reloads_self_talk_fields(tmp_path):
         assert shell.click_show_self_talk is True
     finally:
         _cleanup(shell)
+
+
+# ---------------------------------------------------------------- 8. 图片路径慢帧归因
+def test_image_branch_uses_warm_cache_no_gui_disk_work(tmp_path):
+    """配图走 worker 预热缓存（GUI 零磁盘/解码税）；is_file 剔除有 60s TTL。"""
+    import time as _time
+
+    shell, _config = _make_shell(tmp_path, _talk_values(self_talk_image_chance=100))
+    try:
+        img_path = _write_png(tmp_path / "imgs")
+        shell._self_talk_images = [img_path]
+        shell._self_talk_image_cache = {str(img_path): QPixmap(str(img_path)).toImage()}
+        shell._self_talk_images_checked_at = _time.monotonic()  # TTL 内不再 stat
+
+        calls: dict = {}
+        follower = shell._bubble_follower
+        original = follower.show_image
+        follower.show_image = lambda path, ms, image_scale=1.0, pixmap=None: (
+            calls.update(path=path, pixmap=pixmap), True)[1]
+
+        assert shell._show_random_self_talk() is True
+        assert calls["path"] == img_path
+        assert calls["pixmap"] is not None and not calls["pixmap"].isNull()
+
+        follower.show_image = original
+        shell._delete_runtime_marker()
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_image_branch_cache_miss_falls_back_to_text(tmp_path):
+    """缓存未命中（decode 在飞）→ 回退文本气泡，绝不在 GUI 同步读图。"""
+    shell, _config = _make_shell(tmp_path, _talk_values(self_talk_image_chance=100))
+    try:
+        img_path = _write_png(tmp_path / "imgs")
+        shell._self_talk_images = [img_path]
+        shell._self_talk_image_cache = {}  # 未命中
+
+        calls: dict = {}
+        follower = shell._bubble_follower
+        follower.show_image = lambda *a, **k: (calls.update(image=True), True)[1]
+        shell._show_bubble_text = lambda text, ms: (
+            calls.update(text=text), True)[1]
+
+        assert shell._show_random_self_talk() is True
+        assert "image" not in calls          # 没有同步出图
+        assert calls.get("text") == "自言自语台词"
+        shell._delete_runtime_marker()
+    finally:
+        shell._delete_runtime_marker()

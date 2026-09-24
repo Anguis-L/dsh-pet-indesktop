@@ -586,12 +586,22 @@ class PetSprite(QObject):
         setter = getattr(clip, "set_playback_speed", None)
         if callable(setter):
             setter(self.playback_speed)
-        # start() 前同步取第 0 帧（旧机 window.py:1549-1554 的
-        # stop→jumpToFrame(0)→start 语义）：帧序列 clip 的 start 是异步交付
-        # 首帧，先同步跳帧才能保证显示槽立刻有帧可画。
-        jump = getattr(clip, "jumpToFrame", None)
-        if callable(jump):
-            jump(0)
+        # start() 前同步取第 0 帧的策略（py-spy 慢帧归因 2026-09-24）：
+        # - 显示槽已有可显示帧（预热/上一圈残留）→ 不跳（start 不清槽，
+        #   修复 1 已保证显示连续）；
+        # - FrameSeqClip 无帧 → jumpToFrame(0) 是同步磁盘读 ~2.5ms，便宜，
+        #   且它的 start 是异步交付首帧，必须先同步跳帧才有帧可画；
+        # - WebMClip 无帧 → **不跳**：它的 jumpToFrame(0) 内部走 stop()→
+        #   _hard_stop，随后 start 重新 spawn ffmpeg（GUI 线程 50-56ms，
+        #   py-spy 实机抓到的慢帧主力）。无帧时靠「保留旧 _pixmap 兜底 +
+        #   start 异步交付」过渡（冷启动 60-166ms 是 legacy 既有语义，
+        #   不为它在 GUI 线程付进程创建税）。
+        cur = getattr(clip, "currentImage", None)
+        img = cur() if callable(cur) else None
+        if img is None or img.isNull():
+            from .frameseq_clip import FrameSeqClip
+            if isinstance(clip, FrameSeqClip):
+                clip.jumpToFrame(0)
         start = getattr(clip, "start", None)
         if not callable(start):
             return True

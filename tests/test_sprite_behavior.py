@@ -986,3 +986,35 @@ def test_predict_disabled_falls_back_to_live_roll():
     st = c._states[sprite]
     assert st.predictor.counts["made"] == 0
     assert c.state_of(sprite) == "acts"
+
+
+# ---------------------------------------------------------------- 慢帧归因：预测预热下 worker
+def test_predict_warm_runs_off_gui_thread():
+    """_warm 的首帧解码（ffmpeg spawn ~50ms）必须下 worker——在 tick_sim
+    里同步拉起 ffmpeg 是 50-56ms 周期性慢帧主力（py-spy 慢帧归因）。"""
+    import threading
+
+    lib = _make_library()
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+
+    done = threading.Event()
+    seen: dict = {}
+    clip = lib.clip("idle1")
+    original = clip.warm_first_frame if hasattr(clip, "warm_first_frame") else None
+
+    def warm():
+        seen["thread"] = threading.current_thread().name
+        done.set()
+
+    clip.warm_first_frame = warm
+    # 经 predictor 的 warm 回调触发（GUI 线程直调，等价 _maybe_predict 的调用点）
+    st = c._states[sprite]
+    predictor = st.predictor or c._make_predictor(sprite, st)
+    predictor._warm("idle1")
+
+    assert done.wait(5.0), "warm 未被派发执行"
+    assert seen["thread"] != threading.main_thread().name
+    assert "prewarm" in seen["thread"]

@@ -965,8 +965,12 @@ class PetSpeechBubble(QFrame):
         *,
         pet_scale: float | None = None,
         image_scale: float = 1.0,
+        pixmap: QPixmap | None = None,
     ) -> bool:
-        pixmap = QPixmap(str(image_path))
+        # pixmap 直供（调用方已解码/预热）：跳过同步磁盘读+解码——GUI 线程
+        # 上的 QPixmap(str(path)) 是大图 100ms+ 级慢帧源（py-spy 实测）。
+        if pixmap is None:
+            pixmap = QPixmap(str(image_path))
         if pixmap.isNull():
             return False
         self._content_kind = "image"

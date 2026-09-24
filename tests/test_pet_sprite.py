@@ -264,3 +264,46 @@ def test_set_flight_anim_speed_skips_redundant_writes():
     sprite.set_flight_anim_speed(1.0)
 
     assert len(clip.speed_calls) == calls
+
+
+# ---------------------------------------------------------------- 慢帧归因：bind 的 jump 策略
+def test_bind_skips_jump_when_display_frame_ready():
+    """显示槽已有帧（预热/上一圈残留）→ 不再 jump（start 不清槽，显示连续）。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    assert clip.jump_count == 0          # FakeClip.currentImage 恒非空 → 不跳
+    assert clip.start_count == 1
+
+
+def test_bind_no_jump_for_non_frameseq_without_frame():
+    """WebM 型 clip 无帧也不 jump——它的 jumpToFrame(0) 会 hard-stop 现有
+    reader、随后 start 重新 spawn ffmpeg（GUI 线程 50ms 慢帧源）；
+    无帧时靠保留旧 _pixmap 兜底 + start 异步交付（py-spy 慢帧归因）。"""
+    clip = FakeClip()
+    clip.image = QImage()                # 空图 = 显示槽无帧
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    assert clip.jump_count == 0          # 非帧序列：不跳（异步交付）
+    assert clip.start_count == 1
+
+
+def test_bind_jumps_for_frameseq_without_frame(tmp_path):
+    """FrameSeqClip 无帧 → jumpToFrame(0)（同步磁盘读 ~2.5ms，便宜且必需：
+    它的 start 是异步交付首帧）。真 FrameSeqClip 实例（isinstance 判定）。"""
+    from PySide6.QtGui import QImage as _QI
+    from pet.frameseq_clip import FrameSeqClip
+
+    d = tmp_path / "clip"
+    d.mkdir()
+    (d / "meta.json").write_text('{"fps": 24}', encoding="utf-8")
+    img = _QI(8, 8, _QI.Format.Format_ARGB32)
+    img.fill(0xFF336699)
+    assert img.save(str(d / "f_0001.webp"))  # 空帧目录的 start() 会拒播
+    clip = FrameSeqClip(d)
+    jumps: list = []
+    original = clip.jumpToFrame
+    clip.jumpToFrame = lambda n: (jumps.append(n), original(n))[1]
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    assert jumps == [0]

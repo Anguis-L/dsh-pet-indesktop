@@ -135,11 +135,14 @@ def _half_opaque_clip():
 
 # ---------------------------------------------------------------- clip 绑定（切动画不闪消失）
 def test_bind_clip_primes_frame_zero_and_keeps_previous_frame():
-    """换 clip：start() 前同步 jumpToFrame(0)，且显示槽从不清空（回归）。
+    """换 clip：显示槽从不清空（回归）；jump 策略按 clip 类型分档。
 
     旧行为 bind_clip 把 _pixmap 清空，新 clip 首帧异步到货前 paint 直接
-    return → sprite 区域画透明 = 桌宠闪消失一瞬。保留上一帧兜底 + 同步取
-    帧 0（旧机 window.py:1549-1554 的 stop→jumpToFrame(0)→start 语义）。
+    return → sprite 区域画透明 = 桌宠闪消失一瞬。保留上一帧兜底是主防线；
+    同步取帧 0 只对 FrameSeqClip（同步磁盘读 ~2.5ms 的便宜路径）做——
+    WebM 型 clip（本用例的 DeferredFrameClip）jump 会 hard-stop + 重新
+    spawn ffmpeg（GUI 50ms 慢帧源），改为异步交付 + 旧帧兜底（py-spy
+    慢帧归因 2026-09-24）。
     """
     first = _half_opaque_clip()
     sprite = PetSprite(FakeLibrary(first), pos=QPointF(100, 100), scale=0.5)
@@ -150,8 +153,8 @@ def test_bind_clip_primes_frame_zero_and_keeps_previous_frame():
     second = DeferredFrameClip()
     sprite.library = FakeLibrary(second)
     sprite.bind_clip("b")
-    # start() 前同步取帧 0（对齐 window.py:1554）
-    assert second.calls == ["jump:0", "start"]
+    # WebM 型 clip 无帧也不 jump（异步交付；spawn 税不下 GUI）
+    assert second.calls == ["start"]
     # 首帧异步到货前：上一帧仍在显示槽，paint 不画空
     assert sprite._pixmap is not None
     canvas = QImage(200, 200, QImage.Format.Format_ARGB32)

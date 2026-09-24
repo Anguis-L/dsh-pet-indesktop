@@ -70,7 +70,7 @@ from pathlib import Path
 
 import shiboken6
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QTimer, Qt, Signal
-from PySide6.QtGui import QBitmap, QIcon, QPixmap, QRegion
+from PySide6.QtGui import QBitmap, QIcon, QImage, QPixmap, QRegion
 from PySide6.QtWidgets import QMenu, QStyle, QSystemTrayIcon
 
 from . import catalog
@@ -842,6 +842,11 @@ class OverlayShell(QObject):
         self._expression_picker = None
         self.click_show_balance = bool(config.get("click_show_balance", False))
         self.click_show_self_talk = bool(config.get("click_show_self_talk", False))
+        # 配图缓存随配置重建（目录/清单可能变了），后台解码预热——GUI 只在
+        # 出泡时取缓存（同步读图是 100-256ms 慢帧源，py-spy 实测）。
+        self._self_talk_image_cache = {}
+        self._self_talk_images_checked_at = time.monotonic()
+        self._warm_self_talk_images()
 
     def _install_shared_link(self) -> None:
         """把本壳接进共享联动链（``AppShell._wire_shared_subsystems`` 的等价物）。
@@ -1107,12 +1112,25 @@ class OverlayShell(QObject):
         # 审批等一直挂着的气泡优先，自言自语不覆盖（window_alerts 同款守卫）
         if self._sticky_bubble_active or self._alert_current is not None:
             return False
-        # 惰性剔除运行期间被删除的图片
-        live_images = [path for path in self._self_talk_images if path.is_file()]
-        if len(live_images) != len(self._self_talk_images):
-            self._self_talk_images = live_images
+        # 惰性剔除运行期间被删除的图片——但 stat 是磁盘税（py-spy 实测
+        # 每次自言自语 timeout 全量 is_file 一遍 = 48-56ms 慢帧），
+        # 60s 才复查一次（配置热改路径会主动重置该时刻）。
+        now = time.monotonic()
+        if now - getattr(self, "_self_talk_images_checked_at", 0.0) > 60.0:
+            self._self_talk_images_checked_at = now
+            live_images = [path for path in self._self_talk_images
+                           if path.is_file()]
+            if len(live_images) != len(self._self_talk_images):
+                self._self_talk_images = live_images
+                # 清单变了：图片缓存按新清单裁剪（decode 在 worker，
+                # 见 _warm_self_talk_images）
+                cache = getattr(self, "_self_talk_image_cache", None)
+                if isinstance(cache, dict):
+                    live_keys = {str(p) for p in live_images}
+                    for key in [k for k in cache if k not in live_keys]:
+                        cache.pop(key, None)
         picked = window_alerts.pick_self_talk_choice(
-            self._self_talk_texts, live_images,
+            self._self_talk_texts, self._self_talk_images,
             window_alerts.self_talk_image_chance(self))
         if picked is None:
             return False
@@ -1125,10 +1143,47 @@ class OverlayShell(QObject):
             follower = getattr(self, "_bubble_follower", None)
             if follower is None:
                 return False
+            # 只走 worker 预热好的缓存（GUI 同步读图+解码是 100-256ms 慢帧
+            # 源，py-spy 实测）；缓存未命中（decode 在飞/读取失败）这次先
+            # 回退文本，下次命中再出图——绝不在 GUI 线程付磁盘/解码税。
+            cache = getattr(self, "_self_talk_image_cache", {})
+            image = cache.get(str(value))
+            if image is None or image.isNull():
+                self._warm_self_talk_images()
+                if not self._self_talk_texts:
+                    return False
+                self._last_self_talk_text = self._self_talk_texts[0]
+                return self._show_self_talk_text(self._last_self_talk_text)
             return follower.show_image(
-                value, duration_ms, image_scale=self._self_talk_image_scale)
+                value, duration_ms, image_scale=self._self_talk_image_scale,
+                pixmap=QPixmap.fromImage(image))
         self._last_self_talk_text = value
         return self._show_self_talk_text(value)
+
+    def _warm_self_talk_images(self) -> None:
+        """后台线程解码自言自语配图到 ``_self_talk_image_cache``（QImage，
+        线程安全）；GUI 侧只取缓存。重复调用靠单个守护线程 + 代次去重。"""
+        cache = getattr(self, "_self_talk_image_cache", None)
+        if cache is None:
+            cache = self._self_talk_image_cache = {}
+        gen = self._self_talk_image_warm_gen = \
+            getattr(self, "_self_talk_image_warm_gen", 0) + 1
+        paths = [str(p) for p in self._self_talk_images
+                 if str(p) not in cache]
+        if not paths:
+            return
+
+        def _load():
+            for path in paths:
+                if gen != getattr(self, "_self_talk_image_warm_gen", 0):
+                    return  # 已换代（清单热改）：旧批结果作废
+                img = QImage(path)
+                if not img.isNull():
+                    cache[path] = img
+
+        import threading
+        threading.Thread(target=_load, daemon=True,
+                         name="self-talk-img-warm").start()
 
     def _show_click_self_talk(self, click_name: str = "") -> bool:
         """点击自言自语（``window_alerts.show_click_self_talk`` host 形转发）。

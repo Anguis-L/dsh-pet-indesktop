@@ -46,6 +46,7 @@ WebMClip 圈末交付结束标记后停表，只有 start() 能续圈——多�
 from __future__ import annotations
 
 import random
+from concurrent.futures import ThreadPoolExecutor
 from weakref import WeakKeyDictionary
 
 from PySide6.QtCore import QPointF, QRect
@@ -53,6 +54,15 @@ from PySide6.QtCore import QPointF, QRect
 from . import catalog, movement
 from .pet_sprite import INTERACTION_DRAG, INTERACTION_NORMAL, INTERACTION_THROWN
 from .predictive_prewarm import PredictivePrewarm
+
+# 预测预热共享执行器（单 worker，全控制器共用）：首帧解码（ffmpeg spawn
+# ~50ms）绝不占 GUI 线程——py-spy 慢帧归因（2026-09-24）：_maybe_predict →
+# _warm → warm_first_frame 曾在 tick_sim 里同步拉起 ffmpeg，是 50-56ms
+# 周期性慢帧主力。warm_first_frame 本身按线程安全设计（仅 QImage + 解码
+# 进程，webm_clip.py 的 docstring 明言「后台线程…仅 QImage，线程安全」）；
+# clip 的获取仍留在 GUI（QObject 线程亲和），只有解码动作下 worker。
+_WARM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="sprite-prewarm")
 
 STATE_IDLE = "idle"
 STATE_MOVE = "move"
@@ -441,7 +451,9 @@ class BehaviorController:
                 clip = sprite.library.movie(name)
                 warm = getattr(clip, "warm_first_frame", None)
                 if callable(warm):
-                    warm()
+                    # 解码/拉起 ffmpeg 全部下 worker（GUI 只付一次 submit）。
+                    # clip 的原子认领（N4）保证同一 clip 不重复解码。
+                    _WARM_EXECUTOR.submit(warm)
             except Exception:
                 pass  # 预热失败静默（播放时按需同步解码，语义同旧路径）
 
