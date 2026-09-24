@@ -702,6 +702,16 @@ class OverlayShell(QObject):
         ``window_alerts.read_self_talk_texts``（host 形共享实现）；DEFAULT
         常量取 ``pet/config.py``（不在壳里依赖 ``pet.window`` 的再导出面）。
         """
+        self._load_self_talk_settings()
+        self._self_talk_timer = QTimer(self)
+        self._self_talk_timer.setSingleShot(True)
+        self._self_talk_timer.timeout.connect(self._on_self_talk_timeout)
+        self._schedule_self_talk()  # 首次排程（window.py:740）
+
+    def _load_self_talk_settings(self) -> None:
+        """（重）读 self_talk 族配置字段。构造期由 _init_self_talk 调一次；
+        运行期配置变更由 refresh_settings 再调——否则改开关/间隔/点击行为
+        /配图目录要重启才生效（「改了没反应」会被当成 bug 报回来）。"""
         config = self._config
         self._self_talk_enabled = bool(config.get("self_talk_enabled", False))
         self._self_talk_texts = window_alerts.read_self_talk_texts(
@@ -727,10 +737,6 @@ class OverlayShell(QObject):
         self._expression_picker = None
         self.click_show_balance = bool(config.get("click_show_balance", False))
         self.click_show_self_talk = bool(config.get("click_show_self_talk", False))
-        self._self_talk_timer = QTimer(self)
-        self._self_talk_timer.setSingleShot(True)
-        self._self_talk_timer.timeout.connect(self._on_self_talk_timeout)
-        self._schedule_self_talk()  # 首次排程（window.py:740）
 
     def _install_shared_link(self) -> None:
         """把本壳接进共享联动链（``AppShell._wire_shared_subsystems`` 的等价物）。
@@ -1615,6 +1621,11 @@ class OverlayShell(QObject):
     def refresh_settings(self) -> None:
         """外部配置变更应用点（AppShell._apply_external_config_change 扇出）。"""
         self._apply_window_capabilities()
+        # self_talk 族热改：重读字段并按新口径重排程（schedule_self_talk
+        # 先停表再按 enabled 早退，开/关/改间隔都收敛到这一条路径）。
+        # 气泡风格/字号（_bind_bubble 期应用）不在此列，变更需重启。
+        self._load_self_talk_settings()
+        self._schedule_self_talk()
         self.sync_music_lyric()
 
     def _apply_window_capabilities(self) -> None:

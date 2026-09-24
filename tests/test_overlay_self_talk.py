@@ -273,3 +273,27 @@ def test_click_show_balance_routes_to_shell_show_balance(tmp_path):
         assert shell._self_talk_timer.interval() == 5000  # 走余额分支，不重排自言自语
     finally:
         _cleanup(shell)
+
+
+# ---------------------------------------------------------------- 7. 配置热改
+def test_refresh_settings_hot_reloads_self_talk_fields(tmp_path):
+    """运行期改 self_talk 开关经 refresh_settings 即生效（不等重启）。"""
+    shell, config = _make_shell(tmp_path, _talk_values())
+    try:
+        shell.overlay.show()
+        assert shell._self_talk_timer.isActive() is True
+
+        config.set("self_talk_enabled", False)
+        shell.refresh_settings()
+        assert shell._self_talk_enabled is False
+        assert shell._self_talk_timer.isActive() is False  # 关掉即停表
+
+        config.set("self_talk_enabled", True)
+        shell.refresh_settings()
+        assert shell._self_talk_timer.isActive() is True  # 打开即重排
+
+        config.set("click_show_self_talk", True)
+        shell.refresh_settings()
+        assert shell.click_show_self_talk is True
+    finally:
+        _cleanup(shell)
