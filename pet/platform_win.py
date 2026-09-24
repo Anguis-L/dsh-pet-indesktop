@@ -85,6 +85,10 @@ class WindowsPerPixelInputController:
     """
 
     NORMAL_POLL_INTERVAL_MS = 10
+    #: 光标在窗口包围盒外：逐像素判定必然「无命中 → 穿透」，低频空转即可
+    #: （overlay 铺满整屏时，命中判定还要每 tick 走一遍全部 sprite 的 alpha
+    #: 查询；小窗 legacy 更是绝大多数时间都在盒外）。
+    IDLE_POLL_INTERVAL_MS = 50
     DRAG_POLL_INTERVAL_MS = 100
 
     def __init__(self, window: "PetWindow") -> None:
@@ -105,9 +109,31 @@ class WindowsPerPixelInputController:
             return False
         return win._is_transparent_at(local)
 
+    def _cursor_inside_window(self, global_pos: QPoint) -> bool:
+        """光标是否落在窗口包围盒内（两段式轮询的定档判据）。"""
+        win = self._window
+        local = win.mapFromGlobal(global_pos)
+        return QRect(0, 0, win.width(), win.height()).contains(local)
+
+    def _sync_poll_interval(self, inside: bool) -> None:
+        """按光标位置切档：盒内 10ms（逐像素跟手），盒外 50ms（低频）。
+
+        拖拽中（``_press_global`` 非 None）不参与定档：100ms 档由
+        ``set_drag_active`` 独占（拖拽期 should_click_through 恒 False，
+        轮询只是保活）。
+        """
+        if getattr(self._window, '_press_global', None) is not None:
+            return
+        target = (self.NORMAL_POLL_INTERVAL_MS if inside
+                  else self.IDLE_POLL_INTERVAL_MS)
+        if self._timer.interval() != target:
+            self._timer.setInterval(target)
+
     def refresh(self) -> None:
         try:
-            enabled = self.should_click_through(QCursor.pos())
+            pos = QCursor.pos()
+            self._sync_poll_interval(self._cursor_inside_window(pos))
+            enabled = self.should_click_through(pos)
             _set_windows_click_through(int(self._window.winId()), enabled)
         except (AttributeError, OSError, RuntimeError):
             logging.debug("更新 Windows 逐像素鼠标穿透失败", exc_info=True)
@@ -117,7 +143,8 @@ class WindowsPerPixelInputController:
 
         拖拽（_press_global 非 None）期间 should_click_through 恒返回 False，
         每 10ms 轮询纯属空转：降频到 100ms 减少 Win32/QCursor 调用。
-        松手后立即恢复原频率并强制刷新一次穿透状态；非拖拽状态重复调用是 no-op。
+        松手后立即按光标位置重新定档（盒内 10ms / 盒外 50ms）并强制刷新一次
+        穿透状态；非拖拽状态重复调用是 no-op。
         """
         if active:
             if self._timer.interval() != self.DRAG_POLL_INTERVAL_MS:
