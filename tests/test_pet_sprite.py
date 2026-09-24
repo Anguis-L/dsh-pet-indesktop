@@ -201,3 +201,42 @@ def test_bind_clip_treats_none_start_result_as_accepted():
     clip = FakeClip(start_returns_none=True)
     sprite = _make_sprite(clip)
     assert sprite.bind_clip("walk") is True
+
+
+# ---------------------------------------------------------------- F4：飞行期速率
+def test_flight_anim_speed_scales_user_playback_speed():
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    sprite.playback_speed = 1.5                  # 用户速率
+    sprite.bind_clip("hang")
+
+    sprite.set_flight_anim_speed(1.75)
+
+    assert clip.playback_speed == 1.5 * 1.75
+
+
+def test_reset_playback_speed_restores_user_rate():
+    """落地必须复位：_clip_duration 除 playback_speed（webm_clip.py:1387-1390）。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    sprite.playback_speed = 1.2
+    sprite.bind_clip("hang")
+    sprite.set_flight_anim_speed(1.75)
+    assert clip.playback_speed != 1.2
+
+    sprite.reset_playback_speed()
+
+    assert clip.playback_speed == 1.2
+
+
+def test_set_flight_anim_speed_skips_redundant_writes():
+    """每 tick 调用：速率不变（Δ<0.05）不得重复写（WebMClip 会重设 QTimer 间隔）。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    sprite.bind_clip("hang")
+    sprite.set_flight_anim_speed(1.0)
+    calls = len(clip.speed_calls)
+
+    sprite.set_flight_anim_speed(1.0)
+
+    assert len(clip.speed_calls) == calls

@@ -48,7 +48,7 @@ from weakref import WeakKeyDictionary
 from PySide6.QtCore import QPointF, QRect
 
 from . import catalog, movement
-from .pet_sprite import INTERACTION_DRAG, INTERACTION_NORMAL
+from .pet_sprite import INTERACTION_DRAG, INTERACTION_NORMAL, INTERACTION_THROWN
 from .predictive_prewarm import PredictivePrewarm
 
 STATE_IDLE = "idle"
@@ -58,14 +58,18 @@ STATE_CLICK = "click"
 STATE_ACTS = "acts"
 #: 拖拽接管态（F1）：画面 = drag 悬空动画，位置归鼠标；不属于掷骰链
 STATE_DRAG = "drag"
+#: 抛掷飞行接管态（F4）：画面 = drag（悬空）动画循环 + 物理按速度加速播放；
+#: 位置归 sprite_physics；落地回 normal 后由 tick 收口回待机
+STATE_THROWN = "thrown"
 
-#: 本控制器「画面归它、位置不归它」的状态（F1）：sprite 已回 normal
+#: 本控制器「画面归它、位置不归它」的状态（F1/F4）：sprite 已回 normal
 #: 却停在这些态 = 收尾接线缺失（看门狗/shell 分支没走到），必须自愈回待机
-_CAPTURED_STATES = (STATE_DRAG,)
+_CAPTURED_STATES = (STATE_DRAG, STATE_THROWN)
 
-#: 圈末 finished 需要原地续播（re-arm）的状态（F2）：这些状态的时长可以
-#: 跨多圈（多圈移动 / 循环拖拽），中间圈结束必须重播，否则第 2 圈起冻结
-_REARM_STATES = (STATE_MOVE, STATE_DRAG, STATE_ACTS)
+#: 圈末 finished 需要原地续播（re-arm）的状态（F2/F4）：这些状态的时长可以
+#: 跨多圈（多圈移动 / 循环拖拽 / 飞行悬空循环），中间圈结束必须重播，
+#: 否则第 2 圈起冻结
+_REARM_STATES = (STATE_MOVE, STATE_DRAG, STATE_ACTS, STATE_THROWN)
 
 
 class _SpriteState:
@@ -173,7 +177,7 @@ class BehaviorController:
         归 sprite_physics，落地回 normal 后由 tick 自愈回待机
         （window.py:3260-3264 只处理原地放下分支，同语义）。
         """
-        if getattr(sprite, "interaction_state", INTERACTION_NORMAL) == "thrown":
+        if getattr(sprite, "interaction_state", INTERACTION_NORMAL) == INTERACTION_THROWN:
             return
         st = self._states.get(sprite)
         if st is None:
@@ -278,14 +282,16 @@ class BehaviorController:
 
         位置由鼠标路由与物理控制器负责，本控制器只保证「当前该播什么」：
         拖拽 = 悬空 clip（window.py:3175-3176 进拖拽切 drag），抛掷 = 飞行
-        循环 clip（F4，window.py:2487-2499）。绝不推进掷骰链、绝不改写
+        循环 clip（window.py:2487-2499）。绝不推进掷骰链、绝不改写
         velocity——旧断言「非 normal 从不被接管」在此扩为「只接受 drag
         绑定，不接受掷骰驱动」。
         """
-        if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_DRAG:
-            return
-        if st.state != STATE_DRAG:
-            self._enter_drag(sprite, st)
+        istate = getattr(sprite, "interaction_state", INTERACTION_NORMAL)
+        if istate == INTERACTION_DRAG:
+            if st.state != STATE_DRAG:
+                self._enter_drag(sprite, st)
+        elif istate == INTERACTION_THROWN and st.state != STATE_THROWN:
+            self._enter_thrown(sprite, st)
 
     # ---------------------------------------------------------------- 状态机
     def _tick_sprite(self, sprite, st: _SpriteState, dt: float) -> None:
@@ -489,6 +495,27 @@ class BehaviorController:
         st.anim = name
         st.duration = self._clip_duration(sprite.library, name) if name else 0.0
         if name is not None:
+            self._bind_with_gen(sprite, st, name)
+
+    def _enter_thrown(self, sprite, st: _SpriteState) -> None:
+        """进入抛掷飞行接管态（F4）：绑 drag（缺素材回退 idle 池）并循环。
+
+        旧实现 window.py:2487-2499：飞行途中当前动作播完固定切「悬空」动画
+        并循环（首帧必热的 drag clip，视觉契合被击飞），落地停稳才切回待机
+        ——收口由 tick 的接管态自愈完成，本方法不碰速度/位置。播放速率由
+        sprite_physics 每 tick 按速度叠加（physics.flight_anim_speed，
+        window.py:4328-4340）。
+        """
+        cats = self._categories(sprite.library)
+        name = cats["drag"][0] if cats["drag"] else self._pick(cats["idles"])
+        st.state = STATE_THROWN
+        st.pending_move = None
+        self._clear_move_plan(st)
+        st.elapsed = 0.0
+        st.anim = name
+        st.duration = self._clip_duration(sprite.library, name) if name else 0.0
+        if name is not None:
+            # 起播被拒也静默：飞行段的位置积分不能因动画失败而中断
             self._bind_with_gen(sprite, st, name)
 
     def _enter_acts(self, sprite, st: _SpriteState, cats: dict,

@@ -601,6 +601,39 @@ class PetSprite(QObject):
         if cb is not None:
             cb(self)
 
+    # ---------------------------------------------------------------- 飞行期播放速率（F4）
+    def set_flight_anim_speed(self, factor: float) -> None:
+        """飞行期动画倍率：当前 clip 速率 = 用户播放速率 × factor。
+
+        由 sprite_physics 每 tick 按当拍速度调用（倍率本身是纯函数
+        physics.flight_anim_speed，见 window.py:4328-4340）。速率变化小于
+        0.05 时跳过写入——WebMClip.set_playback_speed 会重设 QTimer 间隔，
+        速度平稳段没必要反复写。
+        """
+        clip = self._clip
+        if clip is None:
+            return
+        setter = getattr(clip, "set_playback_speed", None)
+        if not callable(setter):
+            return
+        target = float(self.playback_speed) * float(factor)
+        if abs(float(getattr(clip, "playback_speed", target)) - target) > 0.05:
+            setter(target)
+
+    def reset_playback_speed(self) -> None:
+        """把当前 clip 播放速率复位回用户速率（落地 / 飞行被打断的唯一出口）。
+
+        必须复位：``duration()`` 会除以 clip.playback_speed
+        （webm_clip.py:1387-1390），留着飞行期的加速倍率会让下一次
+        ``_plan_move`` 按加速后的时长量化位移（步态与墙钟失配）。
+        """
+        clip = self._clip
+        if clip is None:
+            return
+        setter = getattr(clip, "set_playback_speed", None)
+        if callable(setter):
+            setter(float(self.playback_speed))
+
     def _on_frame_changed(self, _frame: int) -> None:
         self._frame_dirty = True
         # V-4：帧到达直驱重绘，不经过 tick——tick 降档后动画帧率不随之掉

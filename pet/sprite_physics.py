@@ -109,10 +109,35 @@ class ThrowPhysicsController:
                 break
 
         sprite.set_pos(QPointF(px, py))
+        speed = math.hypot(vx, vy)
         if physics_mod.is_at_rest(py, vx, vy, bottom, bounced_any, speed):
             # 落地静止：velocity 归零停住（advance 只对 "normal" 积分，
             # 归零后原地不动），交还行为控制器
             sprite.set_velocity(QPointF(0, 0))
+            # F4：速率必须先复位——duration() 除以 playback_speed
+            # （webm_clip.py:1387-1390），留着飞行倍率会让落地后的第一次
+            # _plan_move 按加速后的时长量化位移（步态与墙钟失配）
+            self._reset_flight_speed(sprite)
             sprite.interaction_state = INTERACTION_NORMAL
         else:
             sprite.set_velocity(QPointF(vx, vy))
+            self._apply_flight_speed(sprite, speed)
+
+    @staticmethod
+    def _apply_flight_speed(sprite, speed: float) -> None:
+        """飞行期动画随速度加速（F4，window.py:4328-4340）。
+
+        倍率叠加在用户播放速率之上（叠加在 PetSprite 侧完成，倍率口径唯一
+        来源 = 纯函数 physics.flight_anim_speed）。sprite 缺该接口时静默
+        跳过：位置积分不因动画能力缺失而中断。
+        """
+        setter = getattr(sprite, "set_flight_anim_speed", None)
+        if callable(setter):
+            setter(physics_mod.flight_anim_speed(speed))
+
+    @staticmethod
+    def _reset_flight_speed(sprite) -> None:
+        """落地复位用户播放速率（F4）：与 _apply_flight_speed 成对，唯一出口。"""
+        reset = getattr(sprite, "reset_playback_speed", None)
+        if callable(reset):
+            reset()

@@ -16,6 +16,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
@@ -49,6 +50,8 @@ class FakeClip(QObject):
         self.image = QImage(640, 360, QImage.Format.Format_ARGB32)
         self.image.fill(Qt.GlobalColor.transparent)
         self.started = False
+        self.playback_speed = 1.0
+        self.speed_calls: list[float] = []
 
     def currentFrameNumber(self):
         return self.frame
@@ -65,6 +68,10 @@ class FakeClip(QObject):
 
     def stop(self):
         self.started = False
+
+    def set_playback_speed(self, speed):
+        self.playback_speed = float(speed)
+        self.speed_calls.append(float(speed))
 
 
 class FakeLibrary:
@@ -204,6 +211,62 @@ def test_advance_skips_integration_when_thrown():
     sprite.interaction_state = INTERACTION_NORMAL
     sprite.advance(0.016)                                  # normal：advance 积分
     assert sprite.pos == QPointF(104.8, 100.0)
+
+
+# ---------------------------------------------------------------- F4：飞行期动画匹配
+def test_flight_anim_speed_follows_velocity_and_landing_resets():
+    """F4：飞行每 tick 按速度设 clip 速率；落地复位回用户速率。
+
+    不复位会让 duration()（除以 playback_speed，webm_clip.py:1387-1390）
+    在下一次 _plan_move 里按加速后的时长量化位移。
+    """
+    controller = ThrowPhysicsController(BOUNDS)
+    sprite = _make_sprite((100.0, 100.0))
+    clip = sprite._clip
+    sprite.playback_speed = 1.0
+    sprite.interaction_state = INTERACTION_THROWN
+    sprite.set_velocity(QPointF(1400, 0))                  # 高速飞行
+
+    controller.tick([sprite], 0.016)
+
+    assert sprite.interaction_state == INTERACTION_THROWN
+    assert clip.playback_speed > 1.0                       # 频闪修法：加速播放
+    assert sprite.velocity.x() > 0.0                       # 位置积分未被影响
+
+    sprite.set_pos(QPointF(100.0, FLOOR_Y))                # 贴地低速 → 落地
+    sprite.set_velocity(QPointF(5, 0))
+    controller.tick([sprite], 0.016)
+
+    assert sprite.interaction_state == INTERACTION_NORMAL
+    assert clip.playback_speed == 1.0                      # 速率复位
+
+
+def test_flight_anim_speed_stacks_on_user_rate():
+    """倍率叠加在用户播放速率之上（window.py:4328-4340），不是硬写成 1.75×。"""
+    controller = ThrowPhysicsController(BOUNDS)
+    sprite = _make_sprite((100.0, 100.0))
+    clip = sprite._clip
+    sprite.playback_speed = 1.5
+    sprite.interaction_state = INTERACTION_THROWN
+    sprite.set_velocity(QPointF(700, 0))
+
+    controller.tick([sprite], 0.016)
+
+    speed = math.hypot(sprite.velocity.x(), sprite.velocity.y())
+    assert clip.playback_speed > 1.5
+    assert clip.playback_speed == pytest.approx(
+        1.5 * physics_mod.flight_anim_speed(speed))
+
+
+def test_flight_anim_speed_untouched_for_non_thrown():
+    controller = ThrowPhysicsController(BOUNDS)
+    sprite = _make_sprite((100.0, 100.0))
+    clip = sprite._clip
+    sprite.set_velocity(QPointF(900, 0))                   # normal：advance 管
+
+    controller.tick([sprite], 0.016)
+
+    assert clip.playback_speed == 1.0                      # 控制器不碰非 thrown
 
 
 # ---------------------------------------------------------------- 松手抛掷判定（sprite 侧）
