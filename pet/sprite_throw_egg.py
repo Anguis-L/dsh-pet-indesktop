@@ -18,7 +18,10 @@ overlay 架构下窗口 = 整屏 overlay、宠物 = sprite，于是同一控制�
 
 arm 条件严格对齐旧机（批 A/批 D 通用约束）：只有「边缘探头会话存在且被
 真撞击 ``cancel(reason="collision_throw")``」才 arm；普通抛掷（非探头状态
-被击飞）不 arm，维持批 A 现状。彩蛋常开，不加配置开关。
+被击飞）不 arm，维持批 A 现状。取消了会话这个事实由探头世界
+``on_sprite_collision_hit`` 的返回值显式传给本模块（对齐旧机
+``edge_probe.py:283-287`` 的 was_active 原子绑定），不读探头侧残留倒计时。
+彩蛋常开，不加配置开关。
 
 判定口径逐条对齐旧机 ``window.py`` 的接线（``:4275`` 落地兜底 /
 ``:4453-4455`` 每 tick 驱动）：
@@ -43,14 +46,15 @@ arm 条件严格对齐旧机（批 A/批 D 通用约束）：只有「边缘探�
 传入，offscreen 可测）：
 
 1. ``egg = create_throw_egg_world(bounds, probe=self._probe)``——传入真探头
-   世界，入口据此复核「探头会话存在且被真撞击取消」（见
+   世界，入口在显式事实缺省时据此复核「探头会话仍存在」（见
    ``_probe_hit_confirmed``）；
 2. ``driver.add_extra_controller(egg)``——tick 挂在抛掷物理**之后**：本世界
    读物理结算后的速度，且落地兜底依赖 physics 已把状态切回 normal；
-3. 碰撞真撞击回调（``_on_collision_probe``）里，对命中 sprite
-   ``probe.on_sprite_collision_hit(sprite)`` 之后紧接着
-   ``egg.on_probe_collision_throw(sprite)``——同一入口承担两种语义：
-   「探头被撞 arm」与「已在彩蛋飞行中再次被撞 → 低速回正」；
+3. 碰撞真撞击回调（``_on_collision_probe``）里，取
+   ``cancelled = probe.on_sprite_collision_hit(sprite)`` 的返回值并紧接着
+   ``egg.on_probe_collision_throw(sprite, probe_cancelled=cancelled)``——
+   同一入口承担两种语义：「探头被撞 arm」与「已在彩蛋飞行中再次被撞 →
+   低速回正」。arm 只认这次的显式取消事实，不读探头侧的残留倒计时；
 4. sprite 移除监听接 ``egg.forget``；角色切换/停机接 ``egg.cancel_all``。
 """
 from __future__ import annotations
@@ -114,9 +118,9 @@ class SpriteThrowEggWorld:
 
     def __init__(self, bounds: QRect | QRectF, *, probe: Any = None) -> None:
         self._bounds = QRectF(bounds)
-        # 探头世界引用（可空）：arm 入口据此复核「探头会话存在且被真撞击取消」。
-        # 不 import sprite_edge_probe（鸭子类型消费 is_probing/reentry_remaining_of），
-        # 也不反向依赖 overlay/shell——offscreen 测试可注入替身。
+        # 探头世界引用（可空）：显式事实（probe_cancelled）缺省时据此复核
+        # 「探头会话仍存在」。不 import sprite_edge_probe（鸭子类型消费
+        # is_probing），也不反向依赖 overlay/shell——offscreen 测试可注入替身。
         self._probe = probe
         # sprite -> 当前角度（度）。在表 = 彩蛋会话激活；回正即出表。
         self._angles: dict = {}
@@ -184,20 +188,27 @@ class SpriteThrowEggWorld:
         return float(velocity.x()), float(velocity.y())
 
     # ---------------------------------------------------------------- 事件入口
-    def on_probe_collision_throw(self, sprite: Any) -> None:
+    def on_probe_collision_throw(self, sprite: Any, *,
+                                 probe_cancelled: bool | None = None) -> None:
         """碰撞真撞击入口（壳层从 ``_on_collision_probe`` 调）。
 
         两种语义按会话表分流：
 
         - **已在彩蛋会话中**（飞行中再次撞到其它桌宠）：走旧机
           ``on_pet_contact``——用碰撞结算后的速度判定，低速回正；
-        - **不在会话中**：只有复核到「探头会话存在且被真撞击 cancel」才 arm；
-          普通抛掷（非探头状态被击飞）什么都不做（批 A 现状）。
+        - **不在会话中**：只有确认「本次撞击真取消了活跃探头会话」才 arm。
+          ``probe_cancelled`` 是探头世界 ``on_sprite_collision_hit`` 的返回
+          值（显式事实传递，见旧机 ``edge_probe.py:283-287`` 的 was_active
+          原子绑定）：True = arm；False = 本次没取消任何会话，绝不 arm。
+          缺省 None 时回退 ``_probe_hit_confirmed``（兼容反向接线顺序：先
+          egg 后 probe，此时会话仍在）。
         """
         if sprite in self._angles:
             self.on_pet_contact(sprite)
             return
-        if not self._probe_hit_confirmed(sprite):
+        if probe_cancelled is False:
+            return
+        if probe_cancelled is not True and not self._probe_hit_confirmed(sprite):
             return
         self.arm(sprite)
 
@@ -254,18 +265,19 @@ class SpriteThrowEggWorld:
             setter(angle)
 
     def _probe_hit_confirmed(self, sprite: Any) -> bool:
-        """复核「探头会话存在且被真撞击 cancel（collision_throw）」。
+        """复核「探头会话仍存在」（``probe_cancelled`` 缺省时的回退口径）。
 
-        注入探头世界时（推荐接线）读它的公开状态，两种接线顺序都成立：
+        只在显式事实缺省（None）时使用，两种接线顺序都成立：
 
-        - 壳层先调 ``probe.on_sprite_collision_hit`` 再调本入口：会话已取消，
-          但碰撞取消会 arm ``EDGE_REENTRY_SECONDS`` 重进倒计时，
-          ``reentry_remaining_of > 0`` 即「确实存在会话且被真撞击取消」；
-        - 壳层先调本入口：会话还在，``is_probing`` 为真。
+        - 壳层先调本入口（反向接线）：会话还在，``is_probing`` 为真；
+        - 未注入探头世界时退化为 sprite 姿态口径（曝光 < 1 或已有探头角）；
+          该退化路径需要调用方在姿态仍生效时调用（探头 cancel 会清姿态），
+          因此推荐注入探头世界 + 显式传 ``probe_cancelled``。
 
-        未注入探头世界时退化为 sprite 姿态口径（曝光 < 1 或已有探头角）；
-        该退化路径需要调用方在姿态仍生效时调用（探头 cancel 会清姿态），
-        因此推荐注入探头世界。
+        **刻意不读** ``reentry_remaining_of``：那是 cancel 时 arm 的 5 秒
+        重进倒计时，探头会话结束/彩蛋 end() 都不会清它——把它当成「本次
+        撞击真取消了会话」的证明，会在 5s 窗口内再被撞时误 re-arm（实机
+        arm 30 次 vs 探头真实退出仅 11 次的根因）。
         """
         probe = self._probe
         if probe is not None:
@@ -276,13 +288,6 @@ class SpriteThrowEggWorld:
                         return True
                 except Exception:  # 探头替身异常不拖垮碰撞链
                     log.debug("[抛掷彩蛋] is_probing 调用失败", exc_info=True)
-            reentry = getattr(probe, "reentry_remaining_of", None)
-            if callable(reentry):
-                try:
-                    if float(reentry(sprite)) > 0.0:
-                        return True
-                except Exception:
-                    log.debug("[抛掷彩蛋] reentry_remaining_of 调用失败", exc_info=True)
             return False
         if bool(getattr(sprite, "probe_active", False)):
             return True

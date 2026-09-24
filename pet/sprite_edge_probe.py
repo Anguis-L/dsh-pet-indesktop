@@ -285,14 +285,22 @@ class SpriteEdgeProbeWorld:
             st.last_tick_time = now
         return True
 
-    def on_sprite_collision_hit(self, sprite: Any) -> None:
-        """碰撞真撞击（碰撞世界 listener 接线入口）：取消会话并 arm 重进倒计时。"""
+    def on_sprite_collision_hit(self, sprite: Any) -> bool:
+        """碰撞真撞击（碰撞世界 listener 接线入口）：取消会话并 arm 重进倒计时。
+
+        返回是否**真的取消了本次活跃探头会话**：True = 执行了
+        ``cancel(sprite, "collision_throw")``；未在探头/功能关/隐藏等早退路径
+        返回 False。壳层把该返回值显式转给彩蛋 arm 条件——重进倒计时是
+        cancel 的产物、会残留 5 秒，不能反过来当作「本次撞击取消了会话」的
+        证据（实机 arm 30 次 vs 探头退出仅 11 次的根因）。
+        """
         if self._hidden or not self._enabled():
-            return
+            return False
         st = self._states.get(sprite)
         if st is None or st.mode == OFF:
-            return  # 未在探头：普通碰撞不需要重进倒计时
+            return False  # 未在探头：普通碰撞不需要重进倒计时
         self.cancel(sprite, "collision_throw")
+        return True
 
     def cancel(self, sprite: Any, reason: str = "", restore: bool = False) -> None:
         """取消会话（幂等）：清探头姿态（角度 0/曝光 1）→ 常规钳制把身体钳回屏内。

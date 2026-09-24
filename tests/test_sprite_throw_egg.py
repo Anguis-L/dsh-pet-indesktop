@@ -231,7 +231,7 @@ def test_thresholds_come_from_the_old_controller_not_copied():
 
 # ---------------------------------------------------------------- arm 条件
 def test_arm_requires_probe_session_cancelled_by_real_collision():
-    """只有「探头会话存在且被真撞击 cancel」才 arm；普通抛掷不 arm。"""
+    """只有「本次真取消了活跃探头会话」才 arm；残留倒计时不作证据。"""
     probe = FakeProbe()
     world = _world(probe=probe)
     sprite = _sprite()
@@ -243,18 +243,69 @@ def test_arm_requires_probe_session_cancelled_by_real_collision():
     assert world.active is False
     assert sprite.throw_rotation == 0.0
 
-    probe.probing = True                  # 壳层先调本入口：会话还在
-    world.on_probe_collision_throw(sprite)
+    probe.probing = True                  # 反向接线顺序（先 egg 后 probe）：
+    world.on_probe_collision_throw(sprite)  # 缺省 None → 回退 is_probing
     assert world.is_active(sprite) is True
     assert world.active is True
     assert world.angle_of(sprite) == 0.0
     assert sprite.throw_rotation == 0.0
 
+    # 显式事实：本次真取消了探头会话（会话已不在也照样 arm）
     world.forget(sprite)
     probe.probing = False
-    probe.reentry = 5.0                   # 壳层先取消探头：碰撞重进倒计时是证据
-    world.on_probe_collision_throw(sprite)
+    world.on_probe_collision_throw(sprite, probe_cancelled=True)
     assert world.is_active(sprite) is True
+
+    # 残留倒计时（旧泄漏通道）不再是证据：会话已不在 → 不 arm
+    world.forget(sprite)
+    probe.reentry = 5.0
+    world.on_probe_collision_throw(sprite)
+    assert world.is_active(sprite) is False
+
+    # 显式事实：本次没有取消任何活跃会话 → 绝不 arm
+    world.forget(sprite)
+    world.on_probe_collision_throw(sprite, probe_cancelled=False)
+    assert world.is_active(sprite) is False
+
+
+def test_residual_reentry_countdown_never_rearms_after_egg_end():
+    """彩蛋 end() 后探头重进倒计时仍残留，5s 窗口内再被撞不得误 arm。
+
+    实机日志 arm 30 次 vs 探头真实退出仅 11 次：`_probe_hit_confirmed` 把
+    探头世界的 ``reentry_remaining_of > 0``（cancel 时 arm 的 5 秒倒计时，
+    彩蛋 end() 不会清）当成「本次撞击真取消了活跃会话」的证明，5s 内再被
+    撞就误 re-arm。修法 = 显式事实传递（on_sprite_collision_hit 的返回值），
+    残留态不再参与判定。
+    """
+    clock = FakeClock()
+    probe = SpriteEdgeProbeWorld(FakeConfig(edge_probe_enabled=True), BOUNDS,
+                                 clock=clock)
+    world = create_throw_egg_world(BOUNDS, probe=probe)
+    sprite = _sprite((0.0, 300.0))
+    _drive_to_peeking(probe, clock, sprite)
+
+    hit = probe.on_sprite_collision_hit(sprite)      # 第一次：真取消会话
+    assert hit is True
+    _thrown(sprite, 900.0, 0.0)
+    world.on_probe_collision_throw(sprite, probe_cancelled=hit)
+    assert world.is_active(sprite) is True
+
+    world.end(sprite, "settled")                     # 彩蛋结束（落地回正）
+    assert world.is_active(sprite) is False
+    assert probe.reentry_remaining_of(sprite) > 0.0  # 倒计时残留仍在窗口内
+
+    clock.advance(1.0)                               # 走 1s：仍在 5s 窗口内
+    probe.tick([sprite], 1 / 60)
+    assert probe.reentry_remaining_of(sprite) > 0.0
+
+    hit2 = probe.on_sprite_collision_hit(sprite)     # 第二次：探头无活跃会话
+    assert hit2 is False
+    world.on_probe_collision_throw(sprite, probe_cancelled=hit2)
+    assert world.is_active(sprite) is False          # 不得误 re-arm
+
+    # 缺省口径（旧调用/反向接线）同样不得靠残留倒计时 arm
+    world.on_probe_collision_throw(sprite)
+    assert world.is_active(sprite) is False
 
 
 def test_arm_falls_back_to_probe_pose_without_probe_world():
@@ -271,6 +322,13 @@ def test_arm_falls_back_to_probe_pose_without_probe_world():
     world.on_probe_collision_throw(peeking)
     assert world.is_active(peeking) is True
 
+    # 显式事实优先：本次未取消会话 → 姿态兜底也不 arm
+    explicit = _sprite()
+    explicit.set_probe_pose(45.0, 0.55)
+    _thrown(explicit, 900.0, 0.0)
+    world.on_probe_collision_throw(explicit, probe_cancelled=False)
+    assert world.is_active(explicit) is False
+
 
 def test_real_probe_collision_arms_after_pose_cleared():
     """真接线语义：探头会话被真撞击取消 → 姿态已清 → 彩蛋仍能 arm 并跟随。"""
@@ -282,10 +340,12 @@ def test_real_probe_collision_arms_after_pose_cleared():
     assert sprite.probe_angle != 0.0
     assert sprite.probe_active is True
 
-    # 壳层碰撞 listener 的顺序：先探头 cancel（真撞击），再彩蛋入口
-    probe.on_sprite_collision_hit(sprite)
+    # 壳层碰撞 listener 的顺序：先探头 cancel（真撞击），再彩蛋入口；
+    # cancel 的返回值就是「本次真取消了会话」的显式事实
+    hit = probe.on_sprite_collision_hit(sprite)
+    assert hit is True
     _thrown(sprite, 900.0, 0.0)
-    world.on_probe_collision_throw(sprite)
+    world.on_probe_collision_throw(sprite, probe_cancelled=hit)
 
     assert world.is_active(sprite) is True
     assert sprite.probe_exposure == 1.0     # 探头姿态已清

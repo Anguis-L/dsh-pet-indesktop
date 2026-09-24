@@ -2012,7 +2012,11 @@ class OverlayShell(QObject):
 
     def _on_collision_probe(self, event) -> None:
         """碰撞真撞击 → 边缘探头取消会话（旧机 collision_client 取消链语义）
-        + throw_egg arm（探头被撞飞头部跟随速度）。"""
+        + throw_egg arm（探头被撞飞头部跟随速度）。
+
+        arm 只认「本次真取消了活跃探头会话」这个显式事实（探头入口的返回
+        值）——探头侧的 5 秒重进倒计时会残留，不能反过来当证据。
+        """
         if getattr(event, "j", 0.0) < float(self.collision.hit_min_dv):
             return
         probe = getattr(self, "_probe", None)
@@ -2022,11 +2026,12 @@ class OverlayShell(QObject):
         from .sprite_collision import SpriteCollisionWorld
         for sprite in self.overlay.sprites:
             if SpriteCollisionWorld._member_id(sprite) in (event.a, event.b):
+                cancelled = None
                 if probe is not None:
-                    probe.on_sprite_collision_hit(sprite)
+                    cancelled = probe.on_sprite_collision_hit(sprite)
                 if egg is not None:
-                    # 必须在探头 cancel 之后：靠重进倒计时识别探头会话
-                    egg.on_probe_collision_throw(sprite)
+                    egg.on_probe_collision_throw(
+                        sprite, probe_cancelled=cancelled)
 
     def _say_feeding_bubble(self, files: int, folders: int,
                             total_bytes: int, stats: dict) -> None:
