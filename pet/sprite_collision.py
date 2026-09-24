@@ -16,7 +16,8 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
   静态成员速度经 add_static_member(vx=, vy=) 传入（岛速通道）——求解器只认
   相对速度，速度恒 0 时拖岛撞宠只剩位置分离（平推），传真实岛速才有冲量弹开；
 - 高速防穿透：帧间圆链扫掠（swept_circle_chain_collision，TOI 语义）；
-- 纯位置分离（j==0 且 sep>0）按 pair 去抖 15 tick（防贴贴抖动）；
+- 纯位置分离（j==0 且 sep>0）按 pair 去抖 0.24s（秒基，= T0 15 tick 的墙钟
+  等价；tick 口径在 M-1 降档后会被放大 15~60 倍，见 SEPARATION_DEBOUNCE_SECS）；
 - 真撞击阈值：普通对 dv >= 300px/s、撞静态成员放宽到 60px/s、已 thrown
   成员继续吸收冲量的下限 50px/s（对齐 window.py 的 COLLISION_HIT_MIN_DV /
   COLLISION_CONTACT_DV_FLOOR 与旧实现的静态放宽分支）；
@@ -81,8 +82,11 @@ HIT_MIN_DV = 300.0          # COLLISION_HIT_MIN_DV：普通对 |dv| 阈值 (px/s
 STATIC_HIT_MIN_DV = 60.0    # 撞静态布景放宽（岛的语义就是"撞上去会弹"）
 CONTACT_DV_FLOOR = 50.0     # 已 thrown 成员继续吸收冲量的下限 (px/s)
 
-# 纯位置分离去抖窗口（对齐旧协调者 tick 的 15 tick 去抖）
-SEPARATION_DEBOUNCE_TICKS = 15
+# 纯位置分离去抖窗口（秒基：0.24s = T0 15 tick 的墙钟等价）。
+# 旧口径按 tick 计数（协调者固定 T0，15 tick 就是 0.24s）；M-1 闲置降档后
+# tick 间隔被拉到 T2 的 250ms / T3 的 1000ms，同一「15 tick」在墙钟上放大
+# 15~60 倍（T3 下 15 秒不分离）——贴贴抖动抑制反而变成"长时间不分开"。
+SEPARATION_DEBOUNCE_SECS = 0.24
 # 静态成员速度时效（秒）：岛速只在几何事件回调里刷新，岛停下后不会再有
 # 回调——超过该时长未刷新的速度样本按 0 处理（防「幽灵速度」把贴到静止
 # 岛上的桌宠拍进 THROWN）。取值≈拖拽手势的采样间隙上界，远小于人的
@@ -131,11 +135,12 @@ class SpriteCollisionWorld:
         static_hit_min_dv: float = STATIC_HIT_MIN_DV,
         contact_dv_floor: float = CONTACT_DV_FLOOR,
         speed_cap: float = physics.MAX_THROW_SPEED,
-        separation_debounce_ticks: int = SEPARATION_DEBOUNCE_TICKS,
+        separation_debounce_secs: float = SEPARATION_DEBOUNCE_SECS,
         max_separation_iterations: int = 4,
         support_proximity: float = SUPPORT_PROXIMITY,
         support_settle_speed: float = SUPPORT_SETTLE_SPEED,
         support_settle_ticks: int = SUPPORT_SETTLE_TICKS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.restitution = float(restitution)
         self.friction = float(friction)
@@ -145,18 +150,21 @@ class SpriteCollisionWorld:
         self.static_hit_min_dv = float(static_hit_min_dv)
         self.contact_dv_floor = float(contact_dv_floor)
         self.speed_cap = float(speed_cap)
-        self.separation_debounce_ticks = int(separation_debounce_ticks)
+        self.separation_debounce_secs = max(0.0, float(separation_debounce_secs))
         self.max_separation_iterations = int(max_separation_iterations)
         self.support_proximity = float(support_proximity)
         self.support_settle_speed = float(support_settle_speed)
         self.support_settle_ticks = int(support_settle_ticks)
+        # 时钟可注入（测试用假钟推进去抖窗口，不 sleep 赌时序）
+        self._clock = clock if callable(clock) else time.monotonic
 
         self._tick = 0
         self._overlap_history: Dict[str, int] = {}
         # 上一 tick 的圆链快照（member_id -> circles），供帧间扫掠防穿透
         self._prev_circles: Dict[str, Sequence[Sequence[float]]] = {}
-        # 纯位置分离去抖：pair -> 最近一次实际应用分离的 tick
-        self._position_only_ticks: Dict[str, int] = {}
+        # 纯位置分离去抖：pair -> 最近一次实际应用分离的**墙钟时刻**（秒基；
+        # 旧实现记 tick 号，降档后窗口按墙钟放大）
+        self._position_only_at: Dict[str, float] = {}
         # 静态成员支撑落定：member_id -> 连续被静态成员托住的 tick 数
         self._support_streak: Dict[str, int] = {}
         # 静态成员（灵动岛预留）：member_id -> (left, top, width, height)
@@ -195,7 +203,7 @@ class SpriteCollisionWorld:
         self._static_members[str(member_id)] = (
             float(left), float(top), float(width), float(height))
         self._static_member_velocity[str(member_id)] = (
-            float(vx), float(vy), time.monotonic())
+            float(vx), float(vy), self._clock())
         if circles is not None:
             self._static_member_circles[str(member_id)] = [
                 [float(c[0]), float(c[1]), float(c[2])] for c in circles]
@@ -235,7 +243,7 @@ class SpriteCollisionWorld:
         if (sig == self._last_motion_sig
                 and not self._static_dirty
                 and not self._overlap_history
-                and not self._position_only_ticks
+                and not self._position_only_at
                 and not self._support_streak):
             # 静止豁免（P1/③-1）：无任何成员运动（位置/速度/交互态/缩放/
             # 成员集合全未变）、无静态成员变更、无未结清的重叠/分离去抖——
@@ -365,7 +373,7 @@ class SpriteCollisionWorld:
         left, top, w, h = rect
         vx, vy, ts = self._static_member_velocity.get(
             member_id, (0.0, 0.0, 0.0))
-        if time.monotonic() - ts > STATIC_VELOCITY_TTL_SECS:
+        if self._clock() - ts > STATIC_VELOCITY_TTL_SECS:
             # 幽灵速度闸：速度样本超期未刷新（岛已停但无人再喂几何）→ 当 0。
             vx, vy = 0.0, 0.0
         return collision.MemberState(
@@ -432,13 +440,14 @@ class SpriteCollisionWorld:
             sprite_b = sprite_by_id.get(res.b)
             if sprite_a is None and sprite_b is None:
                 continue  # 静态对静态（理论不产生，防御）
-            # 纯位置分离去抖（对齐 coordinator 15 tick 去抖）：j==0 且 sep>0
-            # 的 pair 在去抖窗口内整条跳过，防贴贴抖动
+            # 纯位置分离去抖（秒基 0.24s ≈ 旧协调者 15 tick 的墙钟等价；降档后
+            # 不被放大）：j==0 且 sep>0 的 pair 在去抖窗口内整条跳过，防贴贴抖动
             if res.j == 0.0 and res.sep > 0.0:
-                last = self._position_only_ticks.get(res.pair)
-                if last is not None and self._tick - last < self.separation_debounce_ticks:
+                now = self._clock()
+                last = self._position_only_at.get(res.pair)
+                if last is not None and now - last < self.separation_debounce_secs:
                     continue
-                self._position_only_ticks[res.pair] = self._tick
+                self._position_only_at[res.pair] = now
 
             real_hit = False
             for sprite, other_id, dvx, dvy in (
@@ -565,9 +574,9 @@ class SpriteCollisionWorld:
 
     def _prune_position_only_ticks(self) -> None:
         """去抖表防漏：远超窗口的陈旧条目清掉（sprite 进出/churn 不积累）。"""
-        if not self._position_only_ticks:
+        if not self._position_only_at:
             return
-        cutoff = self._tick - self.separation_debounce_ticks * 4
-        stale = [p for p, t in self._position_only_ticks.items() if t < cutoff]
+        cutoff = self._clock() - self.separation_debounce_secs * 4
+        stale = [p for p, t in self._position_only_at.items() if t < cutoff]
         for pair in stale:
-            del self._position_only_ticks[pair]
+            del self._position_only_at[pair]

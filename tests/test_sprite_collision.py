@@ -47,6 +47,19 @@ class FakeRect:
         return self._h
 
 
+class FakeClock:
+    """可推进假钟（monotonic 口径）：去抖窗口按墙钟推进，不 sleep 赌时序。"""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
 class FakeSprite:
     """协议鸭子类型：pos/set_pos/velocity/set_velocity/rect/center/radius/
     dragging/interaction_state/scale/facing（+ 可选 collision_id）。"""
@@ -146,17 +159,25 @@ def test_swept_collision_prevents_tunneling():
 
 
 def test_position_only_separation_is_debounced():
-    """纯位置分离（j=0）按 pair 去抖 15 tick：窗口内不反复推，防抖动。"""
-    world = SpriteCollisionWorld()
+    """纯位置分离（j=0）按 pair 去抖：窗口内不反复推，防抖动。
+
+    M12a 后窗口是秒基（``SEPARATION_DEBOUNCE_SECS`` = T0 15 tick 等价），
+    用假钟推进窗口，不依赖真实时间流逝。
+    """
+    from pet.sprite_collision import SEPARATION_DEBOUNCE_SECS
+
+    clock = FakeClock()
+    world = SpriteCollisionWorld(clock=clock)
     a = FakeSprite(0, 0, collision_id="a")
     b = FakeSprite(80, 0, collision_id="b")  # 静止重叠 20px，vn=0 → j=0
-    world.tick([a, b], 0.016)  # tick 1：首次分离生效
+    world.tick([a, b], 0.016)  # 首次分离生效
     ax1, bx1 = a.pos.x(), b.pos.x()
     assert ax1 < 0.0 and bx1 > 80.0  # 确实被推开了
-    for _ in range(14):  # tick 2..15：去抖窗口内，位置不许再动
+    for _ in range(14):  # 去抖窗口内（墙钟未到）：位置不许再动
         world.tick([a, b], 0.016)
     assert a.pos.x() == ax1 and b.pos.x() == bx1
-    world.tick([a, b], 0.016)  # tick 16：窗口届满，分离再次生效
+    clock.advance(SEPARATION_DEBOUNCE_SECS)  # 窗口届满，分离再次生效
+    world.tick([a, b], 0.016)
     assert a.pos.x() < ax1 and b.pos.x() > bx1
 
 
