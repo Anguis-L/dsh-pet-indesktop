@@ -570,6 +570,8 @@ class OverlayShell(QObject):
         self.tray: QSystemTrayIcon | None = None
         self._tray_menu: QMenu | None = None
         self._tray_actions: list = []
+        # 托盘逐只显隐勾选动作（M14：[sprite, QAction]，菜单重建时替换）
+        self._pet_visible_actions: list = []
         self._session_watcher = None
         # D12 指令通道（overlay 拓扑：独立设置进程 → 主进程）；未装时为惰性空转
         self._command_watcher = None
@@ -1762,9 +1764,8 @@ class OverlayShell(QObject):
         - 「生小肥鱼 / 退出子肥鱼」= overlay 多宠生命周期入口（legacy 在右键
           菜单/设置页，不重复造第二个实现，直接复用壳的两个公开方法）；
         - 多宠时逐只子菜单「主肥鱼 / 小肥鱼 [slot-N]」= legacy 每窗子菜单，
-          含「回到右下角」「退出这只」；逐 sprite 显隐需要 per-sprite visible
-          标志（4.1b 未落地项，涉及 overlay_window/pet_sprite），本刀不做，
-          顶层显隐即全显全隐；
+          含「回到右下角」「显示这只」（per-sprite visible，M14）「退出这只」；
+          顶层「显示 / 隐藏」仍是整窗语义（overlay 单窗，全显全隐）；
         - 「桌宠设置」按主身份路由（D13）、「退出」= app.quit。
         """
         if self.tray is None:
@@ -1772,19 +1773,28 @@ class OverlayShell(QObject):
         menu = QMenu()
         # 气泡是置顶 Tool 窗口（层级高于菜单）：弹出前先隐藏（legacy 同款）
         menu.aboutToShow.connect(self._hide_bubble_for_menu)
+        # 弹出前同步逐只勾选态（外部改过 sprite.visible 也能反映）
+        menu.aboutToShow.connect(self._sync_tray_pet_visibility)
         menu.addAction("显示 / 隐藏", self._toggle_pet_visible)
         menu.addAction("回到右下角", lambda: self._go_default_corner(self.sprite))
         menu.addSeparator()
         menu.addAction("生小肥鱼", self.spawn_pet)
         menu.addAction("退出子肥鱼", self.clear_spawned_pets)
+        visible_actions: list = []
         if self._spawned:
             menu.addSeparator()
             for sprite, label in self._pet_entries():
                 sub = menu.addMenu(label)
                 sub.addAction("回到右下角",
                               lambda s=sprite: self._go_default_corner(s))
+                toggle = sub.addAction(
+                    "显示这只", lambda s=sprite: self.toggle_sprite_visible(s))
+                toggle.setCheckable(True)
+                toggle.setChecked(self._sprite_visible(sprite))
+                visible_actions.append((sprite, toggle))
                 sub.addAction("退出这只",
                               lambda s=sprite: self.exit_pet(s))
+        self._pet_visible_actions = visible_actions
         menu.addSeparator()
         menu.addAction("桌宠设置", lambda: self.open_settings_for(self.sprite))
         menu.addAction("退出", self.app.quit)
@@ -2508,6 +2518,41 @@ class OverlayShell(QObject):
         if not callable(opener):
             return False
         return bool(opener(_SettingsIdentity(self.sprite_instance_id(sprite))))
+
+    def _sprite_visible(self, sprite) -> bool:
+        """sprite 当前可见性（M14）；无该字段的鸭式 sprite 视为可见。"""
+        return bool(getattr(sprite, "visible", True))
+
+    def set_sprite_visible(self, sprite, visible: bool) -> None:
+        """逐只显隐（M14）：只改该 sprite 的 visible，不动整窗显隐语义。
+
+        整窗显隐仍归 ``set_pet_visible``（overlay.show/hide + 岛状态同步）；
+        逐只是"这一只退出合成与交互面"，两者互不联动。隐藏走 sprite 既有脏
+        矩形通道，overlay 立即擦除残留。
+        """
+        if sprite is None:
+            return
+        setter = getattr(sprite, "set_visible", None)
+        if callable(setter):
+            setter(bool(visible))
+        else:
+            sprite.visible = bool(visible)
+        self._sync_tray_pet_visibility()
+
+    def toggle_sprite_visible(self, sprite=None) -> None:
+        """逐只显隐切换（托盘逐只菜单入口）；sprite=None = 主宠。"""
+        target = self.sprite if sprite is None else sprite
+        if target is None:
+            return
+        self.set_sprite_visible(target, not self._sprite_visible(target))
+
+    def _sync_tray_pet_visibility(self) -> None:
+        """托盘弹出前/显隐变更后同步逐只勾选态（外部也可能改过 sprite.visible）。"""
+        for sprite, action in list(getattr(self, "_pet_visible_actions", [])):
+            try:
+                action.setChecked(self._sprite_visible(sprite))
+            except RuntimeError:
+                continue  # 菜单已销毁（wrapper 失效）：跳过
 
     def set_pet_visible(self, visible: bool) -> None:
         """显隐切换（app.py toggle_visible 等价）+ 岛状态同步 + 共享子系统 pause/resume。

@@ -436,7 +436,9 @@ class OverlayWindow(QWidget):
             if changed is not None:
                 old, new = changed
                 dirty |= QRegion(old) | QRegion(new)
-                if old != new and sprite in self._position_listeners:
+                # M14：隐藏 sprite 不进位置 fanout（跟随方不再被不可见对象唤）
+                if (old != new and sprite in self._position_listeners
+                        and getattr(sprite, "visible", True)):
                     moved.append(sprite)
         # 位置监听 fanout 放在整轮 advance 之后：tick 内所有控制器已写完
         # 位置，跟随方读到的是本 tick 的最终 rect
@@ -461,6 +463,8 @@ class OverlayWindow(QWidget):
         painter = QPainter(self)
         region = event.region()
         for sprite in self.sprites:  # 列表序 = z-order：先画底层，尾部最上
+            if not getattr(sprite, "visible", True):
+                continue  # M14：隐藏 sprite 跳过绘制（脏区域照旧被覆盖擦除）
             if region.intersects(sprite.rect()):
                 sprite.paint(painter)
         self._paint_slingshot(painter)  # 瞄准 UI 层（橡皮带 + 轨迹预览，最上）
@@ -497,6 +501,8 @@ class OverlayWindow(QWidget):
         """
         x, y = int(local_pos.x()), int(local_pos.y())
         for sprite in reversed(self.sprites):
+            if not getattr(sprite, "visible", True):
+                continue  # M14：隐藏 sprite 不参与逐像素命中（穿透判据同源）
             rect = sprite.rect()
             if not rect.contains(x, y):
                 continue

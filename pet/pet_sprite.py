@@ -127,6 +127,32 @@ class PetSprite(QObject):
         self.drag_physics = True
         # 见模块顶部 INTERACTION_* 常量：跨模块协调协议的唯一权威字段
         self.interaction_state = INTERACTION_NORMAL
+        # 逐只显隐（M14 / PHASE4_DESIGN 4.1b）：False = 不绘制、不命中、不进
+        # 位置 fanout（隐藏是"整只退出合成与交互面"，不是"变透明"）。默认 True。
+        self._visible = True
+
+    # ---------------------------------------------------------------- 显隐（M14）
+    @property
+    def visible(self) -> bool:
+        """逐只可见性（默认 True）；隐藏 = 绘制/命中/位置 fanout 三处一起排除。"""
+        return self._visible
+
+    @visible.setter
+    def visible(self, value: bool) -> None:
+        self.set_visible(value)
+
+    def set_visible(self, visible: bool) -> None:
+        """逐只显隐：走既有脏矩形通道（sprite 不是窗口，没有 hideEvent）。
+
+        隐藏时把当前绘制外接矩形原地报脏一次，让 overlay 立即擦掉残留；重复
+        设置同值是 no-op（与 set_throw_rotation 等通道同纪律）。
+        """
+        visible = bool(visible)
+        if visible == self._visible:
+            return
+        rect = self.paint_bounds()
+        self._visible = visible
+        self._notify_dirty(rect, rect)
 
     # ---------------------------------------------------------------- 几何
     @property
