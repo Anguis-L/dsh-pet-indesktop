@@ -70,7 +70,6 @@ from PySide6.QtWidgets import (
 from . import __version__
 from . import autostart as autostart_mod
 from . import catalog
-from . import overlay_settings_command
 from .click_sound import warm_click_sound_effects
 from .config import (
     DEFAULT_CONTEXT_MENU_APPEARANCE,
@@ -168,21 +167,6 @@ from . import settings_interaction
 from . import settings_music
 from . import settings_pet_controls
 from .report_gates import REPORT_GATE_KEYS, REPORT_GATE_LABELS, gate_for_event
-
-
-def _stream_capture_hint() -> str:
-    """「直播捕获兼容」说明文案（按渲染拓扑分流，T4 / PHASE4_DESIGN.md:80-82）。
-
-    overlay 拓扑下该开关是**重启级切换**：捕获依赖 PetWindow 的窗旗标
-    （``window_screen.py`` 的 set_stream_capture_mode），而 overlay 拓扑不构造
-    PetWindow——勾选只落 config，重启后由拓扑分流消费（多宠先收拢为主 sprite，
-    捕获模式内单宠单窗）。legacy 拓扑保持原文案（运行期即时生效）。
-    """
-    if overlay_settings_command.is_overlay_topology():
-        return ("让 OBS 等工具能够枚举并捕获桌宠窗口。"
-                "当前为单合成窗（overlay）拓扑：该开关重启后生效，"
-                "重启时多只桌宠会先收拢为主宠物。")
-    return "让 OBS 等工具能够枚举并捕获桌宠窗口。"
 
 
 # 语言配置页只展示用户能理解的事件名称；内部 key 仍用于保存和渲染。
@@ -487,7 +471,7 @@ class ModernSettingsDialog(QDialog):
                         "Windows 光标隐藏后，桌宠自动穿透点击；光标出现立即恢复。适用于游戏，也可能影响自动隐藏光标的视频播放器。",
                         self.cursor_hidden_passthrough_check,
                     ),
-                    SettingRow("stream_capture", "直播捕获兼容", _stream_capture_hint(), self.stream_capture_check),
+                    SettingRow("stream_capture", "直播捕获兼容", settings_pet_controls.stream_capture_hint(), self.stream_capture_check),
                 ]
             )
         general_layout.addWidget(SettingsSection("窗口与系统", window_rows, general_content))

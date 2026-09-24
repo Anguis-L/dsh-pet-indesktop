@@ -60,6 +60,27 @@ from .settings_widgets import (
 )
 from .speech_bubble import BUBBLE_STYLE_PRESETS
 
+
+def stream_capture_hint() -> str:
+    """「直播捕获兼容」说明文案（按渲染拓扑分流，T4 / PHASE4_DESIGN.md:80-82）。
+
+    overlay 拓扑下该开关是**重启级切换**：捕获依赖 PetWindow 的窗旗标
+    （``window_screen.py`` 的 set_stream_capture_mode），而 overlay 拓扑不构造
+    PetWindow——勾选只落 config，重启后由拓扑分流消费（多宠先收拢为主宠物，
+    捕获模式内单宠单窗）。legacy 拓扑保持原文案（运行期即时生效）。
+
+    文案落在本模块（控件本体也在这里）而不是 ``modern_settings_dialog``：
+    后者的行数预算只随实测校准，能不加行就不加。
+    """
+    from . import overlay_settings_command
+
+    if overlay_settings_command.is_overlay_topology():
+        return ("让 OBS 等工具能够枚举并捕获桌宠窗口。"
+                "当前为单合成窗（overlay）拓扑：该开关重启后生效，"
+                "重启时多只桌宠会先收拢为主宠物。")
+    return "让 OBS 等工具能够枚举并捕获桌宠窗口。"
+
+
 def build_pet_controls(host) -> None:
     from .modern_settings_dialog import dialogue_params_hint
     host.scale_combo = ModernSelect(host, width=132)
