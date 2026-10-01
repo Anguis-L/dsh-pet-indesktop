@@ -212,10 +212,14 @@ class _RecordingClip:
 
 
 class _LibraryStub:
-    """只带 stop_all_clips 依赖面（_movies）的最小替身。"""
+    """只带 stop_all_clips 依赖面（_movies + 供给线程取消）的最小替身。"""
 
     def __init__(self, clips: dict) -> None:
         self._movies = clips
+        self.provision_cancels = 0
+
+    def cancel_frameseq_provision(self) -> None:
+        self.provision_cancels += 1
 
 
 def test_library_stop_all_clips_stops_every_clip():
@@ -225,6 +229,23 @@ def test_library_stop_all_clips_stops_every_clip():
     MovieLibrary.stop_all_clips(_LibraryStub(clips))
 
     assert [c.stops for c in clips.values()] == [1, 1, 1]
+
+
+def test_library_stop_all_clips_cancels_frameseq_provision():
+    """会话结束入口必须同时取消在飞的帧序列供给线程（issue #111）。
+
+    只停 clip 不取消供给线程，关机窗口里那个线程照样能派生转换 ffmpeg——而
+    ``stop_all_clips`` 是两条拓扑唯一的会话结束入口（legacy
+    ``AppShell._on_session_end`` 逐窗 / overlay ``OverlayShell._on_session_end``
+    逐库），闸门挂在它上面才算真的收口。
+    """
+    from pet.library import MovieLibrary
+
+    stub = _LibraryStub({"a": _RecordingClip()})
+    MovieLibrary.stop_all_clips(stub)
+
+    assert stub.provision_cancels == 1, "会话结束必须取消在飞供给线程"
+    assert stub._movies["a"].stops == 1, "原有 clip 收口行为不变"
 
 
 def test_library_stop_all_clips_survives_single_clip_failure():
@@ -451,16 +472,24 @@ class _FakeWindow:
 
 
 class _RecordingLibrary:
-    """素材库替身：记录 stop_all_clips 调用次数。"""
+    """素材库替身：记录 stop_all_clips / 预热暂停 / 供给线程取消调用次数。"""
 
     def __init__(self, fail: bool = False) -> None:
         self.stops = 0
+        self.pauses = 0
+        self.provision_cancels = 0
         self._fail = fail
 
     def stop_all_clips(self) -> None:
         self.stops += 1
         if self._fail:
             raise RuntimeError("素材库半销毁")
+
+    def pause_warm(self) -> None:
+        self.pauses += 1
+
+    def cancel_frameseq_provision(self) -> None:
+        self.provision_cancels += 1
 
 
 def _shell_with_window(app, tmp_path, win):
@@ -540,6 +569,27 @@ def test_app_shell_window_without_library_still_freezes(app, tmp_path):
         shell._on_session_end()
         assert win.shutdowns == 1
         assert webm_clip_mod.session_ending() is True
+    finally:
+        AppShell._shutdown_live_for_tests()
+
+
+def test_app_shell_about_to_quit_cancels_frameseq_provision(app, tmp_path):
+    """退出收口（aboutToQuit）必须取消在飞的供给线程，不只暂停预热。
+
+    供给线程不是预热线程：``pause_warm`` 管不到它，而它自己派生转换 ffmpeg——
+    退出/关机窗口正是最不该再派生进程的时刻；库随窗口销毁时活线程还会被一起析构
+    （Qt fatal）。与 overlay 的 ``OverlayShell._on_about_to_quit`` 同一收口位置。
+    """
+    from pet.app import AppShell
+
+    lib = _RecordingLibrary()
+    win = _FakeWindow(lib=lib)
+    shell = _shell_with_window(app, tmp_path, win)
+    try:
+        shell._on_about_to_quit()
+
+        assert lib.pauses == 1, "原有行为：退出收口仍暂停预热"
+        assert lib.provision_cancels == 1, "退出收口必须取消在飞供给线程"
     finally:
         AppShell._shutdown_live_for_tests()
 

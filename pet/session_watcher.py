@@ -14,6 +14,14 @@
 2. **置位**进程级闸门 ``pet.webm_clip.set_session_ending()``，并调用注入的
    安全网回调（``AppShell._on_session_end``）终止现有 reader。
 
+除此之外还观测**锁屏/挂起**（O4）：``WM_WTSSESSION_CHANGE``（需
+``WTSRegisterSessionNotification`` 注册才收得到，见
+``register_session_notifications``）与 ``WM_POWERBROADCAST``（广播，无需注册）
+→ 注入的 ``on_suspend_change(active, reason)``。锁屏/挂起时窗口仍是
+``isVisible()``，既有档位判定拿不到任何"不可见"信号，AC 供电下会一直满速空转、
+clip 按帧率解码——故由这条事件链把档位压到 T3 并停播放节拍（只降档，不隐藏
+窗口）。注册失败降级为不支持锁屏探测并记日志（挂起探测与关机探测不受影响）。
+
 为什么原生过滤器是权威信号：``WM_QUERYENDSESSION`` 在会话拆除**之前**送达，
 是唯一能真正赶在窗口期前生效的时机；Qt 会话框架的信号是次生路径，且在
 Windows 上是否触发受 Qt 版本/会话管理器实现影响，不能单靠它。
@@ -39,13 +47,39 @@ logger = logging.getLogger(__name__)
 WM_QUERYENDSESSION = 0x0011  # 会话即将结束：关机/注销前的最后一次询问
 WM_ENDSESSION = 0x0016       # 会话已结束（拆除开始）
 
-# 只关心的消息号 → 日志用 reason。**先比对消息号再解引用**：事件过滤器每帧都
-# 会被调用，绝不能对任意消息都去读 lParam 指向的内存（非 WM_* 消息的 lParam
-# 是任意值，当作指针解引用会触发访问违规——实测在 CPython 上表现为
-# "Windows fatal exception: access violation"）。
+# 锁屏/解锁（需 WTSRegisterSessionNotification 注册才收得到）与挂起/恢复
+# （广播给全部顶层窗口，无需注册）。wParam 是本模块唯一关心的状态量。
+WM_WTSSESSION_CHANGE = 0x02B1
+WTS_SESSION_LOCK = 0x7
+WTS_SESSION_UNLOCK = 0x8
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_APMRESUMEAUTOMATIC = 0x0012
+
+#: 注册/反注册用的通知范围：只要本会话（``NOTIFY_FOR_THIS_SESSION``）
+NOTIFY_FOR_THIS_SESSION = 0
+
+#: 只关心的消息号 → 日志用 reason。**先比对消息号再解引用**：事件过滤器每帧都
+#: 会被调用，绝不能对任意消息都去读 lParam 指向的内存（非 WM_* 消息的 lParam
+#: 是任意值，当作指针解引用会触发访问违规——实测在 CPython 上表现为
+#: "Windows fatal exception: access violation"）。
 _SESSION_END_MESSAGES = {
     WM_QUERYENDSESSION: 'native_query_end_session',
     WM_ENDSESSION: 'native_end_session',
+}
+
+#: 锁屏/挂起消息：wParam → (是否挂起中, 日志标签)
+_SUSPEND_MESSAGES = {
+    WM_WTSSESSION_CHANGE: {
+        WTS_SESSION_LOCK: (True, 'session_lock'),
+        WTS_SESSION_UNLOCK: (False, 'session_unlock'),
+    },
+    WM_POWERBROADCAST: {
+        PBT_APMSUSPEND: (True, 'power_suspend'),
+        PBT_APMRESUMESUSPEND: (False, 'power_resume'),
+        PBT_APMRESUMEAUTOMATIC: (False, 'power_resume'),
+    },
 }
 
 # Windows MSG 结构（原生事件过滤器的 message 指针在 Windows 上即 MSG*）。
@@ -69,21 +103,102 @@ class _WinMsg(ctypes.Structure):
         return int(self.message)
 
 
+#: ``message`` 字段在该结构里的字节偏移：由 ctypes 布局算出，不硬编码
+#: （winuser.h 里 MSG 各字段宽度随位数/对齐变化，写死偏移会在别的架构上静默读错）。
+_MSG_MESSAGE_OFFSET = _WinMsg.message.offset
+_MSG_FIELD_TYPE = ctypes.c_uint  # MSG.message 是 UINT
+
+
 def session_end_reason(message) -> Optional[str]:
     """把原生事件过滤器的 message 参数翻译成会话结束原因（非会话消息返回 None）。
 
-    只读 Qt 给出的 ``MSG*`` 的 ``message`` 字段，解析失败（非 Windows / 指针
-    失效 / PySide6 传参形态变化）一律返回 None——本模块只做观测，任何异常都
-    必须吞掉，绝不让 Qt 事件循环因探测器崩掉。
+    读取分两步（O2）：**先只读 ``MSG.message`` 一个字段**（4 字节）判断是不是
+    会话消息——事件过滤器对**每一条** Windows 消息都会被调用，先前的实现每条
+    都做 ``string_at(48B)`` + ``from_buffer_copy(48B)`` 才拿到消息号，绝大多数
+    消息（WM_PAINT/WM_MOUSEMOVE…）的这次整结构拷贝纯属浪费；只有确认是关机/
+    注销消息时才完整解析 MSG（用于 wParam/lParam 留痕）。
+
+    解析失败（非 Windows / 指针失效 / PySide6 传参形态变化）一律返回 None——
+    本模块只做观测，任何异常都必须吞掉，绝不让 Qt 事件循环因探测器崩掉。
     """
     if not isinstance(message, int) or message <= 0:
         return None
     try:
-        raw = ctypes.string_at(message, ctypes.sizeof(_WinMsg))
-        msg_id = _WinMsg.from_buffer_copy(raw).message_id()
+        msg_id = int(_MSG_FIELD_TYPE.from_address(
+            message + _MSG_MESSAGE_OFFSET).value)
+        reason = _SESSION_END_MESSAGES.get(msg_id)
     except Exception:
         return None
-    return _SESSION_END_MESSAGES.get(msg_id)
+    if reason is None:
+        return None
+    # 确认是会话消息后才完整解析（wParam/lParam 留痕：WM_ENDSESSION 的
+    # lParam 带 ENDSESSION_LOGOFF 标志）。解析失败不影响判定——探测器宁可
+    # 诊断少一行，也绝不能漏掉关机信号。
+    try:
+        win_msg = _WinMsg.from_buffer_copy(
+            ctypes.string_at(message, ctypes.sizeof(_WinMsg)))
+    except Exception:
+        return reason
+    logger.debug('原生会话消息 0x%04X wParam=%s lParam=%s',
+                 int(win_msg.message), int(win_msg.wParam), int(win_msg.lParam))
+    return reason
+
+
+def _suspend_state(message) -> Optional[tuple]:
+    """把原生消息翻译成 ``(是否挂起中, 日志标签)``；无关消息返回 None（O4）。
+
+    与 :func:`session_end_reason` 同款纪律：先窄读 ``MSG.message`` 定消息号，
+    命中锁屏/挂起消息才整结构解析取 wParam（其余消息一个字节都不多读——事件
+    过滤器每条消息都会被调用）。不认识的 wParam（如 Windows 新增的电源事件、
+    ``PBT_APMQUERYSUSPEND`` 查询）一律返回 None：只观测、不改状态。
+    """
+    if not isinstance(message, int) or message <= 0:
+        return None
+    try:
+        msg_id = int(_MSG_FIELD_TYPE.from_address(
+            message + _MSG_MESSAGE_OFFSET).value)
+        states = _SUSPEND_MESSAGES.get(msg_id)
+    except Exception:
+        return None
+    if states is None:
+        return None
+    try:
+        win_msg = _WinMsg.from_buffer_copy(
+            ctypes.string_at(message, ctypes.sizeof(_WinMsg)))
+    except Exception:
+        return None
+    entry = states.get(int(win_msg.wParam))
+    if entry is None:
+        return None
+    logger.debug('原生锁屏/挂起消息 0x%04X wParam=%s → %s',
+                 int(win_msg.message), int(win_msg.wParam), entry[1])
+    return entry
+
+
+def session_power_event(message) -> Optional[str]:
+    """锁屏/挂起消息的日志标签（无关消息返回 None；测试与日志的公开面）。"""
+    entry = _suspend_state(message)
+    return entry[1] if entry is not None else None
+
+
+# ---------------------------------------------------------------- WTS 注册边界
+def _wts_register_session_notification(hwnd: int, flags: int) -> int:
+    """``WTSRegisterSessionNotification`` 边界：返回 0 表示未注册。
+
+    只在这里碰 win32（测试打桩本函数即替换系统调用）。
+    """
+    import ctypes as _ctypes
+
+    return int(_ctypes.windll.wtsapi32.WTSRegisterSessionNotification(
+        _ctypes.c_void_p(int(hwnd)), _ctypes.c_uint(int(flags))))
+
+
+def _wts_unregister_session_notification(hwnd: int) -> int:
+    """``WTSUnRegisterSessionNotification`` 边界（注意 win32 里的拼写无 Register 的 r）。"""
+    import ctypes as _ctypes
+
+    return int(_ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(
+        _ctypes.c_void_p(int(hwnd))))
 
 
 class SessionWatcher(QObject):
@@ -93,14 +208,18 @@ class SessionWatcher(QObject):
     """
 
     def __init__(self, app=None, on_session_end: Optional[Callable[[], None]] = None,
-                 install_native_filter: bool = True) -> None:
+                 install_native_filter: bool = True,
+                 on_suspend_change: Optional[Callable[[bool, str], None]] = None) -> None:
         super().__init__(None)
         self._app = app if app is not None else QCoreApplication.instance()
         self._on_session_end = on_session_end
+        self._on_suspend_change = on_suspend_change
         self._install_native_filter = bool(install_native_filter)
         self._armed = False
         self._installed = False
         self._signals_connected = False
+        # 锁屏通知注册状态：已注册的 hwnd（0 = 未注册/注册失败降级）
+        self._wts_hwnd = 0
 
     # ------------------------------------------------------------ 状态
     @property
@@ -147,16 +266,78 @@ class SessionWatcher(QObject):
 
     # ------------------------------------------------------------ 原生过滤器
     def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt API
-        """应用级原生事件过滤器：Windows 关机/注销消息 → 置位闸门。
+        """应用级原生事件过滤器：Windows 关机/注销 → 置位闸门；锁屏/挂起 → 降档。
 
         恒返回 ``(False, 0)``：只观测、不拦截——绝不 veto 关机，也不改变 Qt 的
         默认处理（Qt 对 WM_QUERYENDSESSION 的应答语义保持原样）。
+
+        两条分支互不影响：会话结束 latch 一旦置位就不再观测（关机窗口里锁屏
+        消息没有意义）；锁屏/挂起在任何时候都转发给 ``on_suspend_change``
+        （回调异常单独隔离，绝不影响关机探测）。
         """
         if not self._armed:
             reason = session_end_reason(message)
             if reason is not None:
                 self.arm(reason)
+                return (False, 0)
+        self._report_suspend(message)
         return (False, 0)
+
+    def _report_suspend(self, message) -> None:
+        """锁屏/挂起消息 → ``on_suspend_change(active, reason)``（异常隔离）。"""
+        if self._on_suspend_change is None:
+            return
+        try:
+            entry = _suspend_state(message)
+        except Exception:
+            return  # 探测器只做观测：解析失败绝不打断 Qt 事件循环
+        if entry is None:
+            return
+        try:
+            self._on_suspend_change(bool(entry[0]), entry[1])
+        except Exception:
+            logger.exception('锁屏/挂起降档回调失败（只观测，不影响事件循环）')
+
+    # ------------------------------------------------------------ 锁屏通知注册
+    def register_session_notifications(self, hwnd) -> bool:
+        """对给定窗口句柄注册会话通知（Windows 才收得到 WM_WTSSESSION_CHANGE）。
+
+        注册失败（``wtsapi32`` 不可用 / API 返回 0 / 非 Windows）→ 返回 False 并
+        记日志：**降级为不支持锁屏探测**，挂起/恢复（WM_POWERBROADCAST 无需
+        注册）与关机探测照常工作。幂等：同一 hwnd 不重复注册。
+        """
+        if os.name != 'nt':
+            return False
+        hwnd = int(hwnd or 0)
+        if hwnd == 0:
+            logger.info('会话通知注册跳过（无窗口句柄）：锁屏探测降级为不支持')
+            return False
+        if self._wts_hwnd == hwnd:
+            return True
+        if self._wts_hwnd:
+            self.unregister_session_notifications()
+        try:
+            ok = bool(_wts_register_session_notification(
+                hwnd, NOTIFY_FOR_THIS_SESSION))
+        except Exception:
+            logger.info('会话通知注册失败（锁屏探测降级为不支持）', exc_info=True)
+            return False
+        if not ok:
+            logger.info('会话通知注册被拒绝 hwnd=%s（锁屏探测降级为不支持）', hwnd)
+            return False
+        self._wts_hwnd = hwnd
+        logger.debug('会话通知已注册 hwnd=%s（锁屏/解锁可探测）', hwnd)
+        return True
+
+    def unregister_session_notifications(self) -> None:
+        """关闭时反注册（幂等；未注册成功时绝不去摘别人的注册）。"""
+        hwnd, self._wts_hwnd = self._wts_hwnd, 0
+        if not hwnd or os.name != 'nt':
+            return
+        try:
+            _wts_unregister_session_notification(hwnd)
+        except Exception:
+            logger.debug('会话通知反注册失败 hwnd=%s', hwnd, exc_info=True)
 
     # ------------------------------------------------------------ 触发
     def arm(self, reason='') -> None:
@@ -192,13 +373,16 @@ class SessionWatcher(QObject):
             logger.debug('置位会话结束闸门失败', exc_info=True)
 
 
-def install_session_watcher(app=None, on_session_end=None) -> SessionWatcher:
-    """便捷入口：创建并安装探测器（AppShell 使用）。
+def install_session_watcher(app=None, on_session_end=None,
+                            on_suspend_change=None) -> SessionWatcher:
+    """便捷入口：创建并安装探测器（AppShell / OverlayShell 使用）。
 
     平台判定在 ``SessionWatcher.install()`` 内完成：只有 Windows
     （``os.name == 'nt'``）才注册原生事件过滤器，POSIX 上仅保留闸门与 Qt
-    会话信号接线。
+    会话信号接线。锁屏通知的注册（``register_session_notifications``）由调用方
+    在拿到窗口句柄后单独触发（非 Windows 上是 no-op）。
     """
-    watcher = SessionWatcher(app=app, on_session_end=on_session_end)
+    watcher = SessionWatcher(app=app, on_session_end=on_session_end,
+                             on_suspend_change=on_suspend_change)
     watcher.install()
     return watcher

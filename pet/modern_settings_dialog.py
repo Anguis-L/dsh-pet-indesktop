@@ -444,7 +444,7 @@ class ModernSettingsDialog(QDialog):
             SettingRow(
                 "harness_autostart",
                 "随桌宠启动 dsh 服务",
-                "桌宠启动后自动在后台静默拉起 dsh web 服务（只起服务，不开浏览器、不弹窗口；需要使用时点「启动 DeepSeek Harness」秒开页面）。仅主桌宠生效。",
+                "桌宠启动后自动在后台静默拉起 dsh web 服务（只起服务，不开浏览器、不弹窗口；需要使用时点「启动 DeepSeek Harness」秒开页面）。关闭本项即停止已拉起的服务；桌宠退出会断开自拉起页面。仅主桌宠生效。",
                 self.harness_autostart_check,
             ),
         ]
@@ -582,7 +582,7 @@ class ModernSettingsDialog(QDialog):
                     SettingRow(
                         "idle_low_fps",
                         "省电模式",
-                        "一段时间不操作桌宠时，动画按半帧率呈现（24fps 素材 → 12fps 效果）并停止后台动画预热，任何交互立即恢复全帧率。",
+                        settings_pet_controls.idle_low_fps_hint(),
                         self.idle_low_fps_check,
                     ),
                     SettingRow("no_move", "不移动", "暂停桌宠在桌面上的自动移动。", self.no_move_check),
@@ -996,6 +996,8 @@ class ModernSettingsDialog(QDialog):
         self._apply_selected_theme()
         # 行全部就位后收敛台词编辑可见性：初始层若为某 Agent 专属则隐藏公共事件行
         settings_pet_controls._apply_dialogue_scope_rows(self)
+        # 行全部就位后标注窗口级键的生效范围（overlay 一窗多宠：只有子宠页需要）
+        settings_pet_controls._apply_window_scope_rows(self)
         if self.standalone:
             # 独立进程本地宿主：试听改本地播放、节日试听本地演示、无 parent 时
             # 读 runtime 状态文件避让桌宠。逻辑全在 pet/settings_standalone.py，
