@@ -1,16 +1,25 @@
 # -*- coding: utf-8 -*-
-"""热集帧序列转换器（帧序列化 B 档）——命令行薄壳。
+"""帧序列转换器（帧序列化 B 档）——命令行薄壳。
 
 转换核心全部在 ``pet/frameseq_provision.py``：运行时首跑自动供给与构建期
-工具共用同一份实现（``<stem>.tmp/`` 原子目录、bgra + libvpx-vp9 两组防坑
-参数、read_frames meta 探测 fps、幂等跳过）。本模块只保留命令行行为：
+工具共用同一份实现（``<stem>.g<戳>.tmp/`` 原子发布、bgra + libvpx-vp9 两组
+防坑参数、read_frames meta 探测 fps、按源身份戳幂等跳过、按目录分档编码）。
+本模块只保留命令行行为：
 
-    assets/characters/<id>/frameseq/<folder>/<stem>/f_0001.webp + meta.json
+    assets/characters/<id>/frameseq/<folder>/<stem>.g<源戳12>/f_0001.webp + meta.json
 
 用法：
     python tools/convert_frameseq.py [--character shenshen] [--force]
                                      [--include random,events]
-幂等：已完成（f_*.webp + meta.json）的目录跳过；--force 全量重转。
+幂等：当前源已有**同档位**的可用世代目录（名字戳与 meta 戳自洽、帧数与磁盘相符、
+encoder 串与本目录档位一致）即跳过；--force 全量重转。
+档位由 webm 相对 videos 的第一级目录决定：热集（idle/move/turn/click/drag）走
+无损 ``-lossless 1``，``--include`` 进来的 random/events 走有损
+``-lossless 0 -quality 80``（meta 写 ``ENCODER_DESC_LOSSY``）。默认范围仍是热集
+（random/events 体积大，构建期是否转换由打包方决定；运行时自动供给的范围是
+热集 + random + events，见 ``frameseq_provision.SUPPLY_FOLDERS``）。
+本工具是**构建期入口，不设启动预算**（一轮转完范围内全部 webm）；运行时的首跑
+自动供给按每次启动的预算分批、失败退避，见 ``frameseq_provision.provision_once``。
 退出码：0 全部成功；1 角色目录缺失/无匹配 webm/有失败 clip（明细打到 stderr）。
 """
 from __future__ import annotations
@@ -28,18 +37,20 @@ from pet.frameseq_provision import (  # noqa: E402  (须先补 sys.path 再导�
     clip_out_dir,
     convert_clip,
     hot_webms,
+    is_lossy_clip,
 )
 
 __all__ = ["HOT_FOLDERS", "REPO_ROOT", "clip_out_dir", "convert_clip",
-           "hot_webms", "main"]
+           "hot_webms", "is_lossy_clip", "main"]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="热集帧序列转换器（B 档）")
+    parser = argparse.ArgumentParser(description="帧序列转换器（B 档）")
     parser.add_argument("--character", default="shenshen")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--include", default="",
-                        help="逗号分隔的额外目录（默认只转热集 idle/move/turn/click/drag）")
+                        help="逗号分隔的额外目录（默认只转热集 idle/move/turn/click/drag；"
+                             "random/events 按有损档 Q80 转）")
     args = parser.parse_args()
 
     videos = REPO_ROOT / "assets" / "characters" / args.character / "videos"
@@ -60,7 +71,10 @@ def main() -> int:
     for webm in webms:
         rel = webm.relative_to(videos).with_suffix("")
         out_dir = clip_out_dir(webm, videos, out_root)
-        converted, err = convert_clip(webm, out_dir, force=args.force)
+        converted, err = convert_clip(
+            webm, out_dir, force=args.force,
+            lossy=is_lossy_clip(webm, videos),   # 档位由目录决定（同运行时供给）
+        )
         if err:
             failed += 1
             print(f"FAIL {rel}: {err}", file=sys.stderr)

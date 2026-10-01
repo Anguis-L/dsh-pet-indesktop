@@ -81,6 +81,7 @@ import time
 import types
 import json
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
@@ -112,6 +113,9 @@ _META_CACHE = ByteBudgetLru(_META_CACHE_MAX_BYTES)
 _META_FILE_CACHE_PATH = Path(tempfile.gettempdir()) / "dsh-pet-media-meta-cache.json"
 _META_FILE_CACHE_MAX_ENTRIES = 20000
 _META_FILE_CACHE: dict | None = None
+# 加载边界体检出的死条目 key（源文件已不存在）：本进程后续落盘时顺手把这些条目
+# 从磁盘文件里一并带走——一次全表体检的结论跨写复用，不必每写一条重扫全表。
+_META_FILE_CACHE_DEAD: set[str] = set()
 _META_CACHE_LOCK = threading.Lock()
 
 # ------------------------------------------------------------ reader 生命周期（B7）
@@ -555,11 +559,164 @@ def set_first_frame_budget(max_bytes: int) -> None:
     """设置首帧缓存全局预算（启动时由应用层按配置调用一次）。
 
     只写预算值，不主动逐出——超出部分随后续登记自然逐出（下一次
-    register/置顶触发），避免在 GUI 线程做同步清理。
+    register/置顶触发），避免在 GUI 线程做同步清理。首帧**跨库共享表**
+    （见 _ffr_share_put）用同一个预算值，一起更新。
     """
-    global _first_frame_budget_bytes
+    global _first_frame_budget_bytes, _ffr_share_budget_bytes
     with _first_frame_reg_lock:
         _first_frame_budget_bytes = max(0, int(max_bytes))
+    with _ffr_share_lock:
+        _ffr_share_budget_bytes = _first_frame_budget_bytes
+
+
+# ------------------------------------------------------- 首帧解码结果跨库共享
+# 同角色多宠（overlay 单进程多 sprite）各自持一份 MovieLibrary，各自
+# warm_first_frame 同一批素材：同一段素材的首帧被解码 N 遍，每遍拉起一个
+# ffmpeg 子进程（首帧解码 = 一次 spawn + 一次 RGBA 直通解码，实测 60~166ms）。
+# 三库实测 21 次解码里 14 次是纯重复——结果字节相同，而且 clip 侧预算 LRU 会
+# 把兄弟库刚解出来的同一段首帧当"新条目"逐出去，白解一遍又白占一次预算。
+#
+# 这里按**媒体身份**（路径 + mtime_ns + size，与 animation_thumbnail 的磁盘
+# 缓存、_ensure_meta 的 key 同口径）保留首帧解码结果：同进程内任一库解出的
+# 首帧，其它库（以及同步播放/预测式预热路径）直接取用，0 spawn、0 解码。
+#
+# 只存**引用**：取用方拿到的就是同一张 QImage（QImage 隐式共享；既有的
+# _first_image 语义是只读——jumpToFrame 只读它转 QPixmap），因此本表不产生
+# 第二份像素。表自身字节账与 clip 侧首帧预算同值（set_first_frame_budget
+# 同步）且是**硬上界**（见 _ffr_share_trim_locked），故总占用不因共享而放大。
+#
+# 常驻保护：库把高频交互核（click/turn/drag）clip 标成 _ffr_pinned 时，同一
+# 素材在共享表里的那条一并 pin（pin_shared_first_frame）——兄弟库晚几秒才
+# spawn 时，交互核首帧不该因为期间播放别的动画而被逐掉，否则它又要重新
+# spawn 一个 ffmpeg 解一遍（正是本表要消掉的那笔重复）。pin 集只增不减，
+# 规模 = 交互核名字数 × 建过库的角色数（都是短字符串键，且 pin 的落点
+# "素材在表里"由预算硬上界兜住）。
+_ffr_share_lock = threading.Lock()
+_ffr_share: "OrderedDict[str, tuple]" = OrderedDict()  # key -> (QImage, bytes)
+_ffr_share_bytes = 0
+_ffr_share_budget_bytes = _FIRST_FRAME_BUDGET_BYTES
+_ffr_share_pinned: set[str] = set()
+_ffr_share_stats = {'hits': 0, 'misses': 0, 'spawns': 0, 'puts': 0}
+
+
+def _ffr_share_key(path) -> str | None:
+    """共享表键：路径 + mtime_ns + size；素材不可 stat 时返回 None（不共享）。"""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return f"{path}|{st.st_mtime_ns}|{st.st_size}"
+
+
+def _ffr_share_trim_locked() -> None:
+    """超预算逐出最久未用：优先非 pin 条目；全 pin 时**仍逐出最久未用**。
+
+    与 clip 侧 `_ffr_touch`（剩余全是常驻 → 预算转软上限）的差别是有意的：clip 侧
+    的常驻条目由 clip 拥有，clip 终结即随 weakref 清账、内存自动回落；本表的条目
+    由表强引用持有，若也转成软上限，切角色反复建库会让"每角色交互核"的键越积越
+    多（7 段 × 角色数 × 0.88MB）而永不释放。因此这里的预算保持**硬上界**：pin 只
+    在还有别的条目可逐时起保护作用（正是"兄弟库还没 spawn 完"那个窗口）。
+    """
+    global _ffr_share_bytes
+    while _ffr_share_bytes > _ffr_share_budget_bytes and len(_ffr_share) > 1:
+        victim = next((key for key in _ffr_share if key not in _ffr_share_pinned),
+                      None)
+        if victim is None:
+            victim = next(iter(_ffr_share))  # 全常驻：仍逐最久未用（硬上界）
+        _ffr_share_bytes -= _ffr_share.pop(victim)[1]
+
+
+def _ffr_share_put_locked(key: str, img) -> None:
+    global _ffr_share_bytes
+    nbytes = img.width() * img.height() * 4
+    old = _ffr_share.pop(key, None)
+    if old is not None:
+        _ffr_share_bytes -= old[1]
+    _ffr_share[key] = (img, nbytes)
+    _ffr_share_bytes += nbytes
+    _ffr_share_stats['puts'] += 1
+    _ffr_share_trim_locked()
+
+
+def share_first_frame(path, img) -> None:
+    """发布一段素材的首帧解码结果（解码完成后调用；img 为空时 no-op）。"""
+    if img is None:
+        return
+    key = _ffr_share_key(path)
+    if key is None:
+        return
+    with _ffr_share_lock:
+        _ffr_share_put_locked(key, img)
+
+
+def shared_first_frame(path):
+    """取用其它库已解出的首帧（同一 QImage 对象）；未命中返回 None。"""
+    key = _ffr_share_key(path)
+    with _ffr_share_lock:
+        if key is None:
+            _ffr_share_stats['misses'] += 1
+            return None
+        entry = _ffr_share.get(key)
+        if entry is None:
+            _ffr_share_stats['misses'] += 1
+            return None
+        _ffr_share.move_to_end(key)
+        _ffr_share_stats['hits'] += 1
+        return entry[0]
+
+
+def shared_first_frame_ready(path) -> bool:
+    """只探测共享表里是否已有该素材的首帧（不动 LRU 序、不计命中/未命中）。
+
+    供兄弟库预热前的有界等待用：等到了再走正常预热（clip 侧从共享表取用，
+    0 spawn），不必自己解一遍同一素材。
+    """
+    key = _ffr_share_key(path)
+    if key is None:
+        return False
+    with _ffr_share_lock:
+        return key in _ffr_share
+
+
+def pin_shared_first_frame(path) -> None:
+    """常驻保护一段素材的共享首帧（高频交互核；见本节的"常驻保护"说明）。"""
+    key = _ffr_share_key(path)
+    if key is None:
+        return
+    with _ffr_share_lock:
+        _ffr_share_pinned.add(key)
+        entry = _ffr_share.get(key)
+        if entry is not None:
+            _ffr_share.move_to_end(key)
+
+
+def bump_first_frame_spawns() -> None:
+    """记一笔"真的要为某段素材拉起 ffmpeg 解首帧"（共享未命中时调用）。"""
+    with _ffr_share_lock:
+        _ffr_share_stats['spawns'] += 1
+
+
+def first_frame_share_stats() -> dict:
+    """共享表取证快照（命中/未命中/真实 spawn 次数 + 占用）。"""
+    with _ffr_share_lock:
+        return {
+            **_ffr_share_stats,
+            'entries': len(_ffr_share),
+            'bytes': _ffr_share_bytes,
+            'pinned': len(_ffr_share_pinned),
+            'budget': _ffr_share_budget_bytes,
+        }
+
+
+def reset_first_frame_share() -> None:
+    """清空共享表与计数（测试收口：跨用例不残留首帧引用）。"""
+    global _ffr_share_bytes
+    with _ffr_share_lock:
+        _ffr_share.clear()
+        _ffr_share_pinned.clear()
+        _ffr_share_bytes = 0
+        for key in _ffr_share_stats:
+            _ffr_share_stats[key] = 0
 
 
 def _ffr_unregister(clip) -> None:
@@ -767,6 +924,58 @@ class _PopenCapture:
         return proc
 
 
+def _meta_cache_source_path(key: str) -> str:
+    """从 meta 缓存 key 还原源文件路径。
+
+    key 形如 ``<path>|<mtime_ns>|<size>``（``_ensure_meta``），stat 失败时退化为
+    裸 ``<path>``。尾部两段都能当数字才认定是版本后缀——路径里带 ``|`` 的
+    极端情况不会被误切。
+    """
+    head, sep, size = key.rpartition("|")
+    if sep and size.isdigit():
+        path, sep2, mtime = head.rpartition("|")
+        if sep2 and mtime.isdigit():
+            return path
+    return key
+
+
+def _prune_dead_meta_file_cache(cache: dict) -> int:
+    """逐出源文件已不存在的条目，返回逐出条数（N3，2026-09-29 审计）。
+
+    pytest 临时路径这类条目在源文件删掉后永不失效（key 的 ``(mtime+size)``
+    再也没有匹配者），跨运行常驻在 ``%TEMP%/dsh-pet-media-meta-cache.json`` 里。
+    只在本进程第一次读该文件时做一次全表体检（``_get_meta_file_cache``），逐出的
+    key 记入 :data:`_META_FILE_CACHE_DEAD` 供后续落盘复用——**不进** ``_ensure_meta``
+    热路径，条数上限语义不变。
+
+    体检实现：按父目录分组、每组一次 ``os.scandir`` 列名单比对，而不是逐条
+    ``os.path.exists``。本机实测（真实缓存 4972 条 / 139 个目录）：分组 34.9ms vs
+    逐条 462.6ms（Windows 上逐条 stat 病态昂贵，见 ``ByteOffsetTailer`` 注释）。
+    判定等价：目录列不出来 = 其下所有源文件都不存在。Windows 大小写不敏感，
+    比对时统一小写。
+    """
+    groups: dict[str, dict[str, list[str]]] = {}
+    for key in cache:
+        parent, name = os.path.split(_meta_cache_source_path(key))
+        groups.setdefault(parent, {}).setdefault(name, []).append(key)
+    dead: list[str] = []
+    for parent, names in groups.items():
+        try:
+            listed = {entry.name for entry in os.scandir(parent or os.curdir)}
+        except OSError:
+            for keys in names.values():   # 目录没了 / 读不了：其下条目一律视为死
+                dead.extend(keys)
+            continue
+        lowered = {name.lower() for name in listed}
+        for name, keys in names.items():
+            if name.lower() not in lowered:
+                dead.extend(keys)
+    for key in dead:
+        cache.pop(key, None)
+    _META_FILE_CACHE_DEAD.update(dead)
+    return len(dead)
+
+
 def _load_meta_file_cache() -> dict:
     try:
         raw = json.loads(_META_FILE_CACHE_PATH.read_text(encoding="utf-8"))
@@ -790,6 +999,9 @@ def _get_meta_file_cache() -> dict:
     if _META_FILE_CACHE is None:
         _META_FILE_CACHE = _load_meta_file_cache()
         _prune_meta_file_cache(_META_FILE_CACHE)  # 历史超限文件：内存即有界
+        # N3：本进程第一次读到这份文件时体检一遍死条目（源文件已删的那种），
+        # 结论同时交给写路径把磁盘文件缩小——整条链只在加载/落盘边界花钱。
+        _prune_dead_meta_file_cache(_META_FILE_CACHE)
     return _META_FILE_CACHE
 
 
@@ -853,6 +1065,10 @@ def _save_meta_file_cache_entry(key: str, frames: int, duration: float) -> None:
                 # 缓存单调累积，多开预热不重复探测。跨进程临界区由
                 # _meta_cache_file_lock 提供（有界等待，失败退化为重读合并）。
                 cache = _load_meta_file_cache()
+                # N3：加载边界体检出的死条目（源文件已删）顺手从磁盘文件里带走。
+                # 结论复用一次全表体检，这里只花集合查找的钱。
+                for dead_key in _META_FILE_CACHE_DEAD:
+                    cache.pop(dead_key, None)
                 cache[key] = {
                     "frames": frames,
                     "duration": duration,
@@ -884,7 +1100,15 @@ else:
 
 
 class WebMClip(QObject):
-    """与窗口层期望的媒体播放器接口兼容。"""
+    """与窗口层期望的媒体播放器接口兼容的 webm 播放器。
+
+    首帧预热可被**兄弟库取用**（``FIRST_FRAME_WARM_ADOPTABLE``）：同角色多宠时
+    首帧冷路径要 spawn 一个 ffmpeg（60~166ms），兄弟库不必各解一遍同一段素材——
+    预热前有界等一会（库侧 ``MovieLibrary._await_peer_first_frame``），等到了就从
+    ``webm_clip`` 的跨库首帧共享表取用（同一张 QImage：0 spawn、0 解码）。
+    """
+
+    FIRST_FRAME_WARM_ADOPTABLE = True
 
     frameChanged = Signal(int)
     finished = Signal()
@@ -962,6 +1186,13 @@ class WebMClip(QObject):
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(self._timer_interval())
         self._timer.timeout.connect(self._poll)
+        # 待落地的消费节拍间隔（见 _apply_interval）：运行中真变速时排到下一次
+        # timeout 落地，避免重设 QTimer 截断当拍倒计时。
+        self._pending_interval: int | None = None
+        # 播放节拍暂停（O3）：隐藏/挂起期为 True——消费端定时器停摆（不再
+        # _poll），播放位置/队列/显示图原地保留；reader 由有界帧队列背压自然
+        # 停步。恢复走 resume()，从暂停处续播（绝不回第 0 帧、不重新拉进程）。
+        self._paused = False
         # 共享解码（默认 None = 今天的行为逐位不变）：
         # - _publish_sink：发布端（首发窗）播放时置（facade 在 start() 前设置）
         #   ——reader 线程每解码一帧回调 sink.on_frame(data, src_idx)，扇出到
@@ -1426,11 +1657,50 @@ class WebMClip(QObject):
         self._current_pixmap = None
 
     # ------------------------------------------------------------ lifecycle
+    def _apply_interval(self, interval: int) -> None:
+        """落地消费节拍间隔：同值不重设，运行中把新值排到下一次 timeout。
+
+        对运行中的 QTimer 重设 interval（``setInterval`` / ``start(ms)`` 同语义）
+        会**重开倒计时**：当拍已经走掉的时间被抹掉，下一帧被推迟最多一个整间隔。
+        飞行期 ``set_flight_anim_speed`` 每 ~4 个 tick（≈64ms）就写一次速率、每次
+        写入都跨过一个间隔档，于是帧交付被反复推迟（实机"上下飞帧数上不去"，
+        I1 真 QTimer 探针：每 64ms 写一次同值 → 2s 只交付 31 帧 vs 不写 47 帧）。
+
+        规则：目标间隔与当前一致 → 什么都不做（连 QTimer 都不碰）；真变了且帧表
+        正在运行 → 记在 ``_pending_interval``，由下一次 timeout（``_poll`` 入口）
+        落地——那一刻倒计时本来就要重开，零额外代价。帧表未运行时立即落地：
+        ``_switch()`` 在 ``movie.start()`` 之前设速率的老语义不变（否则新动画会
+        继续用默认 1x 间隔起播）。
+        """
+        interval = max(1, int(interval))
+        if interval == self._timer.interval():
+            self._pending_interval = None  # 目标已生效，撤掉排队的值
+            return
+        if self._timer.isActive():
+            self._pending_interval = interval
+            return
+        self._pending_interval = None
+        self._timer.setInterval(interval)
+
+    def _flush_pending_interval(self) -> None:
+        """把排队的间隔落地（由帧表 timeout 入口调用：倒计时刚重开，零代价）。"""
+        pending = self._pending_interval
+        if pending is None:
+            return
+        self._pending_interval = None
+        if pending != self._timer.interval():
+            self._timer.setInterval(pending)
+
+    def _set_interval_now(self, interval: int) -> None:
+        """立即落地间隔（帧表未运行 / 即将 start 的路径：没有倒计时要保）。"""
+        self._pending_interval = None
+        self._timer.setInterval(max(1, int(interval)))
+
     def set_playback_speed(self, speed: float) -> None:
         self.playback_speed = max(0.1, float(speed))
-        # _switch() 在 movie.start() 之前设置速率，不能只在 QTimer 已启动时更新。
+        # _switch() 在 movie.start() 之前设置速率 → 未运行时必须立即落地，
         # 否则每个新 WebM 动画都会继续使用默认的 1x interval。
-        self._timer.setInterval(self._timer_interval())
+        self._apply_interval(self._timer_interval())
 
     @property
     def decode_throttle_divisor(self) -> int:
@@ -1461,7 +1731,7 @@ class WebMClip(QObject):
         if divisor == self._decode_throttle_divisor:
             return
         self._decode_throttle_divisor = divisor
-        self._timer.setInterval(self._timer_interval())
+        self._apply_interval(self._timer_interval())
 
     def set_recycle_minutes(self, minutes: int) -> None:
         """设置 ffmpeg 圈边界定期回收阈值（分钟；0 = 关闭回收。批11-B1，主线程调用）。
@@ -1549,7 +1819,7 @@ class WebMClip(QObject):
         # 在 GUI 线程读取真实 fps 后再启动 QTimer，保证新动画的实际帧率
         # 与播放速率计算一致；reader 线程只负责解码和入队。
         self._ensure_meta()
-        self._timer.setInterval(self._timer_interval())
+        self._set_interval_now(self._timer_interval())
         stop_evt = threading.Event()
         ready_evt = threading.Event()
         self._stop_evt = stop_evt
@@ -1588,8 +1858,41 @@ class WebMClip(QObject):
                 self._queue, thread, self._w * self._h * self._bpp,
             )
         thread.start()
-        self._timer.start()
+        if not self._paused:
+            self._timer.start()
         return True
+
+    def pause(self) -> None:
+        """暂停播放节拍（O3：隐藏/挂起期不再按帧率消费）。
+
+        只停消费端 QTimer：播放位置（``_frame_index``/``_current_frame_index``）、
+        帧队列、当前显示图全部原地保留——恢复走 ``resume()`` 从暂停处续播，
+        **不**重启 reader、**不**回第 0 帧（``stop()``/``jumpToFrame(0)`` 都会
+        换代并重新拉起 ffmpeg，冷启动 60-166ms，绝不能拿来当暂停用）。
+
+        reader 侧不主动杀进程：消费端停摆后帧队列写满即背压（详见
+        ``_fill_queue`` 的节流语义），恢复无需重新起进程 = 无首帧冷启动。
+        """
+        if self._paused:
+            return
+        self._paused = True
+        try:
+            self._timer.stop()
+        except RuntimeError:
+            pass  # C++ QTimer 已随 clip 销毁（半销毁场景）
+
+    def resume(self) -> None:
+        """恢复播放节拍（从暂停处续播）。已停播（``_running=False``）时只清标记。"""
+        if not self._paused:
+            return
+        self._paused = False
+        if not self._running:
+            return
+        try:
+            self._set_interval_now(self._timer_interval())
+            self._timer.start()
+        except RuntimeError:
+            logger.debug('webm 恢复播放节拍失败（QTimer 已销毁）: %s', self.path)
 
     def stop(self) -> None:
         self._running = False
@@ -1714,9 +2017,10 @@ class WebMClip(QObject):
             self._current_frame_index = 0  # 新一圈从源时间线 0 起
             self._ended_fired = False
             self._running = True
-            self._timer.setInterval(self._timer_interval())
+            self._set_interval_now(self._timer_interval())
             self._loop_gate.set()  # 唤醒圈边界驻留的 reader
-        self._timer.start()
+        if not self._paused:
+            self._timer.start()
         if not self._loop_ack.wait(_LOOP_REARM_ACK_TIMEOUT):
             # 唤醒握手超时：reader 实际已在退出（finally 窗口），回滚 re-arm
             # 落回 fresh start（调用方正常路径会换代/换队列/重新拉起）。
@@ -1788,11 +2092,19 @@ class WebMClip(QObject):
         cleanup 可主动 terminate；gen 是本次解码认领的首帧代次，解码期间
         代次被换代则结果作废返回 None。未显式传入 gen 时以解码开始时的
         代次为准（所有真实调用路径均显式传入，此为防御默认）。
+
+        跨库共享（同角色多宠）：同进程内已有库解过这段素材的首帧时直接
+        取用（同一 QImage 对象），不 spawn、不解码——详见模块顶部"首帧解码
+        结果跨库共享"。这是首帧解码的唯一入口，预热与同步播放路径都在此收口。
         """
         if imageio_ffmpeg is None:
             return None
         if session_ending():
             return None  # 会话结束：绝不为首帧拉起解码进程（走既有 None 降级）
+        shared = shared_first_frame(self.path)
+        if shared is not None:
+            return shared  # 命中兄弟库已解出的首帧：0 spawn、0 解码
+        bump_first_frame_spawns()
         # 批 6-8b：探测串行化预热——与播放 reader 同源，避免首帧解码路径
         # 并发跑 ffmpeg -version 探测（read_frames 内部本就会探测，此处仅
         # 提前到统一入口并串行化）。
@@ -1881,12 +2193,17 @@ class WebMClip(QObject):
         幂等：缓存已存在则跳过；写入后 set _first_frame_done。
         返回待逐出列表——调用方必须在释放本 clip 锁后再 _ffr_evict
         （R3 复审：锁内逐出会取 victim 的锁，构成跨对象持锁嵌套）。
+
+        同时把结果发布进**跨库共享表**（同角色兄弟库直接取用，不再各解一遍；
+        见模块顶部"首帧解码结果跨库共享"）。锁序与 _ffr_touch 一致：clip 首帧锁
+        → 共享表锁（单向，无反向获取）。
         """
         if img is None:
             return []
         if self._first_image is None:
             self._first_image = img
             self._first_frame_done.set()
+            share_first_frame(self.path, img)
             # 预算 LRU 登记；逐出返回给调用方、在释放本 clip 锁后执行
             # （R3 复审：持锁期间逐出会取 victim 的锁，跨对象嵌套可死锁）
             return _ffr_touch(self, img.width() * img.height() * 4)
@@ -2359,6 +2676,7 @@ class WebMClip(QObject):
         注意：不能一次清空队列只处理最新帧，否则会把中间帧丢弃，
         导致动画视觉上“快进”。这里每次只取最早的一帧。
         """
+        self._flush_pending_interval()  # 排队的变速在本次 timeout 落地（零代价）
         try:
             item = self._queue.get_nowait()
         except queue.Empty:

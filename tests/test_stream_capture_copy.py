@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """捕获模式在 overlay 拓扑下的文案/消费口径回归（DS 审查 M15 / T4）。
 
-设计稿 .scratch/single-overlay-window/PHASE4_DESIGN.md「T4 捕获模式」：
-overlay 拓扑下勾选捕获模式 = **重启级切换**（设置页文案同步改「重启后生效」，
-多宠先收拢为主 sprite），运行期不再有窗旗标切换。legacy 拓扑（PetWindow 唯一
-存在理由）文案与运行期切换路径保持不变。
+overlay 拓扑不建 PetWindow，捕获依赖的窗旗标（``set_stream_capture_mode``）
+在全仓没有 overlay 侧消费者，**重启也不生效**（审计 D：PHASE4_DESIGN 早期的
+「重启级切换」设想从未落地）。故设置页文案改为如实说明不支持并置灰控件。
+legacy 拓扑（PetWindow 唯一存在理由）文案与运行期切换路径保持不变。
 
 纪律：offscreen；同步直调，不 sleep。
 """
@@ -43,11 +43,11 @@ def _stream_capture_hint(tmp_path, monkeypatch, topology: str) -> str:
         app.processEvents()
 
 
-def test_stream_capture_copy_says_restart_under_overlay_topology(tmp_path, monkeypatch):
-    """overlay 拓扑：文案明说「重启后生效」并交代多宠收拢。"""
+def test_stream_capture_copy_says_unsupported_under_overlay_topology(tmp_path, monkeypatch):
+    """overlay 拓扑：文案如实说明单窗模式不支持（不再声称「重启后生效」）。"""
     hint = _stream_capture_hint(tmp_path, monkeypatch, "overlay")
-    assert "重启后生效" in hint
-    assert "收拢" in hint
+    assert "暂不支持" in hint
+    assert "重启" not in hint
     assert "让 OBS 等工具能够枚举并捕获桌宠窗口" in hint
 
 

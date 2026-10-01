@@ -9,8 +9,16 @@ ffmpeg 子进程、spawn 冷启动（60-166ms）、管道/背压/看门狗/关�
 
 素材形态（转换器 tools/convert_frameseq.py 产出）：
     assets/characters/<id>/frameseq/<folder>/<stem>/
-        meta.json      {"fps": 24.0, "source": "idle/x.webm", ...}
+        meta.json      {"fps": 24.0, "frames": 239, "source": "idle/x.webm", ...}
         f_0001.webp ...（libvpx 解码 + bgra 直通的无损帧，视觉 bit-exact）
+
+帧表去物化（M1 内存口径，2026-09-28）：构造阶段不列目录，只读 meta 的
+fps/frames；frameCount/duration/currentTimeSeconds 走 meta 的帧数（O(1)，零系统
+调用），**播放路径也不物化帧表**——素材是转换器写出的连续 ``f_%04d.webp``，路径
+按编号现推、用完即弃。R1 那版"首次真播放 glob 一次并常驻 ~239 个 Path"实测在
+106 段 × 3 宠下多出 ≈110MB RSS 且永不释放（``library.release_idle_frames`` 只回收
+队列/显示槽，碰不到帧表），而帧数本来就以 meta 为权威。glob 只保留为 meta
+缺失/非法（旧产物、转换中断）时的兜底——那才是唯一真"列帧表"的路径。
 
 播放模型与现架构一致（链式一次性播放）：start() 从第 0 帧起按 fps 推进，
 末帧后停表并发 finished()，循环由上层状态机重启 clip 承接。
@@ -22,6 +30,11 @@ GUI 定时器里，3 宠待机循环时 GUI 线程被吃掉 ~18%/核——直接
 worker 常驻下一帧预取。内存只驻留当前帧 + 1~2 帧预取（+OS 页缓存），
 无 reader 线程级队列。jumpToFrame/warm_first_frame 这类低频同步路径
 允许一次 ~2.5ms 的同步加载（调用方期望立即生效）。
+
+显示槽只存 QImage：QPixmap 由 ``currentPixmap()`` 的消费者（托盘/灵动岛
+图标、legacy 窗口）惰性构建并按帧缓存。overlay 渲染链（PetSprite →
+``library.clip_current_image``）只读 ``currentImage()``，每帧 QPixmap 是纯
+浪费；预热跑在后台线程，在那里构建 QPixmap 本身也不合法（Qt 要求 GUI 线程）。
 
 预取看门狗（"画面经常卡住不动"的用户实测根因）：worker 所在共享线程失能
 时，``_request`` 的 queued 调用永远不被处理，``_advance`` 会停在 ``_awaiting``
@@ -35,6 +48,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -106,6 +120,50 @@ def _shared_prefetch_thread() -> QThread:
     return _shared_thread
 
 
+class _FramePaths:
+    """帧路径序列：按编号现推，不物化 Path 列表（M1 内存口径）。
+
+    素材命名是转换器写出的连续 ``f_%04d.webp``、帧数以 meta.json 的 ``frames`` 为
+    权威，因此路径可以按编号现推：``seq[i]`` = ``dir/f_{i+1:04d}.webp``（一个临时
+    Path，用完即弃，不常驻）。改前这里是首次播放 glob 出来的 ~241 个 Path 的常驻
+    列表（106 段 × 3 宠实测 ≈110MB RSS，且 ``library.release_idle_frames`` 碰不到）。
+
+    meta 缺失/非法（旧产物、转换中断）才 glob 一次兜底——那才是唯一真"列帧表"的
+    路径，此时 ``listed`` 非 None。``len()``/``seq[i]`` 的语义与旧列表逐位相同
+    （预取 worker 与播放层只用这两个），实例身份恒定（worker 持有的同一引用自动
+    可见）；锁只护"glob 一次"（预热跑在后台线程，GUI 线程可能同时在播放）。
+    """
+
+    def __init__(self, frames_dir: Path, meta_count: int | None) -> None:
+        self._dir = frames_dir
+        self._meta_count = meta_count
+        self._lock = threading.Lock()
+        #: glob 兜底产物（仅 meta 缺失/非法时为非 None）；常态 None = 零物化
+        self.listed: list[Path] | None = None
+
+    def __len__(self) -> int:
+        if self._meta_count is not None:
+            return self._meta_count
+        return len(self._resolve())
+
+    def __getitem__(self, index: int) -> Path:
+        if self._meta_count is None:
+            return self._resolve()[index]
+        if index < 0:                      # 与列表同语义（调用方理论上只传非负）
+            index += self._meta_count
+        if not 0 <= index < self._meta_count:
+            raise IndexError(index)
+        return self._dir / f"f_{index + 1:04d}.webp"
+
+    def _resolve(self) -> list[Path]:
+        """glob 兜底：只列一次（meta 缺失/非法时才会走到）。"""
+        if self.listed is None:
+            with self._lock:
+                if self.listed is None:
+                    self.listed = sorted(self._dir.glob("f_*.webp"))
+        return self.listed
+
+
 class _PrefetchWorker(QObject):
     """后台预取：按路径加载帧（~2.5ms/帧）移出 GUI 线程。
 
@@ -115,7 +173,7 @@ class _PrefetchWorker(QObject):
 
     loaded = Signal(int, QImage)
 
-    def __init__(self, frames: list[Path], parent: QObject | None = None) -> None:
+    def __init__(self, frames: _FramePaths, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._frames = frames
 
@@ -132,26 +190,53 @@ class FrameSeqClip(QObject):
     finished = Signal()
     errorOccurred = Signal(str)
 
+    #: 帧 0 预热的**重复代价可忽略**：冷解码 ~1.2ms，且 ``start()`` 本就异步
+    #: 交付首帧（未到货时继续显示旧帧，不阻塞 GUI）——同角色兄弟库因此不重复
+    #: 预热这一帧（见 ``MovieLibrary._warm_objects`` 的 _warm_peer 分支）。
+    #: WebMClip 故意没有这个标记：它的首帧冷路径要 spawn 一个 ffmpeg（60~166ms），
+    #: 兄弟库必须覆盖，那笔重复由 ``webm_clip`` 的跨库首帧共享表消掉。
+    FIRST_FRAME_WARM_TRIVIAL = True
+
     def __init__(self, frames_dir: Path | str, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._dir = Path(frames_dir)
         self._fps = DEFAULT_FPS
+        #: meta.json 里的整数帧数（>0 才有效；缺失/非法 = None，计数走列目录兜底）
+        self._meta_count: int | None = None
         try:
             meta = json.loads((self._dir / "meta.json").read_text(encoding="utf-8"))
             self._fps = float(meta.get("fps") or DEFAULT_FPS)
+            # 与 frameseq_provision.is_complete 同一口径：帧数必须是正整数
+            # （转换器的 _write_meta 就是这么写的），浮点/字符串一律当无效。
+            meta_count = meta.get("frames")
+            if type(meta_count) is int and meta_count > 0:
+                self._meta_count = meta_count
         except (OSError, ValueError):
             pass  # 缺 meta 按默认 fps（与包内素材 24fps 一致）
         if self._fps <= 0:
             self._fps = DEFAULT_FPS
-        self._frames = sorted(self._dir.glob("f_*.webp"))
+        #: 帧表（M1 去物化）：按编号现推路径、帧数以 meta 为权威——构造阶段绝不
+        #: glob，播放路径也不物化 Path 列表（改前每 clip 常驻 ~239 个 Path，见
+        #: ``_FramePaths``）。实例身份恒定，worker 持有的同一引用自动可见。
+        self._frames = _FramePaths(self._dir, self._meta_count)
         self._cur = 0
         self._img: QImage | None = None
+        #: 显示槽里那张 QImage 对应的帧号（-1 = 无图）。与 _cur 的区别只在
+        #: warm_first_frame（后台预热装载帧 0 但不动播放位置）——start() 靠它
+        #: 判断"显示槽已经就是第 0 帧"，避免又让 worker 解一遍（O1）。
+        self._img_frame = -1
         self._pm: QPixmap | None = None
         self.playback_speed = 1.0
         self._running = False
+        # 播放节拍暂停（O3）：隐藏/挂起期为 True——定时器停摆（不推进、不预取
+        # 下一帧），播放位置/在途帧/显示图原地保留，恢复时从暂停处续播。
+        self._paused = False
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._advance)
+        # 待落地的帧表间隔（见 _apply_interval）：运行中真变速排到下一次
+        # _advance 落地，避免重设 QTimer 截断当拍倒计时
+        self._pending_interval: int | None = None
         # 异步预取（GUI 零解码）：pending = 已到货未上屏，wanted = 在途请求，
         # awaiting = 播放位置在等的帧号（到货即上屏）；线程进程级共享，
         # clip 只挂 worker（销毁经 close()→deleteLater，无线程寿命问题）
@@ -172,16 +257,16 @@ class FrameSeqClip(QObject):
 
     # ---------------------------------------------------------------- 元信息
     def frameCount(self) -> int:
-        return max(1, len(self._frames))
+        return max(1, self._frame_count())
 
     def duration(self) -> float:
-        return len(self._frames) / self._fps / self.playback_speed
+        return self._frame_count() / self._fps / self.playback_speed
 
     def currentFrameNumber(self) -> int:
         return self._cur
 
     def currentTimeSeconds(self) -> float:
-        frames = len(self._frames)
+        frames = self._frame_count()
         if frames <= 0:
             return 0.0
         return self._cur * (self.duration() / frames)
@@ -191,11 +276,31 @@ class FrameSeqClip(QObject):
         return self._img
 
     def currentPixmap(self) -> QPixmap | None:
+        """当前帧的 QPixmap（惰性构建、按帧缓存；无帧返回 ``None``）。
+
+        接口语义与改前逐位一致：返回值仍是**当前显示帧**那一张、非空；只是
+        构建时机从"每帧上屏时"挪到"消费者第一次要"（托盘/灵动岛图标、
+        legacy 窗口）。同一帧重复请求复用同一对象，新帧到货即失效。
+        """
+        if self._img is None:
+            return None
+        if self._pm is None:
+            self._pm = QPixmap.fromImage(self._img)
         return self._pm
 
     def clear_display_frame(self) -> None:
-        self._img = None
+        """清显示槽（``MovieLibrary.release_idle_frames`` 回收残留帧的入口）。
+
+        pinned clip 也清（2026-09-27 真机 A/B 撤回 O1 的 pinned 保留）：保留
+        每 pinned clip 1 帧在三宠下实测多占私有内存 ~17.5MB（7 段 × 3 库 ×
+        0.88MB，`.scratch/windows-parity-20260926-a/opt-ab-20260927-b/`），换来的
+        只是一次 ~1.2ms 的帧 0 解码——与 WebMClip 不同，帧序列冷解码本来就快，
+        不值得常驻。惰性 pixmap 同样丢掉（下个消费者按需重建）。
+        """
         self._pm = None
+        self._img = None
+        self._img_frame = -1
+        self._pending.clear()
 
     # ---------------------------------------------------------------- 播放控制
     def start(self) -> bool:
@@ -203,8 +308,14 @@ class FrameSeqClip(QObject):
 
         首帧异步交付（~2.5ms 后到，frameChanged 通知——与 WebMClip 的
         冷路径语义一致，只是从 60-166ms 缩到 ~2.5ms）。
+
+        帧 0 已到手时不重复解码（O1）：预热（``warm_first_frame``）解出的帧 0
+        直接寄存 ``_pending[0]``、显示槽已是帧 0（``jumpToFrame(0)`` 起播、
+        上一圈停在帧 0）则原地复用——两种情况都省掉 worker 的第二次帧 0 解码
+        与一次线程往返（实测单帧解码 ~1.2ms，见证据目录 BENCH-frame-path.txt
+        「帧 0 解码」列：改前 2 次/改后 1 次，每次起播都付）。
         """
-        if not self._frames:
+        if not self._frames:               # 帧表按 meta 现推；0 帧 = 空素材目录
             self.errorOccurred.emit(f"frameseq: 空素材目录 {self._dir}")
             return False
         self._timer.stop()
@@ -212,8 +323,15 @@ class FrameSeqClip(QObject):
         self._clear_awaiting()
         img = self._pending.pop(0, None)
         if img is not None:
-            self._apply(img)
+            self._apply(img, 0)
             self.frameChanged.emit(0)
+        elif self._img is not None and self._img_frame == 0:
+            # 显示槽已是帧 0（预热装载/jumpToFrame(0) 起播/上一圈停在帧 0）：
+            # 直接起播并补发帧 0 通知，零解码
+            self.frameChanged.emit(0)
+            # 预取链深度与旧路径保持一致（旧路径帧 0 一到货就 `_request(1)`）：
+            # 不预取帧 1 会让起播后第一个 tick 停在等待上（不跳帧但白等一拍）
+            self._request(1)
         else:
             # 帧 0 尚未到货：**不清显示槽**——保留预热帧/上一圈末帧直到新帧
             # 交付（与 WebMClip edecd57 的语义对齐）。清空会让 sprite.paint
@@ -222,12 +340,42 @@ class FrameSeqClip(QObject):
             self._set_awaiting(0)
             self._request(0)
         self._running = True
-        self._timer.start(self._interval_ms())
+        if not self._paused:
+            self._set_interval_now(self._interval_ms())
+            self._timer.start()
         return True
 
     def stop(self) -> None:
         self._running = False
         self._timer.stop()
+        # 在途到货帧只对"这一圈播放"有意义，停播后留着就是每 clip 1 帧的
+        # 常驻浪费（pinned 例外：预热帧 0 寄存在 _pending 里供 start() 复用）。
+        # ``_wanted`` 是"请求在途"标记，照旧保留——真到货时会按 _awaiting
+        # 匹配上屏，误清反而会让 _request 去重拦掉本该发出的请求。
+        if not getattr(self, "_ffr_pinned", False):
+            self._pending.clear()
+
+    def pause(self) -> None:
+        """暂停播放节拍（O3：隐藏/挂起期零帧推进、零预取）。
+
+        只停自身的 QTimer：播放位置 ``_cur``、在途/已到货帧 ``_pending``、
+        等待态 ``_awaiting`` 与显示图 ``_img`` 全部原地保留（``stop()`` 会清
+        ``_pending`` 并置 ``_running=False``，语义不同，绝不能拿来当暂停用）。
+        恢复走 ``resume()``，从暂停处续播——绝不 ``jumpToFrame(0)``。
+        """
+        if self._paused:
+            return
+        self._paused = True
+        self._timer.stop()
+
+    def resume(self) -> None:
+        """恢复播放节拍（从暂停处续播）。已停播（``_running=False``）时只清标记。"""
+        if not self._paused:
+            return
+        self._paused = False
+        if self._running:
+            self._set_interval_now(self._interval_ms())
+            self._timer.start()
 
     def close(self) -> None:
         """停止播放并回收预取 worker（MovieLibrary.shutdown/收尾调用）。
@@ -246,24 +394,71 @@ class FrameSeqClip(QObject):
         if not img.isNull():
             self._cur = frame_index
             self._clear_awaiting()
-            self._apply(img)
+            self._apply(img, frame_index)
         self.frameChanged.emit(frame_index)
         return True
 
     def set_playback_speed(self, speed: float) -> None:
+        """写入播放速率（用户速率 × 飞行倍率）。
+
+        运行中的帧表按 ``_apply_interval`` 落地新间隔：同值不碰 QTimer、真变速
+        排到下一次 ``_advance`` 落地——对运行中的 QTimer ``start(ms)`` 会重开
+        倒计时，飞行期每 ~4 tick 的写入会把帧交付一路推迟（实机"上下飞帧数上
+        不去"，见 tests/test_flight_frame_pacing.py）。
+        """
         self.playback_speed = max(0.1, float(speed))
-        if self._running:
-            self._timer.start(self._interval_ms())
+        if self._running and not self._paused:
+            self._apply_interval(self._interval_ms())
+
+    def _apply_interval(self, interval: int) -> None:
+        """落地帧表间隔：同值不重设；运行中真变速排到下一次 timeout 落地。
+
+        对运行中的 QTimer 重设间隔（``setInterval`` / ``start(ms)`` 同语义）会
+        重开倒计时，抹掉当拍已走掉的时间（下一帧最多被推迟一个整间隔）。同值
+        直接不碰；真变了且帧表在跑 → 记 ``_pending_interval``，由 ``_advance``
+        入口落地（那一刻倒计时本来就要重开，零额外代价）。帧表未运行时立即
+        落地（起播前设速率的老语义不变）。
+        """
+        interval = max(1, int(interval))
+        if interval == self._timer.interval():
+            self._pending_interval = None
+            return
+        if self._timer.isActive():
+            self._pending_interval = interval
+            return
+        self._pending_interval = None
+        self._timer.setInterval(interval)
+
+    def _flush_pending_interval(self) -> None:
+        """把排队的间隔落地（由帧表 timeout 入口调用：倒计时刚重开，零代价）。"""
+        pending = self._pending_interval
+        if pending is None:
+            return
+        self._pending_interval = None
+        if pending != self._timer.interval():
+            self._timer.setInterval(pending)
+
+    def _set_interval_now(self, interval: int) -> None:
+        """立即落地间隔（帧表未运行 / 即将 start 的路径：没有倒计时要保）。"""
+        self._pending_interval = None
+        self._timer.setInterval(max(1, int(interval)))
 
     # ---------------------------------------------------------------- 解码层兼容（本实现无 webm 解码层语义，全为良性 no-op）
     def warm_meta(self) -> None:
         return
 
     def warm_first_frame(self) -> None:
+        """后台预热帧 0（幂等：显示槽已有帧即返回）。
+
+        解出的帧 0 同时寄存 ``_pending[0]``：``start()`` 起播时直接弹出来上屏
+        （``frameChanged(0)`` 同步发出），不再让 prefetch worker 又解一遍
+        （每段动画每次起播省一次帧解码 + 一次线程往返）。
+        """
         if self._img is None and self._frames:
             img = QImage(str(self._frames[0]))
             if not img.isNull():
-                self._apply(img)
+                self._apply(img, 0)
+                self._pending[0] = img
 
     def cancel_first_frame_warm(self) -> None:
         return
@@ -288,15 +483,33 @@ class FrameSeqClip(QObject):
         return
 
     # ---------------------------------------------------------------- 内部
+    def _frame_count(self) -> int:
+        """帧数快查：meta 的 ``frames`` 为权威（O(1)，零 glob）。
+
+        帧表已按 meta 现推 → ``len`` 就是 meta 帧数；meta 缺失/非法（旧产物、转换
+        中断）才由 ``_FramePaths`` 列一次目录兜底——那是唯一会 glob 的元信息路径。
+        """
+        return len(self._frames)
+
     def _interval_ms(self) -> int:
         return max(1, round(1000.0 / self._fps / self.playback_speed))
 
-    def _apply(self, img: QImage) -> None:
+    def _apply(self, img: QImage, frame: int) -> None:
+        """上屏一帧：只存 QImage + 帧号；pixmap 交给 ``currentPixmap()`` 惰性建。
+
+        ``frame`` 是这张图对应的源帧号（调用点都持有），``start()`` 靠它判断
+        显示槽是否已经是第 0 帧（帧号不能用 ``_cur`` 代替：预热装载不动播放
+        位置，``start()`` 又会先把自己置 0）。
+        """
         self._img = img
-        self._pm = QPixmap.fromImage(img)
+        self._img_frame = frame
+        self._pm = None  # 新帧到货 → 惰性 pixmap 缓存失效
 
     def _request(self, idx: int) -> None:
-        """请求 worker 预取一帧（幂等去重：已到货/在途不重发）。"""
+        """请求 worker 预取一帧（幂等去重：已到货/在途不重发）。
+
+        帧表按编号现推（``_FramePaths``），worker 侧同样零 glob。
+        """
         if idx >= len(self._frames) or idx in self._pending or idx == self._wanted:
             return
         self._wanted = idx
@@ -312,13 +525,14 @@ class FrameSeqClip(QObject):
         if self._running and idx == self._awaiting:
             self._cur = idx
             self._clear_awaiting()  # 到货 = 恢复：看门狗状态清零，此后不再告警
-            self._apply(img)
+            self._apply(img, idx)
             self.frameChanged.emit(idx)
             self._request(idx + 1)  # 链式预取下一帧
         else:
             self._pending[idx] = img
 
     def _advance(self) -> None:
+        self._flush_pending_interval()  # 排队的变速在本次 timeout 落地（零代价）
         nxt = self._cur + 1
         if nxt >= len(self._frames):
             # 链式一次性播放到尾：停表并发 finished（上层据此接下一个动画）
@@ -329,7 +543,7 @@ class FrameSeqClip(QObject):
         img = self._pending.pop(nxt, None)
         if img is not None:
             self._cur = nxt
-            self._apply(img)
+            self._apply(img, nxt)
             self.frameChanged.emit(nxt)
             self._request(nxt + 1)
         else:
@@ -394,14 +608,14 @@ class FrameSeqClip(QObject):
             self._stall_count, waited_ms, self._dir.name, idx, self._wanted,
             len(self._pending), thread_alive)
         self._stall_count = 0
-        img = QImage(str(self._frames[idx]))
+        img = QImage(str(self._frames[idx]))   # 同步兜底直读帧路径（帧表按编号现推）
         if img.isNull():
             return  # 坏帧：保持现状，下个 tick 重新走看门狗
         if not self._running:
             return
         self._cur = idx
         self._clear_awaiting()
-        self._apply(img)
+        self._apply(img, idx)
         self.frameChanged.emit(idx)
         self._request(idx + 1)  # 同步兜底后仍续链式预取（worker 恢复即接回异步）
 
