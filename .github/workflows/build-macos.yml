@@ -43,7 +43,7 @@ jobs:
       - name: Pytest (main suite)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py
+        run: python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py --ignore=tests/test_frameseq_prefetch_watchdog.py
 
       - name: Pytest (webm lifecycle family, isolated + one retry)
         env:
@@ -54,6 +54,13 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q tests/test_low_priority_warm_interaction_yield.py || python -m pytest -q tests/test_low_priority_warm_interaction_yield.py
+
+      # frameseq 预取 watchdog 族：全套件上下文约 28% 处偶发 native access
+      # violation（详见 pr-test.yml 同名单元注释），按族先例隔离 + 一次重跑。
+      - name: Pytest (frameseq watchdog family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_frameseq_prefetch_watchdog.py || python -m pytest -q tests/test_frameseq_prefetch_watchdog.py
 
       # 构建入口与本地完全一致：scripts/build_macos.sh（PyInstaller 打包 +
       # 中文编码自检 + ad-hoc 签名都在脚本内完成），CI 不内联
