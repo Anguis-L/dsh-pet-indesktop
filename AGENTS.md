@@ -63,7 +63,10 @@ stay gone and are never imported again. Collision math is pure (`pet/collision.p
 `sprite_collision.capsule_circles` via `pet/island_bridge.py`.
 
 `pet/multi_window_shared.py` is always on: one process-wide agent_link /
-proactive / fullscreen watcher fanned out to every window or sprite.
+proactive / fullscreen watcher fanned out to every window or sprite. Under the
+overlay topology the shared fullscreen watcher is not started (the overlay shell
+owns its own `FullscreenCursorWatcher`), and `DshStateTracker` only runs while
+`agent_link.dsh` is enabled.
 
 ## Change discipline
 
