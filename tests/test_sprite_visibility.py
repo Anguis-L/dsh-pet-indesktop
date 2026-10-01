@@ -14,6 +14,8 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import time
+
 from PySide6.QtCore import QPoint, QPointF
 from PySide6.QtWidgets import QApplication
 
@@ -204,3 +206,299 @@ def test_sprite_without_visible_field_treated_as_visible():
     assert overlay.sprite_at(QPoint(4, 4)) is sprite
     overlay.grab()
     assert sprite.paint_calls == 1
+
+
+# ---------------------------------------------------------------- O3 隐藏期停播放节拍
+class _FakeClock:
+    """可推进的假钟（档位滞回用；壳的驱动器不起真表、不 sleep 赌时序）。
+
+    起点取 ``time.monotonic()``：驱动器在 ``_build``/``showEvent`` 里已经用真钟
+    记过 kinetic 时间戳，注入一个从 0 起的小值会让"kinetic 尾巴是否过期"的
+    算术失真。
+    """
+
+    def __init__(self, now=None):
+        self.now = time.monotonic() if now is None else float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+
+class PausableStubSprite(FakeSprite):
+    """鸭子 sprite + 可见性/播放节拍记录面（壳层接线的观测点）。"""
+
+    def __init__(self, pos=(0, 0), size=(32, 32)):
+        super().__init__(pos, size)
+        self.visible = True
+        self.pause_calls = 0
+        self.resume_calls = 0
+
+    def set_visible(self, visible):
+        self.visible = bool(visible)
+
+    def pause_clip(self):
+        self.pause_calls += 1
+
+    def resume_clip(self):
+        self.resume_calls += 1
+
+
+class WarmRecorder:
+    """记录 pause_warm/resume_warm 的库替身（成对配对的观测点）。"""
+
+    def __init__(self):
+        self.pauses = 0
+        self.resumes = 0
+
+    def pause_warm(self):
+        self.pauses += 1
+
+    def resume_warm(self):
+        self.resumes += 1
+
+
+def _real_frameseq_sprite(tmp_path, name="idle1", count=12):
+    """真 PetSprite + 真 FrameSeqClip（现场生成的 webp 帧素材）。"""
+    from tests.test_frameseq_clip import _make_frames
+
+    from pet.frameseq_clip import FrameSeqClip
+    from pet.pet_sprite import PetSprite
+
+    frames_dir = tmp_path / name
+    _make_frames(frames_dir, count=count)
+    clip = FrameSeqClip(frames_dir)
+    lib = fac.RichLibrary()
+    lib._clips[name] = clip
+    sprite = PetSprite(lib, pos=QPointF(50, 50), scale=0.5)
+    return sprite, clip
+
+
+def _drive_frames(clip, count):
+    """同步推 count 帧（真 clip 的 _advance + 事件泵等在途预取交付）。"""
+    from tests.test_frameseq_clip import _pump_until
+
+    for _ in range(count):
+        target = clip.currentFrameNumber() + 1
+        clip._advance()
+        _pump_until(lambda: clip.currentFrameNumber() == target)
+
+
+def test_pause_clip_stops_timer_and_resume_continues_without_rewind(tmp_path):
+    """pause_clip 只停播放节拍；resume_clip 从暂停处续播（绝不回第 0 帧）。"""
+    sprite, clip = _real_frameseq_sprite(tmp_path)
+    try:
+        assert sprite.bind_clip("idle1") is True
+        from tests.test_frameseq_clip import _pump_until
+        _pump_until(lambda: clip.currentImage() is not None)
+        clip._timer.stop()                     # 定序：测试自己推帧，不赌真走时
+        _drive_frames(clip, 3)
+        assert clip.currentFrameNumber() == 3
+
+        jumps: list = []
+        real_jump = clip.jumpToFrame
+        clip.jumpToFrame = lambda frame: (jumps.append(frame), real_jump(frame))[1]
+
+        sprite.pause_clip()
+        assert clip._timer.isActive() is False, "暂停 = 停 clip 自身定时器"
+        assert clip.currentFrameNumber() == 3, "暂停不得清播放位置"
+        assert clip.currentImage() is not None, "暂停不得清显示图"
+
+        sprite.resume_clip()
+        assert clip._timer.isActive() is True, "恢复 = 重开定时器"
+        assert clip.currentFrameNumber() == 3, "恢复不得回落第 0 帧"
+        assert jumps == [], "恢复绝不许 jumpToFrame(0)/restart_clip"
+
+        clip._timer.stop()                     # 继续定序推帧
+        _drive_frames(clip, 1)
+        assert clip.currentFrameNumber() == 4, "续播：从暂停帧往下一帧走，不是从 0 重放"
+    finally:
+        clip.close()
+
+
+def test_pause_clip_is_idempotent_and_noop_without_clip(tmp_path):
+    """无 clip / 重复暂停：幂等 no-op（隐藏与恢复可能被重复触发）。"""
+    from pet.pet_sprite import PetSprite
+
+    bare = PetSprite(fac.RichLibrary(), pos=QPointF(0, 0), scale=0.5)
+    bare.pause_clip()                          # 无 clip：不许抛
+    bare.resume_clip()
+
+    sprite, clip = _real_frameseq_sprite(tmp_path)
+    try:
+        sprite.bind_clip("idle1")
+        sprite.pause_clip()
+        sprite.pause_clip()
+        assert clip._timer.isActive() is False
+        sprite.resume_clip()
+        sprite.resume_clip()
+        assert clip._timer.isActive() is True
+    finally:
+        clip.close()
+
+
+def test_rebind_while_paused_stays_paused(tmp_path):
+    """隐藏中行为链换绑 clip：新 clip 必须立刻回到暂停（隐藏期零推进）。"""
+    sprite, clip = _real_frameseq_sprite(tmp_path)
+    try:
+        sprite.bind_clip("idle1")
+        sprite.pause_clip()
+        assert clip._timer.isActive() is False
+
+        sprite.bind_clip("idle1")              # 行为链换绑（隐藏中照常发生）
+
+        assert clip._timer.isActive() is False, "隐藏中换绑不得把播放节拍放行"
+        sprite.resume_clip()
+        assert clip._timer.isActive() is True
+    finally:
+        clip.close()
+
+
+def test_shell_set_sprite_visible_pauses_and_resumes_that_sprite_clip(tmp_path):
+    """壳层逐只显隐：隐藏 → 该只 pause_clip；恢复 → resume_clip（只影响这一只）。"""
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        other = PausableStubSprite()
+        shell.overlay.add_sprite(other)
+
+        shell.set_sprite_visible(other, False)
+
+        assert other.pause_calls == 1
+        assert other.resume_calls == 0
+
+        shell.set_sprite_visible(other, True)
+
+        assert other.resume_calls == 1
+        assert other.pause_calls == 1
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_window_hide_pauses_every_sprite_clip_and_show_resumes(tmp_path):
+    """整窗隐藏/全屏避让：逐 sprite pause_clip；显示时逐 sprite resume_clip。"""
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        first = PausableStubSprite()
+        second = PausableStubSprite()
+        shell.overlay.add_sprite(first)
+        shell.overlay.add_sprite(second)
+        shell.overlay.show()
+
+        shell.set_pet_visible(False)
+
+        assert (first.pause_calls, second.pause_calls) == (1, 1)
+        assert not shell.overlay.isVisible()
+
+        shell.set_pet_visible(True)
+
+        assert (first.resume_calls, second.resume_calls) == (1, 1)
+
+        # 全屏避让走同一条契约（隐藏 → 恢复）
+        shell._on_fullscreen_changed(True)
+        assert (first.pause_calls, second.pause_calls) == (2, 2)
+        shell._on_fullscreen_changed(False)
+        assert (first.resume_calls, second.resume_calls) == (2, 2)
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_window_show_does_not_resume_individually_hidden_sprite(tmp_path):
+    """整窗显示不等于逐只隐藏的那只该醒：它的播放节拍保持暂停。"""
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        hidden = PausableStubSprite()
+        shown = PausableStubSprite()
+        shell.overlay.add_sprite(hidden)
+        shell.overlay.add_sprite(shown)
+
+        shell.set_sprite_visible(hidden, False)
+        assert hidden.pause_calls == 1
+
+        shell.set_pet_visible(False)
+        shell.set_pet_visible(True)
+
+        assert shown.resume_calls == 1
+        assert hidden.resume_calls == 0, "隐藏那只不因整窗显示而恢复"
+        assert shell._sprite_visible(hidden) is False
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_window_visibility_pairs_pause_and_resume_warm_for_all_libraries(tmp_path):
+    """整窗隐藏/显示 → 主库与全部子宠库 pause_warm/resume_warm 成对。"""
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        main, spawned = WarmRecorder(), WarmRecorder()
+        spawned_sprite = PausableStubSprite()
+        shell.lib = main
+        shell._spawned_libs[spawned_sprite] = spawned
+
+        shell.overlay.show()
+        shell.set_pet_visible(False)
+        assert (main.pauses, spawned.pauses) == (1, 1), "隐藏必须逐库停预热"
+        shell.set_pet_visible(True)
+        assert (main.resumes, spawned.resumes) == (1, 1), "显示必须逐库补预热"
+
+        # 入口二：全屏避让
+        shell._on_fullscreen_changed(True)
+        assert (main.pauses, spawned.pauses) == (2, 2)
+        shell._on_fullscreen_changed(False)
+        assert (main.resumes, spawned.resumes) == (2, 2)
+
+        # 入口三：锁屏/挂起（只降档，不隐藏窗口）
+        shell._on_suspend_changed(True, "session_lock")
+        assert (main.pauses, spawned.pauses) == (3, 3)
+        assert shell.overlay.isVisible() is True, "锁屏不 hide overlay"
+        shell._on_suspend_changed(False, "session_unlock")
+        assert (main.resumes, spawned.resumes) == (3, 3)
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_shell_set_sprite_visible_notifies_driver_tier(tmp_path):
+    """逐只藏光：壳层必须通知驱动器（零可见 sprite → 目标 T3）。"""
+    from pet.tick_governor import TIER_OCCLUDED
+
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        shell.overlay.show()
+        clock = _FakeClock()
+        shell.driver._governor._clock = clock
+        clock.advance(1.0)                     # 先过 start/show 的 kinetic 尾巴
+        shell.set_sprite_visible(shell.sprite, False)
+        clock.advance(1.0)                     # 过降档滞回（DOWNGRADE_HOLD_MS=800）
+        shell.set_sprite_visible(shell.sprite, False)
+
+        assert shell.driver.applied_tier == TIER_OCCLUDED
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_hiding_one_of_two_sprites_keeps_tier_running(tmp_path):
+    """只剩一只可见时不许降档（零可见 sprite 才是 T3 的判据）。"""
+    from pet.tick_governor import TIER_OCCLUDED
+
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        shell.overlay.show()
+        clock = _FakeClock()
+        shell.driver._governor._clock = clock
+        other = PausableStubSprite()
+        shell.overlay.add_sprite(other)
+        clock.advance(1.0)
+
+        shell.set_sprite_visible(other, False)
+        clock.advance(2.0)
+        shell.set_sprite_visible(shell.sprite, True)   # 触发一次重评
+
+        assert shell.driver.applied_tier != TIER_OCCLUDED
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()

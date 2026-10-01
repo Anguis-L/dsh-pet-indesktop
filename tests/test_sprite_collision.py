@@ -389,3 +389,106 @@ def test_static_member_capsule_covers_axis_midpoint():
     world.add_collision_listener(events.append)
     world.tick([s], 0.016)
     assert events or s.pos.y() != 80 or s.velocity.y() != 0.0  # 发生碰撞结算
+
+
+# ---------------------------------------------------------------- G4：宠物间总碰撞开关
+def _three_pets(*, restitution=1.0, friction=0.0):
+    """三宠同水平线：a/b 迎面对撞（重叠 10px），b/c 相邻（重叠 10px）。
+
+    e=1/无摩擦以便断言精确速度交换（口径同 test_head_on_elastic_collision）。
+    """
+    world = SpriteCollisionWorld(restitution=restitution, friction=friction)
+    a = FakeSprite(0, 0, vx=500, collision_id="a")
+    b = FakeSprite(90, 0, vx=-500, collision_id="b")
+    c = FakeSprite(180, 0, vx=0, collision_id="c")
+    return world, a, b, c
+
+
+def test_pet_collision_disabled_excludes_only_that_pet():
+    """G4：关掉某只的宠物间总开关 = 那只退出宠-宠结算，别的宠之间照常。"""
+    world, a, b, c = _three_pets()
+    c.collision_enabled = False
+    before_c = (c.pos.x(), c.pos.y())
+    events = []
+    world.add_collision_listener(events.append)
+
+    world.tick([a, b, c], 0.016)
+
+    # a/b 照常真撞（速度交换、进抛掷）；c 与 b 的 pair 被过滤，所以 b 只与 a 结算
+    assert a.velocity.x() == -500.0
+    assert b.velocity.x() == 500.0
+    assert a.interaction_state == INTERACTION_THROWN
+    # 被关的那只：不吸收冲量、不被位置分离推开、不出事件
+    assert c.velocity.x() == 0.0 and c.velocity.y() == 0.0
+    assert (c.pos.x(), c.pos.y()) == before_c
+    assert c.interaction_state == INTERACTION_NORMAL
+    pairs = {event.pair for event in events}
+    assert pairs == {"a|b"}
+    # 过滤发生在碰撞检测之前：该 pair 连重叠簿记都不该留下
+    assert not any("c" in key for key in world._overlap_history)
+
+
+def test_pet_collision_default_enabled_for_all_pets():
+    """不设该属性（默认）= 全部参与结算，老行为不变。"""
+    world, a, b, c = _three_pets()
+    events = []
+    world.add_collision_listener(events.append)
+
+    world.tick([a, b, c], 0.016)
+
+    # a/b 真撞出事件；b/c（相对速度 ~0 → 纯位置分离）照样结算，把 c 推开
+    assert [event.pair for event in events] == ["a|b"]
+    assert c.pos.x() > 180.0
+    assert any("c" in key for key in world._overlap_history)
+
+
+def test_pet_collision_toggle_off_on_leaves_no_ghost_impulse():
+    """关→开热切：监听器不增长；关闭期间的长位移不留过期扫掠/幽灵冲量。"""
+    world = SpriteCollisionWorld(restitution=1.0, friction=0.0)
+    a = FakeSprite(0, 0, vx=0, collision_id="a")
+    b = FakeSprite(0, 0, vx=0, collision_id="b")
+    events = []
+    world.add_collision_listener(events.append)
+
+    # 关：完全重叠也不结算
+    b.collision_enabled = False
+    for _ in range(3):
+        world.tick([a, b], 0.016)
+    assert events == []
+    assert a.velocity.x() == 0.0 and b.velocity.x() == 0.0
+    assert len(world._listeners) == 1
+
+    # 关闭期间 b 一帧内跳远（帧间扫掠若还覆盖该 pair 就是幽灵撞击）
+    b.set_pos(FakePoint(2000, 0))
+    world.tick([a, b], 0.016)
+    assert events == []
+
+    # 开：远处重新启用不得补发过期冲量（prev 快照每 tick 照常刷新）
+    b.collision_enabled = True
+    world.tick([a, b], 0.016)
+    assert events == []
+    assert a.velocity.x() == 0.0 and b.velocity.x() == 0.0
+
+    # 真靠近才有真撞击；监听器仍只有 1 份
+    b.set_pos(FakePoint(90, 0))
+    a.set_velocity(FakePoint(500, 0))
+    b.set_velocity(FakePoint(-500, 0))
+    world.tick([a, b], 0.016)
+    assert [event.pair for event in events] == ["a|b"]
+    assert len(world._listeners) == 1
+
+
+def test_pet_collision_disabled_keeps_static_member_contact():
+    """岛的静态接触不受宠物间总开关影响（岛开关才是岛-宠碰撞的门）。"""
+    world = SpriteCollisionWorld()
+    world.add_static_member("island", 300, 0, 40, 200)
+    a = FakeSprite(230, 50, vx=500, collision_id="a")
+    a.collision_enabled = False
+    events = []
+    world.add_collision_listener(events.append)
+
+    world.tick([a], 0.016)
+
+    # 口径同 test_static_member_bounces_with_trampoline_restitution：1.3 加速弹开
+    assert a.velocity.x() == -650.0
+    assert [event.pair for event in events] == ["a|island"]

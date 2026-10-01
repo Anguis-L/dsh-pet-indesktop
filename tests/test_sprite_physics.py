@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
@@ -402,3 +403,120 @@ def test_sprite_bounds_inset_by_body_box(monkeypatch):
     sprite = _make_sprite()
     c = ThrowPhysicsController(BOUNDS)
     assert c._sprite_bounds(sprite) == (-50.0, -30.0, 600.0, 435.0)
+
+
+# ---------------------------------------------------------------- 落地首帧：预热 + 飞行期 pin
+# 旧架构口径：起飞 ``_warm_landing_idles`` 后台预热全部 idle 首帧并给 clip 打
+# ``_ffr_landing_pinned``（window.py:4356-4404，pin 只覆盖「起飞→落地」窗口——
+# 飞行期 8MB 首帧预算的逐出会把刚暖好的落地首帧挤掉，实测定案 105~399ms 落地
+# 冷解码卡顿）；落地（``_stop_physics``，:4289）与被拖拽打断
+# （``_enter_physics_mode('drag')``，:4318）调 ``_unpin_landing_idles`` 摘 pin。
+# sprite 世界没有等价物（sprite_physics 全文无 warm/pin 调用），落地回待机因此
+# 命中冷首帧（GUI 线程同步拉 ffmpeg ~100ms），飞行期 idle 首帧还会被预算逐出。
+#
+# 落点在行为控制器的 THROWN 进入/退出边沿（位置积分仍归本控制器）：起飞 =
+# ``_enter_thrown``，落地/被拖拽打断 = 退出该状态的那一 tick。
+BOUNDS_INT = QRect(0, 0, 800, 600)
+
+
+class WarmClip(FakeClip):
+    """带首帧预热接口的假 clip（记录调用；可选阻塞，验证预热绝不在 GUI 线程跑）。"""
+
+    def __init__(self, block: "threading.Event | None" = None):
+        super().__init__()
+        self._ffr_landing_pinned = False
+        self.warm_calls = 0
+        self.entered = threading.Event()
+        self._block = block
+
+    def warm_first_frame(self):
+        self.warm_calls += 1
+        self.entered.set()
+        if self._block is not None:
+            self._block.wait(5.0)
+
+
+def _throw_scene(clip, *, idles=("fake",)):
+    """起飞现场：sprite 已甩出（interaction_state = thrown），行为控制器待接管。"""
+    from pet.sprite_behavior import BehaviorController
+
+    lib = FakeLibrary(clip)
+    lib.idles = list(idles)
+    sprite = PetSprite(lib, pos=QPointF(100.0, 50.0), scale=0.5)
+    sprite.bind_clip("fake")
+    behavior = BehaviorController(BOUNDS_INT)
+    behavior.predict_enabled = False
+    sprite.interaction_state = INTERACTION_THROWN
+    return sprite, behavior
+
+
+def test_throw_entry_warms_and_pins_landing_idles_off_gui_thread():
+    """起飞首帧预热 + 飞行期 pin：后台进行，GUI 线程零阻塞。"""
+    import time
+
+    release = threading.Event()
+    clip = WarmClip(block=release)
+    sprite, behavior = _throw_scene(clip)
+
+    t0 = time.monotonic()
+    behavior.tick([sprite], 0.016)                 # 起飞边沿
+    elapsed = time.monotonic() - t0
+    try:
+        assert clip.entered.wait(5.0)              # 后台线程确实开始预热（事件同步）
+        assert clip._ffr_landing_pinned is True    # 飞行期首帧绝不逐出
+    finally:
+        release.set()
+    # warm 阻塞上限 5s：同步预热会在此吃到那 5s（旧机教训：GUI 同步预热在碰撞
+    # 风暴下每只 ~100ms，多鱼互撞连续 200ms+ 卡顿）
+    assert elapsed < 2.0
+    assert clip.warm_calls == 1
+
+
+def test_landing_returns_to_idle_and_unpins_landing_idles():
+    """落地（物理切回 normal）→ 收口回待机并摘 pin（window.py:4289）。"""
+    from pet.sprite_behavior import STATE_IDLE
+
+    clip = WarmClip()
+    sprite, behavior = _throw_scene(clip)
+    physics = ThrowPhysicsController(BOUNDS)
+
+    behavior.tick([sprite], 0.016)
+    assert clip._ffr_landing_pinned is True
+
+    sprite.set_pos(QPointF(100.0, FLOOR_Y))        # 贴地低速 → 落地静止
+    sprite.set_velocity(QPointF(5, 0))
+    physics.tick([sprite], 0.016)
+    assert sprite.interaction_state == INTERACTION_NORMAL
+
+    behavior.tick([sprite], 0.016)                 # 收口 tick：回待机
+    assert behavior.state_of(sprite) == STATE_IDLE
+    assert clip._ffr_landing_pinned is False
+
+
+def test_flight_interrupted_by_drag_unpins_landing_idles():
+    """飞行被拖拽打断（空中抓住）→ 摘 pin（window.py:4318 同款语义）。"""
+    from pet.sprite_behavior import STATE_DRAG
+
+    clip = WarmClip()
+    sprite, behavior = _throw_scene(clip)
+
+    behavior.tick([sprite], 0.016)
+    assert clip._ffr_landing_pinned is True
+
+    sprite.on_press(QPointF(110.0, 60.0))
+    sprite.begin_drag()                            # 过阈值升级真拖拽
+    behavior.tick([sprite], 0.016)
+
+    assert behavior.state_of(sprite) == STATE_DRAG
+    assert clip._ffr_landing_pinned is False
+
+
+def test_landing_warm_skips_clip_without_warm_api():
+    """缺 ``warm_first_frame`` 的播放器（旧替身/帧序列降级）→ getattr 跳过，不炸。"""
+    clip = FakeClip()                              # 无首帧预热接口
+    sprite, behavior = _throw_scene(clip)
+
+    behavior.tick([sprite], 0.016)
+
+    assert sprite.interaction_state == INTERACTION_THROWN   # 飞行不受影响
+    assert clip._ffr_landing_pinned is True                 # pin 与预热独立

@@ -5,7 +5,12 @@
 - 核心桥 ``IslandCollisionBridge``（零 Qt，几何经参数喂入）：attach 注册 /
   几何更新 / 去注册零残留 / stadium 圆链口径 / 幂等（重复 attach、同几何
   重复同步不打脏）/ 显隐 / 缺省几何与负尺寸/非有限值防御 / bump 回调
-  （阈值、方向、强度封顶、计数、非岛 pair）/ 音效 hook / 回调异常静默降级；
+  （阈值、方向、强度封顶、计数、非岛 pair）/ 回调异常静默降级；
+- 撞击音效的**单入口**纪律：桥只收 ``sound=`` 入参（调用点兼容）不自行派发
+  ——同一个 ``SpriteSoundPlayer`` 由壳注册在世界监听侧，世界扇出已覆盖岛击；
+- 岛侧拖拽状态通道：核心桥只在**翻转**时转达（重复几何上报去重），
+  Qt 适配层把它接到 overlay 的逐像素穿透轮询（与拖鱼同款 100ms 档），
+  松手/拖拽中隐藏/摘桥三条复位路径都在测；
 - Qt 适配层 ``IslandWindowBridge``：真实 QWidget 岛的几何与显隐跟踪、
   无参几何回调通道、事件过滤通道、``set_origin`` 屏迁移重定位、无效几何
   防御、双 attach 幂等、真实 ``DynamicIsland`` 构造接线、退出零残留；
@@ -400,23 +405,124 @@ def test_core_bump_feedback_ignores_light_and_non_island_pairs():
         bridge.detach()
 
 
-def test_core_sound_hook_only_above_threshold_and_failure_is_silent():
+def test_core_does_not_dispatch_sound_world_listener_is_single_entry():
+    """岛击音效只有一个派发入口：世界侧监听（不再由桥内重复调用）。
+
+    同一个 ``SpriteSoundPlayer`` 已由壳在世界侧注册（
+    ``overlay_shell._build`` 的 ``collision.add_collision_listener(self._sound.
+    on_collision)``），世界扇出必然覆盖岛击事件；桥内再调一次 = 每个岛击事件
+    两遍 ``on_collision``（精灵解析/配置读取做两遍，节流窗口一跨就双响）。
+    桥仍收 ``sound=`` 入参（调用点兼容），但不再自行派发。
+    """
     world = SpriteCollisionWorld()
     sound = StubSound()
     bridge, bumps = _core(sound=sound)
     try:
         bridge.attach(world)
-        bridge.on_collision(_island_event(10.0))
-        assert sound.events == []
-        bridge.on_collision(_island_event(120.0))
-        assert len(sound.events) == 1 and bridge.bumps == 1
-        # 音效后端抛异常：bump 已发生，桥不崩
+        bridge.on_collision(_island_event(10.0))     # 阈值下：连 bump 都没有
+        bridge.on_collision(_island_event(120.0))    # 过门：bump 照常
+        assert bridge.bumps == 1 and bumps
+        assert sound.events == [], "桥内仍在自行派发音效（与世界监听重复）"
+
+        # 后端炸的桩件同样不该被桥碰到（桥内已无音效调用；旧用例的
+        # 「音效失败静默降级」在新入口下由 SpriteSoundPlayer 自己负责）
         boom = StubSound(boom=True)
         bridge2, bumps2 = _core(sound=boom)
         bridge2.attach(world)
-        bridge2.on_collision(_island_event(120.0))
+        bridge2.on_collision(_island_event(120.0))   # 不抛
         assert bumps2 and bridge2.bumps == 1
         bridge2.detach()
+    finally:
+        bridge.detach()
+
+
+def test_island_hit_plays_sound_once_through_world_listener():
+    """端到端：真世界 tick 的岛击，音效回调只发生一次（双入口时是两次）。"""
+    world = SpriteCollisionWorld()
+    sound = StubSound()
+    world.add_collision_listener(sound.on_collision)  # 口径同 overlay_shell._build
+    bridge, bumps = _core(sound=sound)
+    try:
+        bridge.attach(world)
+        bridge.update_geometry(100.0, 100.0, 400.0, 80.0)  # 宽扁岛（胶囊圆链）
+        fish = FakeSprite(180.0, 80.0, vy=900.0, collision_id="a")
+        world.tick([fish], 0.016)
+        assert bumps, "岛击未反馈（bump）"
+        assert len(sound.events) == 1, \
+            f"岛击音效派发了 {len(sound.events)} 次（应只由世界监听派发一次）"
+    finally:
+        bridge.detach()
+        world.remove_collision_listener(sound.on_collision)
+
+
+class DragStubIsland:
+    """零 Qt 岛桩：只暴露核心桥拖拽观测读的那两个属性。"""
+
+    def __init__(self, *, dragging=False):
+        self._dragging = bool(dragging)
+        self._geo_to = None
+
+
+def test_core_reports_island_drag_state_once_per_transition():
+    """桥把观测到的岛拖拽状态变化转达出去：翻转才发，重复上报不发。
+
+    去重是硬要求：拖拽中的 geometry 回调可达 100Hz+（一次 mouseMoveEvent 经
+    Move 事件 + 显式几何回调喂两遍），每次都转达等于每个样本重设一次 overlay
+    穿透轮询的 QTimer 间隔。
+    """
+    island = DragStubIsland(dragging=False)
+    reported: list = []
+    bridge = IslandCollisionBridge(island=island, drag_state=reported.append)
+    try:
+        bridge.update_geometry(10.0, 10.0, 200.0, 44.0)
+        assert reported == [], "未拖拽的首次观测无须转达（无从复位）"
+        island._dragging = True
+        bridge.update_geometry(12.0, 10.0, 200.0, 44.0)
+        bridge.update_geometry(14.0, 10.0, 200.0, 44.0)  # 同一手势的重复上报
+        assert reported == [True]
+        island._dragging = False  # 松手（先翻标志，再发几何回调）
+        bridge.update_geometry(14.0, 10.0, 200.0, 44.0)
+        assert reported == [True, False]
+        bridge.update_geometry(14.0, 10.0, 200.0, 44.0)
+        assert reported == [True, False], "状态未变却重复转达"
+    finally:
+        bridge.detach()
+
+
+def test_core_detach_and_hide_release_island_drag_state():
+    """拖拽中断路径必须复位：摘桥（岛重建/退出收口）与拖拽中隐藏。
+
+    两者都让岛不再发几何回调；不显式复位时 overlay 的穿透轮询会永久停在
+    100ms 档（穿透更新延迟 10 倍）。
+    """
+    island = DragStubIsland(dragging=True)
+    reported: list = []
+    bridge = IslandCollisionBridge(island=island, drag_state=reported.append)
+    bridge.update_geometry(10.0, 10.0, 200.0, 44.0)
+    assert reported == [True]
+    bridge.set_visible(False)
+    assert reported == [True, False], "拖拽中隐藏未复位降档"
+
+    island._dragging = True
+    bridge.set_visible(True)
+    bridge.update_geometry(10.0, 10.0, 200.0, 44.0)
+    assert reported == [True, False, True]
+    bridge.detach()
+    assert reported == [True, False, True, False], "摘桥未复位降档"
+    bridge.detach()  # 幂等：不再重复发
+    assert reported == [True, False, True, False]
+
+
+def test_core_drag_state_callback_failure_is_silent():
+    """拖拽状态通道异常静默降级（同 bump/kinetic 挂点纪律）：桥不崩、不重发。"""
+    def boom(_dragging):
+        raise RuntimeError("overlay gone")
+
+    island = DragStubIsland(dragging=True)
+    bridge = IslandCollisionBridge(island=island, drag_state=boom)
+    try:
+        bridge.update_geometry(10.0, 10.0, 200.0, 44.0)  # 不抛
+        bridge.detach()                                   # 收口照常
     finally:
         bridge.detach()
 
@@ -551,7 +657,7 @@ def test_window_bridge_rejects_invalid_island_geometry():
         island.close()
 
 
-def test_window_bridge_bump_feedback_uses_island_bump_and_sound():
+def test_window_bridge_bump_feedback_uses_island_bump_only():
     overlay = OverlayWindow()
     world = SpriteCollisionWorld()
     island = FakeIsland()
@@ -561,8 +667,8 @@ def test_window_bridge_bump_feedback_uses_island_bump_and_sound():
     try:
         bridge.on_collision(_island_event(100.0))
         assert island.bump_calls == [(0.25, 0.6, 0.8)]
-        assert len(sound.events) == 1
         assert bridge.bumps == 1
+        assert sound.events == [], "桥不再自行派发音效（世界监听是唯一入口）"
         bridge.on_collision(_island_event(20.0))  # 阈值下
         assert len(island.bump_calls) == 1 and bridge.bumps == 1
     finally:
@@ -629,6 +735,120 @@ def test_window_bridge_warns_when_replacing_foreign_geometry_callback(caplog):
     finally:
         bridge.close()
         island.close()
+
+
+# ---------------------------------------------------------------- 岛拖拽 → 穿透轮询降档
+class FakeInputController:
+    """记录 set_drag_active 调用的假穿透控制器（真控制器是 Win32 边界）。"""
+
+    def __init__(self):
+        self.drag_states: list[bool] = []
+        self.stopped = False
+
+    def set_drag_active(self, active):
+        self.drag_states.append(bool(active))
+
+    def stop(self):
+        """overlay 的 hideEvent/closeEvent 会停表（假件照单接收）。"""
+        self.stopped = True
+
+
+def _bridge_with_fake_controller(*, dragging: bool | None = False):
+    """真 OverlayWindow + 假穿透控制器 + 带 ``_dragging`` 的假岛。"""
+    overlay = OverlayWindow()
+    controller = FakeInputController()
+    overlay._input_controller = controller
+    world = SpriteCollisionWorld()
+    island = FakeIsland()
+    if dragging is not None:
+        island._dragging = bool(dragging)
+    bridge = IslandWindowBridge(island, world, overlay)
+    return bridge, island, overlay, controller
+
+
+def test_island_drag_slows_overlay_pixel_polling_and_restores():
+    """岛拖拽与鱼拖拽同款降档：起手置位、松手复位、重复几何上报不重复置位。
+
+    拖鱼时 overlay 穿透轮询降到 100ms（``_press_global`` 非空）；岛是独立顶层窗，
+    overlay 一无所知——不喂这条通道，拖岛全程 overlay 保持 10ms 全量逐像素判定。
+    桥已在 ``_update_motion`` 观测岛的 ``_dragging``，这里把观测结果转成
+    ``set_drag_active``（含状态翻转去重：拖拽几何回调可达 100Hz+）。
+    """
+    bridge, island, _overlay, controller = _bridge_with_fake_controller()
+    try:
+        island.show()
+        bridge.sync_geometry()  # 首个观测：未拖拽 → 不发（无从复位）
+        assert controller.drag_states == []
+
+        island._dragging = True
+        island.emit_geometry_changed()
+        island.emit_geometry_changed()  # 同一拖拽手势的重复上报
+        assert controller.drag_states == [True], "拖拽置位必须恰好一次"
+
+        island._dragging = False  # 真实顺序：松手先翻标志，再发几何回调
+        island.emit_geometry_changed()
+        assert controller.drag_states == [True, False], "松手必须复位降档"
+    finally:
+        bridge.close()
+        island.close()
+
+
+def test_island_hidden_mid_drag_restores_overlay_pixel_polling():
+    """拖拽中断（拖岛时岛被隐藏/重建）：降档必须对称复位。
+
+    隐藏后岛不再发几何回调，没有这条显式复位，overlay 的穿透轮询会永久钉在
+    100ms 档（穿透更新延迟 10 倍）——口径同 legacy PetWindow 隐藏打断拖拽的
+    对称恢复（``test_input_controller_drag.test_hide_during_drag_restores_polling``）。
+    """
+    bridge, island, _overlay, controller = _bridge_with_fake_controller()
+    try:
+        island.show()
+        island._dragging = True
+        island.emit_geometry_changed()
+        assert controller.drag_states == [True]
+
+        island.hide()  # 拖拽中被隐藏（托盘隐藏/全屏避让/换屏重建）
+        assert controller.drag_states == [True, False], "隐藏打断拖拽后未复位降档"
+
+        bridge.close()  # 摘桥（岛上不存在，退出收口路径）不得再发第二次
+        assert controller.drag_states == [True, False]
+    finally:
+        island.close()
+
+
+def test_island_drag_release_defers_to_fish_drag_tier():
+    """鱼拖拽已在降档档位上时（``overlay._press_global`` 非空）：岛侧不抢档。
+
+    两条拖拽源共用一个 100ms 档；岛侧松手若直接 ``set_drag_active(False)``，会把
+    仍在进行的鱼拖拽打回 10ms 档。档位归属交给鱼侧的按-放循环。
+    """
+    bridge, island, overlay, controller = _bridge_with_fake_controller()
+    try:
+        island.show()
+        overlay._press_global = QPoint(10, 10)  # 鱼拖拽进行中
+        island._dragging = True
+        island.emit_geometry_changed()
+        island._dragging = False
+        island.emit_geometry_changed()
+        assert controller.drag_states == [], "岛侧抢占了鱼拖拽的降档档位"
+    finally:
+        overlay._press_global = None
+        bridge.close()
+        island.close()
+
+
+def test_island_without_dragging_flag_never_touches_overlay_polling():
+    """非 QWidget 岛（无 ``_dragging``）/未接 overlay：通道静默降级，不炸不改档。"""
+    controller = FakeInputController()
+    overlay = OverlayWindow()
+    overlay._input_controller = controller
+    world = SpriteCollisionWorld()
+    bridge = IslandWindowBridge(FakeIsland(), world, overlay)  # 岛无 _dragging
+    try:
+        bridge.sync_geometry()
+        assert controller.drag_states == []
+    finally:
+        bridge.close()
 
 
 # ---------------------------------------------------------------- 零 Qt 守卫

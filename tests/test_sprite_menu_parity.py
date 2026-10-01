@@ -38,6 +38,7 @@ from PySide6.QtWidgets import QApplication
 import tests.test_context_menu_lifecycle as lc
 import tests.test_overlay_window_capabilities as cap
 import tests.test_sprite_menu_facade as fac
+from pet.catalog import CANVAS_W, SCALE_STEPS
 from pet.config import Config
 from pet.context_menu import load_menu_template
 from pet.context_menus import build_legacy_menu, build_modern_menu
@@ -443,7 +444,7 @@ def test_menu_routes_legacy_service_semantics(tmp_path, monkeypatch):
         shell.proactive_watcher = type("_W", (), {
             "apply_config": lambda self: watcher_calls.append("apply")})()
         monkeypatch.setattr(shell, "trigger_golden_spin",
-                            lambda: spin_calls.append("spin"))
+                            lambda sprite=None: spin_calls.append(sprite))
         monkeypatch.setattr(shell.overlay, "reopen_context_menu",
                             lambda menu: reopened.append(menu))
 
@@ -453,9 +454,9 @@ def test_menu_routes_legacy_service_semantics(tmp_path, monkeypatch):
         _find(menu, "AI 设置").trigger()
         assert ("open_chat",) in instance.calls
         assert ("open_chat_settings",) in instance.calls
-        # 黄金回旋 → 壳的 sprite 版旋转
+        # 黄金回旋 → 壳的 sprite 版旋转（作用对象 = 被点 sprite；主宠菜单 = 主 sprite）
         _find(menu, "黄金回旋").trigger()
-        assert spin_calls == ["spin"]
+        assert spin_calls == [shell.sprite]
         # 边缘探头 → config 键（探头世界每 tick 热读）；勾选动作 = toggled
         probe = _find(menu, "边缘探头")
         probe.setChecked(True)
@@ -464,11 +465,14 @@ def test_menu_routes_legacy_service_semantics(tmp_path, monkeypatch):
         cost = _find(menu, "显示本轮消费")
         cost.setChecked(True)
         assert config.get("agent_cost_enabled") is True
-        # 大小四档 → sprite scale setter
+        # 大小四档 → sprite scale setter + 主配置（主宠菜单：作用对象 = 主 sprite）
         size = _find(menu, "大小").menu()
         target = next(a for a in size.actions() if a.text().endswith("px"))
         target.trigger()
-        assert abs(shell.sprite.scale - float(shell.sprite.scale)) < 1e-9
+        px = int(target.text()[:-2])
+        expected_scale = next(s for s in SCALE_STEPS
+                              if int(round(CANVAS_W * s)) == px)
+        assert abs(shell.sprite.scale - expected_scale) < 1e-9
         assert config.get("scale") == shell.sprite.scale
         # 主动识屏 → proactive_screen 配置 + 共享监视器 apply_config
         proactive_menu = _find(menu, "主动识屏").menu()

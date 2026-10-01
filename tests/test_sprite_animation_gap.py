@@ -105,6 +105,45 @@ def test_animation_gap_applies_after_move():
     assert c._states[sprite].gap_remaining > 0.0
 
 
+def test_gap_turn_step_never_flips_facing_by_random_roll():
+    """gap 掷中转向素材但无需纠正（中线滞回带内）→ 降级待机，朝向不变。
+
+    旧机 gap 步走 ``_play_roll``（window.py:2699-2707 + :2743-2763），注释明言
+    「朝向绝不由随机数翻转」：掷中转向但无需纠正 → 降级待机。旧实现的
+    ``_play_animation_gap_step`` 直接 ``_enter_turn`` 绕过了这道闸门，
+    turn 播完还会无条件翻 facing ⇒ 背对屏内方向随机转身。
+    """
+    lib = _make_library()
+    sprite = _make_sprite(lib)                      # 中线滞回带内：want = None
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(choices=("turn1",)))
+    c.animation_gap_seconds = 0.5
+    _enter_acts(c, sprite)
+
+    c.tick([sprite], IDLE_DURATION + 0.1)           # 进 gap → 氛围步掷中 turn1
+
+    assert c.state_of(sprite) == STATE_IDLE, "无需纠正的转向素材必须降级待机"
+    assert c.anim_of(sprite) == "idle1"
+    assert lib.clip("turn1").start_count == 0       # 转向素材根本没起播
+    assert sprite.facing == "left"                  # 朝向绝不由随机数翻转
+
+
+def test_gap_turn_step_still_corrects_facing_when_off_centre():
+    """需要纠正朝向时 gap 步照旧播转向，并由收口逻辑翻 facing（闸门不是禁播）。"""
+    lib = _make_library()
+    sprite = _make_sprite(lib, pos=(100, 400), facing="left")   # 靠左、朝外
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(choices=("turn1",)))
+    c.animation_gap_seconds = 0.5
+    _enter_acts(c, sprite)
+
+    c.tick([sprite], IDLE_DURATION + 0.1)
+
+    assert c.state_of(sprite) == STATE_TURN
+    assert c.anim_of(sprite) == "turn1"
+    assert sprite.facing == "left"                  # 播完才翻
+    _run(c, sprite, lib.duration("turn1") + 0.1)
+    assert sprite.facing == "right"
+
+
 def test_animation_gap_cancelled_by_click_and_by_zero_config():
     """点击打断 / 配置改 0：在跑的 gap 立即作废（window.py:_cancel_animation_gap）。"""
     lib = _make_library()

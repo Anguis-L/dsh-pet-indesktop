@@ -31,7 +31,9 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
 本模块刻意保持零 Qt：交互状态协议字面量（"normal"/"drag"/"thrown"）与
 pet/pet_sprite.py 的 INTERACTION_* 常量保持一致，但不 import pet_sprite
 （它依赖 PySide6）；sprite 按鸭子类型消费（pos/set_pos/velocity/set_velocity/
-rect()/interaction_state/dragging/scale），纯逻辑可脱离 QApplication 单测。
+rect()/interaction_state/dragging/scale/collision_enabled），纯逻辑可脱离
+QApplication 单测。``collision_enabled`` 缺省 True = 该 sprite 参与宠-宠碰撞
+（per-sprite 资格位，见 G4）；它不参与岛（静态成员）接触的门。
 """
 
 from __future__ import annotations
@@ -266,10 +268,16 @@ class SpriteCollisionWorld:
         self._sample_drag_velocities(sprites)
         members: List[collision.MemberState] = []
         sprite_by_id: Dict[str, object] = {}
+        # G4：宠物间总碰撞开关（per-sprite 资格位，默认 True = 老行为）。关掉的
+        # sprite 退出**宠-宠** pair；静态成员（灵动岛）接触不在此列——岛的接触由
+        # dynamic_island.collision_enabled（壳侧挂/摘岛桥）单独控制。
+        disabled_ids: set = set()
         for sprite in sprites:
             member = self._member_from_sprite(sprite)
             members.append(member)
             sprite_by_id[member.runtime_id] = sprite
+            if not getattr(sprite, "collision_enabled", True):
+                disabled_ids.add(member.runtime_id)
         for member_id, rect in self._static_members.items():
             members.append(self._static_member_state(member_id, rect))
 
@@ -285,6 +293,7 @@ class SpriteCollisionWorld:
                 impulse_cap=self.impulse_cap,
                 max_separation_iterations=self.max_separation_iterations,
                 swept_collisions=swept,
+                ignored_pairs=self._ignored_pet_pairs(disabled_ids, sprite_by_id),
             )
             self._apply_results(results, sprite_by_id)
         # 静态成员支撑落定（"落在岛上"= 落地）：不依赖 dt，只看这一 tick 的
@@ -313,7 +322,13 @@ class SpriteCollisionWorld:
     @classmethod
     def _motion_signature(cls, sprites: Sequence) -> tuple:
         """成员运动签名（静止豁免判据）：成员集合 + 位置 + 速度 + 交互态 +
-        缩放——结算读取的全部动态输入；任一变化即重新求解。"""
+        缩放 + 宠-宠碰撞资格——结算读取的全部动态输入；任一变化即重新求解。
+
+        ``collision_enabled`` 必须入签名：开关热切本身不改变位置/速度，若不入
+        签名，「全静止时切开关」会被静止豁免当成"结果不变"整 tick 跳过（旧
+        多进程层对同一件事是 ``update_policy`` 里置 membership_dirty + 清求解
+        历史，见 collision_ipc._clear_solver_history）。
+        """
         items = []
         for sprite in sprites:
             pos = getattr(sprite, "pos", None)
@@ -325,6 +340,7 @@ class SpriteCollisionWorld:
                 getattr(sprite, "interaction_state", None),
                 cls._is_dragging(sprite),
                 float(getattr(sprite, "scale", 0.0) or 0.0),
+                bool(getattr(sprite, "collision_enabled", True)),
             ))
         return tuple(items)
 
@@ -477,6 +493,33 @@ class SpriteCollisionWorld:
                 if hit[0]:
                     swept[f"{a.runtime_id}|{b.runtime_id}"] = hit
         return swept
+
+    def _ignored_pet_pairs(self, disabled_ids: set,
+                           sprite_by_id: Dict[str, object]) -> "set | None":
+        """关掉宠物间碰撞的 sprite 参与的 **宠-宠** pair 键集合（静态成员不在内）。
+
+        复用 ``collision.solve_multi_body_collision`` 既有的 ``ignored_pairs`` 参数
+        （旧多进程层同一件事靠成员 ``FLAG_COLLISION_ENABLED`` 的 pair 过滤；
+        进程内世界改成世界侧显式点名 pair，不改纯数学层）。pair 键口径必须与
+        求解器内部一致：按 runtime_id 字符串序拼接（求解器先 sort 再取键）。
+
+        成本：没有 sprite 被关时返回 ``None``——不构造 pair 表，求解器侧
+        ``if ignored_pairs and ...`` 直接短路（``tick`` 仍会传一个空 ``set``，
+        属顺手分配，不做微优化）。有被关的 sprite 时 O(被关数 × 成员数) 建表，
+        与求解器自身的 pair 枚举同阶、O(1) 每 pair，不引入 I/O / 线程 / 定时器；
+        静态成员（灵动岛）接触完全不进这张表。
+        """
+        if not disabled_ids:
+            return None
+        others = [mid for mid in sprite_by_id if mid not in self._static_members]
+        ignored: set = set()
+        for disabled in disabled_ids:
+            for other in others:
+                if other == disabled:
+                    continue
+                ignored.add(f"{disabled}|{other}" if disabled < other
+                            else f"{other}|{disabled}")
+        return ignored
 
     # ---------------------------------------------------------------- 内部：结果写回
     def _apply_results(self, results: Sequence[collision.ImpulseResult],

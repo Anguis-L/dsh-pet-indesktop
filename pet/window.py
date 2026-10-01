@@ -88,7 +88,7 @@ from .animation_thumbnail import decode_representative_frame
 from .speech_bubble import PetSpeechBubble, list_self_talk_images
 from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
 from .context_menu import normalize_template_id, populate_context_menu as _populate_context_menu
-from .context_menus.shared import take_deferred_menu_callbacks
+from .context_menus.shared import release_menu_tree, take_deferred_menu_callbacks
 from . import physics as physics_mod
 from .click_sound import (
     choose_sound, play_sound, resolve_click_sound_candidates, resolve_click_sound_pair,
@@ -3632,40 +3632,9 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
                     return
 
             menu.destroyed.connect(schedule_after_menu_destroyed)
-        # 菜单使用完毕即释放整棵菜单树：QMenu 以长命窗口为 parent，
-        # 不删除会随每次右键累积（子菜单/动作/线程池/图标 pixmap）。
-        # 先清掉尚未启动的解码任务，避免 QThreadPool 析构时在 GUI 线程
-        # 等待运行中的 worker。
-        pools = []
-        for submenu in menu.findChildren(QMenu):
-            pool = getattr(submenu, "_animation_icon_pool", None)
-            if pool is not None:
-                pool.clear()
-                pools.append(pool)
-
-        def delete_when_idle(_attempts: int = 0) -> None:
-            """非阻塞等待图标解码 worker 结束后再释放菜单树。
-
-            直接 pool.waitForDone(3000) 会阻塞 GUI 线程最多 3 秒，可能造成
-            右键菜单关闭时卡顿/假死；这里每 50ms 轮询一次，不阻塞事件循环。
-            总上限 3s（60×50ms）：解码 worker 病态不结束时也强制释放，
-            否则菜单树会永久滞留、deferred 回调永不派发（审查 DS-L16）。
-            """
-            if _attempts >= 60:
-                menu.deleteLater()
-                return
-            if any(not pool.waitForDone(0) for pool in pools):
-                # 绑定 menu 为 context：窗口/菜单在轮询途中销毁时定时器随
-                # context 失效被丢弃，否则回调会对已删 C++ 对象 deleteLater
-                #（GUI 线程 RuntimeError）。
-                QTimer.singleShot(50, menu, lambda: delete_when_idle(_attempts + 1))
-                return
-            menu.deleteLater()
-
-        if pools:
-            delete_when_idle()
-        else:
-            menu.deleteLater()
+        # 菜单使用完毕即释放整棵菜单树（overlay 路径共用同一收口，见
+        # context_menus.shared.release_menu_tree）
+        release_menu_tree(menu)
 
     def reopen_context_menu(self, menu: QMenu) -> None:
         """Close the old template and immediately show the newly selected one."""

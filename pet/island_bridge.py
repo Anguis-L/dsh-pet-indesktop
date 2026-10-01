@@ -11,10 +11,17 @@
    登记（``SpriteCollisionWorld.add_static_member``）。坐标 = 岛全局几何 -
    overlay 全局原点（碰撞世界是 overlay 局部坐标，M-3「每屏逻辑坐标」口径）。
 2. **更新**：岛几何/显隐变化 → 重登记或注销（岛隐藏不留幽灵墙）。
-3. **反馈**：碰撞 listener 识别 pair 含岛成员且 ``j >= world.static_hit_min_dv``
-   → bump 回调 ``(min(3.0, j / 400.0), dir_x, dir_y)``（口径同旧架构
-   ``island_collision._apply_feedback``：strength 封顶 3、dir = 岛被顶的方向）
-   + 可选音效 hook。进程内直连，旧架构「远端墙无信号」死结天然消失。
+3. **反馈**：碰撞 listener 识别 pair 含岛成员且冲量 ``j`` 达到世界侧 dv 门的
+   冲量等价（``j > world.static_hit_min_dv × 成员质量下界``，见
+   ``_impulse_floor``）→ bump 回调 ``(min(3.0, j / 400.0), dir_x, dir_y)``（口径同
+   旧架构 ``island_collision._apply_feedback``：strength 封顶 3、dir = 岛被顶的方向）。
+   **撞击音效不在这里派发**：同一个 ``SpriteSoundPlayer`` 由壳注册在世界侧
+   （``overlay_shell._build`` 的 ``collision.add_collision_listener``），世界扇出
+   已覆盖岛击事件，桥内再调一次 = 每个岛击两遍 ``on_collision``（``sound=`` 入参
+   因此只保留调用点兼容）。另有可选 ``kinetic`` 回调：岛在动时同步唤醒 tick 档位
+   （M-1，见 ``_notify_kinetic``），与可选 ``drag_state`` 回调：岛侧拖拽状态翻转时
+   转达给壳（overlay 穿透轮询降档，与拖鱼同款，见 ``_notify_drag_state``）。
+   进程内直连，旧架构「远端墙无信号」死结天然消失。
 
 产品化增强（demo 版没有）
 ----------------------
@@ -81,6 +88,11 @@ _MOTION_JUMP_SPEED = 3000.0
 _MOTION_MIN_STEP = 1.0
 _MAX_ISLAND_SPEED = 1500.0
 
+# 碰撞世界成员质量下界（px/s 换算用）：直接向 collision.calculate_mass 要下钳值
+# （scale→0 时返回它的钳制下界 0.5），质量区间调整时桥侧的冲量门自动跟随，
+# 不复制魔数。见 _impulse_floor。
+_MIN_MEMBER_MASS = collision.calculate_mass(0.0, 0.0, scale=0.0)
+
 
 def _validated_geometry(left, top, width, height):
     """几何校验：返回 ``(l, t, w, h)`` 或 ``None``（不可注册）。
@@ -125,11 +137,24 @@ class IslandCollisionBridge:
     """
 
     def __init__(self, *, bump=None, sound=None, member_id: str | None = None,
-                 island=None, clock=None) -> None:
+                 island=None, clock=None, kinetic=None, drag_state=None) -> None:
         # bump 反馈挂点：callable(strength, dir_x, dir_y)；异常静默降级
         self._bump = bump
-        # 音效 hook：对象需有 on_collision(event)（如 sprite_sound.SpriteSoundPlayer）
+        # 音效入参保留**只为调用点兼容**（``overlay_shell.attach_island`` 仍传
+        # ``sound=self._sound``）：本桥不再自行派发撞击音效——同一个
+        # ``SpriteSoundPlayer`` 已由壳注册在世界侧（``overlay_shell._build`` 的
+        # ``collision.add_collision_listener(self._sound.on_collision)``），世界
+        # 扇出必然覆盖岛击事件；桥内再调一次 = 每个岛击事件两遍 ``on_collision``
+        # （精灵解析/配置读取做两遍，跨过 80ms 节流窗口就是双响）。
         self._sound = sound
+        # kinetic 挂点：callable()，岛在动时同步唤醒 tick 档位（M-1 的
+        # ``TickDriver.note_kinetic``）；异常静默降级。
+        self._kinetic = kinetic
+        # drag_state 挂点：callable(dragging)，岛侧拖拽状态**翻转**时调用——壳把
+        # 它接到 overlay 的逐像素穿透轮询上，与拖鱼同款降到 100ms 档；异常静默降级。
+        self._drag_state = drag_state
+        # 已转达给外部的拖拽状态（去重；False = 当前没占着降频档，不回发 False）
+        self._drag_reported = False
         self._member_id = str(member_id or collision.ISLAND_MEMBER_ID)
         # 岛对象（可空，鸭子类型）：岛速守卫读它的 ``_geo_to``（几何动画中）与
         # ``_dragging``（拖拽中）。直接喂几何的非 QWidget 岛可不传（视为
@@ -147,6 +172,10 @@ class IslandCollisionBridge:
         self._last_center: tuple[float, float] | None = None
         self._last_motion_ts = 0.0
         self._last_size: tuple[float, float] | None = None
+        # 上一次观测到的岛侧拖拽状态（True/False/None=岛没这个属性）：用来识别
+        # 「拖拽 → 松手」这一状态切换（见 _update_motion 的松手闸）。不随
+        # reset_motion 清空——它是对岛的观测，不是采样基线。
+        self._last_dragging: bool | None = None
         self._vx = 0.0
         self._vy = 0.0
         self.bumps = 0
@@ -192,6 +221,9 @@ class IslandCollisionBridge:
         """摘下监听器与静态成员（幂等，零残留）；几何/可见性状态保留。"""
         world, self._world = self._world, None
         self._applied = None
+        # 拖拽中断路径：摘线（岛重建/退出收口）时交回穿透轮询档位，否则 overlay
+        # 会永久停在 100ms 档（岛不再发几何回调，桥侧无从纠正）
+        self._notify_drag_state(False)
         self.reset_motion()  # 摘线后重挂从静止起步，不把旧岛速带进新世界
         if world is None:
             return
@@ -228,6 +260,9 @@ class IslandCollisionBridge:
         """岛显隐：隐藏 → 撤墙（不留幽灵墙），显示 → 按最近几何复墙。"""
         self._visible = bool(visible)
         if not self._visible:
+            # 拖拽中断路径：拖拽中隐藏（托盘隐藏/全屏避让/换屏重建）后岛不再发
+            # 几何回调 → 必须在这里交回穿透轮询档位
+            self._notify_drag_state(False)
             self.reset_motion()  # 隐藏期间不残留墙速，复墙从静止起步
         self._sync()
 
@@ -268,6 +303,19 @@ class IslandCollisionBridge:
         self._last_motion_ts = 0.0
         self._last_size = None
 
+    def _island_drag_state(self) -> bool | None:
+        """岛侧自报的拖拽状态：True 拖拽中 / False 已松手 / None 无从判断。
+
+        读 ``DynamicIsland._dragging``（``mousePressEvent`` 置 False、
+        ``mouseMoveEvent`` 起手后置 True、``mouseReleaseEvent`` 在发几何回调
+        **之前**置回 False）。岛对象没有这个属性时返回 None（非 QWidget 岛、
+        直接喂几何的假对象）——调用方据此退回纯几何判据，不因缺属性误判。
+        """
+        dragging = getattr(self._island, "_dragging", None)
+        if dragging is None:
+            return None
+        return bool(dragging)
+
     def _update_motion(self, rect: tuple[float, float, float, float]) -> None:
         """从相邻两次几何采样估计岛速（口径对齐 island_collision._update_motion）。
 
@@ -277,12 +325,31 @@ class IslandCollisionBridge:
            峰值约 2600px/s，会把旁边静止的鱼凭空拍飞；
         ② 尺寸变化（展开/收起卡片、停靠切换、文本变长）只重置采样点不估计；
         ③ dt<0.01s 的过密样本"跳过"而不是清零——拖拽几何回调可达 100Hz+，
-           清零刷新采样点会让拖拽全程岛速恒 0（实机教训）；
+           清零刷新采样点会让拖拽全程岛速恒 0（实机教训）；其中「同 rect」样本
+           只在岛没在拖拽时才当停速（拖拽中的同 rect = 同一次 move 的重复上报，
+           见 ``_island_drag_state``）；
+        ③′ 松手闸：「拖拽 → 松手」是状态切换而不是「岛在动」，该拍位移（夹回
+           屏幕/落位）清零 **并作废采样基线**——否则后面第一份非拖拽几何上报会
+           拿拖拽期的旧采样点算出「跨松手的过期位移 / 间隔」当岛速（幽灵撞击）；
+           常态非拖拽运动（自动动画、落位、设置改位）不归这条管，语义不变；
         ④ 瞬移跳变守卫：位移超过"极速×间隔 + 岛宽"即视为瞬移，清零重置；
         ⑤ 仅拖拽中允许把超速钳到 ``_MAX_ISLAND_SPEED``；非拖拽的极速位移
            必是瞬移/尺寸变化残留，清零重置。
         """
+        # 岛侧拖拽状态先记账（任何早退分支都不许漏记，否则识别不出松手切换）；
+        # 同时把状态翻转转达给外部（overlay 穿透轮询降档，见 _notify_drag_state）
+        dragging = self._island_drag_state()
+        released = dragging is False and self._last_dragging is True
+        if dragging is not None:
+            self._last_dragging = dragging
+            self._notify_drag_state(dragging)
         if getattr(self._island, "_geo_to", None) is not None:
+            self.reset_motion()
+            return
+        if released:
+            # 松手闸（状态切换）：拖拽结束后的第一拍位移是岛侧夹回屏幕/落位，
+            # 不是用户拖动 → 清零 + 作废采样基线（v 也归零），避免过期延迟把
+            # 这段位移算成岛速。
             self.reset_motion()
             return
         left, top, w, h = rect
@@ -299,12 +366,20 @@ class IslandCollisionBridge:
             dt = now - self._last_motion_ts
             dx, dy = cx - self._last_center[0], cy - self._last_center[1]
             jump = math.hypot(dx, dy)
+            if jump >= _MOTION_MIN_STEP:
+                # 「岛在动」：相邻两次采样之间真的位移了（死区内外的样本都算，
+                # 只看位移不看是否估出速度）→ 同步唤醒 tick 档位。桌宠静止时
+                # tick 已降到 T2/T3（不跑仿真），岛拖拽是几何回调驱动的用户
+                # 输入、不经过 overlay 的鼠标事件，没有这条通道甩岛过鱼会整个
+                # 手势期间不结算（见 _notify_kinetic）。
+                self._notify_kinetic()
             if dt < _MOTION_MIN_DT:
-                # 高频回调样本太密：不刷新采样点。但「同 rect」样本（岛没动）
-                # 必须顺手清零——松手样本落进死区时旧速度会残留，静止的岛
-                # 会把贴上来的桌宠拍进 THROWN（幽灵速度，世界侧时效是兜底，
-                # 这里尽早纠正）。真实拖拽的密集样本位移 ≥ MIN_STEP，不受影响。
-                if jump < _MOTION_MIN_STEP:
+                # 高频回调样本太密：不刷新采样点。同 rect（岛没动）是否清零看岛
+                # 侧拖拽状态——拖拽中它是同一次 move 经 ``move()`` 的 Move 事件与
+                # ``_emit_geometry_changed()`` 的重复上报，清零会让拖拽全程岛速
+                # 恒 0、撞击 j=0 无反馈（用户反馈「拖岛快速撞鱼没反馈」的根因）；
+                # 非拖拽 / 取不到拖拽状态（非 QWidget 岛）时沿用既有判据。
+                if jump < _MOTION_MIN_STEP and dragging is not True:
                     self._vx = self._vy = 0.0
                 return
             if jump > _MOTION_JUMP_SPEED * dt + w:
@@ -332,9 +407,28 @@ class IslandCollisionBridge:
         self._last_center = (cx, cy)
         self._last_motion_ts = now
 
+    def _notify_drag_state(self, dragging: bool) -> None:
+        """岛侧拖拽状态**翻转** → 外部（overlay 逐像素穿透轮询降档）。
+
+        只在翻转时转达：拖拽中的几何回调可达 100Hz+（一次 ``mouseMoveEvent`` 经
+        ``move()`` 的 Move 事件与随后的显式几何回调喂桥两遍），每个样本都转达
+        等于每个样本重设一次轮询间隔。未置起过降频档时不回发 False（无从复位）。
+        先记账再回调：回调抛异常不重发，与 bump/kinetic 挂点同纪律。
+        """
+        if dragging == self._drag_reported:
+            return
+        self._drag_reported = dragging
+        callback = self._drag_state
+        if not callable(callback):
+            return
+        try:
+            callback(dragging)
+        except Exception:
+            logger.debug("island_bridge: 岛拖拽状态转达失败", exc_info=True)
+
     # ---------------------------------------------------------------- 撞击反馈
     def _hit_floor(self) -> float:
-        """真撞击阈值 = 世界的静态成员放宽阈值（对齐 demo/旧架构）。"""
+        """世界侧真撞击门（dv，px/s）= 静态成员放宽阈值（对齐 demo/旧架构）。"""
         world = self._world
         value = getattr(world, "static_hit_min_dv", STATIC_HIT_MIN_DV)
         try:
@@ -342,18 +436,39 @@ class IslandCollisionBridge:
         except (TypeError, ValueError):
             return float(STATIC_HIT_MIN_DV)
 
-    def on_collision(self, event) -> None:
-        """碰撞 listener：pair 含岛且冲量达阈值 → bump 回调 + 音效 hook。
+    def _impulse_floor(self) -> float:
+        """桥侧冲量门 = 世界侧 dv 门 × 成员质量下界（见 ``_MIN_MEMBER_MASS``）。
 
-        未挂接（detach 后）直接返回：摘下的桥不再对外发反馈。
+        世界判真撞击用的是 **dv**（相对法向速度，``sprite_collision`` 的
+        ``static_hit_min_dv``），而 ``CollisionEvent`` 只带冲量 ``j``——
+        两者的换算是 ``j = dv × mass``（``collision.solve_collision_impulse``：
+        岛无限质量时 ``jn = -(1+e)·vn / (1/m_鱼)``，故 ``dv = j / m_鱼``）。
+        拿 j 直接比 dv 门（本桥旧写法）等于把门按质量放大：轻量小鱼
+        （``collision.calculate_mass`` 的下钳 0.5）的岛击 j = dv×0.5 会被吞掉
+        （世界已按 dv 放行、事件都发了，桥却不反馈：无 bump、无音效）。
+
+        用质量**下界**换算 ⟹ 世界放行的任何事件都不会在桥侧被二次吞掉；
+        取严格不等是因为 ``j = 30`` 恰好是「最轻成员恰好踩在 dv 门上」的冲量，
+        边界由世界侧的 ``>=`` 独占判定。
+        """
+        return self._hit_floor() * _MIN_MEMBER_MASS
+
+    def on_collision(self, event) -> None:
+        """碰撞 listener：pair 含岛且冲量过门 → bump 回调。
+
+        未挂接（detach 后）直接返回：摘下的桥不再对外发反馈。门见
+        ``_impulse_floor``（与世界侧 dv 门同口径，不用冲量直接比 dv）。
+        音效**不在这里派发**：同一个 ``SpriteSoundPlayer`` 由壳注册在世界侧
+        （``overlay_shell._build``），世界扇出覆盖本入口收到的每个事件；桥内
+        再调一次就是每个岛击两遍 ``on_collision``（见 ``__init__`` 的音效入参）。
         """
         if self._world is None:
             return
         if self._member_id not in (event.a, event.b):
             return
         j = float(getattr(event, "j", 0.0) or 0.0)
-        if j < self._hit_floor():
-            return  # 轻触不反馈（音效/形变纪律同现架构）
+        if j <= self._impulse_floor():
+            return  # 轻触不反馈（形变纪律同现架构）
         # 岛被顶的方向 = 从对方指向岛（island_collision 从对方 dv 取反的口径
         # 在进程内等价于碰撞法线方向）
         if event.b == self._member_id:
@@ -361,11 +476,22 @@ class IslandCollisionBridge:
         else:
             dir_x, dir_y = -event.nx, -event.ny
         self._fire_bump(j, float(dir_x), float(dir_y))
-        if self._sound is not None:
-            try:
-                self._sound.on_collision(event)
-            except Exception:
-                logger.debug("island_bridge: 撞击音效失败", exc_info=True)
+
+    def _notify_kinetic(self) -> None:
+        """岛在动 → 同步唤醒 tick 档位（M-1 的 ``TickDriver.note_kinetic``）。
+
+        桌宠静止时 tick 会降到 T2（250ms 心跳）甚至 T3（不跑仿真）；岛拖拽是
+        几何回调驱动的用户输入，不经过 overlay 的鼠标事件（岛是独立顶层窗），
+        没有这条通道，拖岛撞鱼可能整个手势期间一次碰撞结算都没发生。异常静默
+        降级（岛本体功能不受影响），与音效/bump 挂点同纪律。
+        """
+        callback = self._kinetic
+        if not callable(callback):
+            return
+        try:
+            callback()
+        except Exception:
+            logger.debug("island_bridge: tick 档位唤醒失败", exc_info=True)
 
     def _fire_bump(self, j: float, dir_x: float, dir_y: float) -> None:
         callback = self._bump
@@ -409,6 +535,10 @@ class IslandWindowBridge:
     overlay 原点换算成本地几何喂核心桥。``world`` 给了就 ``attach``（默认
     bump = ``island.bump``）；``overlay`` 给了就以其 ``geometry().topLeft()``
     为原点（``overlay=None`` 时原点为 (0,0)，岛几何即局部几何）。
+    ``kinetic`` 透传核心桥：岛在动时唤醒 tick 档位（M-1，壳层传
+    ``driver.note_kinetic``）。岛侧拖拽状态同样透传（``drag_state`` 口）：
+    壳层给了 overlay 时，桥把拖拽翻转接到它的逐像素穿透轮询上，与拖鱼同款降档
+    （见 ``_sync_island_drag``）。
 
     本类本身不是 QObject：Qt 只出现在惰性事件过滤器里（见
     ``_build_island_event_filter``），岛按鸭子类型消费（geometry/isVisible/
@@ -416,15 +546,20 @@ class IslandWindowBridge:
     """
 
     def __init__(self, island, world=None, overlay=None, *, sound=None,
-                 bump=None, member_id: str | None = None, clock=None) -> None:
+                 bump=None, member_id: str | None = None, clock=None,
+                 kinetic=None) -> None:
         self._island = island
+        # overlay 引用：几何原点来源 + 拖拽期穿透轮询降档的落点（见
+        # _sync_island_drag）。None 时降档通道静默降级。
+        self._overlay = overlay
         origin = overlay.geometry().topLeft() if overlay is not None else None
         self._origin = (float(origin.x()), float(origin.y())) if origin is not None else (0.0, 0.0)
         self._filter = None
         self._filter_installed = False
         self._core = IslandCollisionBridge(
             bump=bump if bump is not None else self._bump_island,
-            sound=sound, member_id=member_id, island=island, clock=clock)
+            sound=sound, member_id=member_id, island=island, clock=clock,
+            kinetic=kinetic, drag_state=self._sync_island_drag)
         self._wire_island()
         if world is not None:
             self.attach(world)
@@ -462,6 +597,29 @@ class IslandWindowBridge:
     # ---------------------------------------------------------------- 接线
     def _bump_island(self, strength: float, dir_x: float, dir_y: float) -> None:
         self._island.bump(strength, dir_x, dir_y)
+
+    def _sync_island_drag(self, dragging: bool) -> None:
+        """岛侧拖拽状态 → overlay 逐像素穿透轮询降档（与拖鱼同款 100ms 档）。
+
+        岛是独立顶层窗，overlay 收不到它的鼠标事件（``_press_global`` 恒 None）：
+        不喂这条通道，拖岛全程 overlay 保持 10ms 全量逐像素判定，而拖鱼早已降到
+        100ms（``WindowsPerPixelInputController.set_drag_active``）。
+
+        鱼拖拽正在进行（``overlay._press_global`` 非空）时不抢档：两条拖拽源共用
+        一个轮询档位，岛侧松手若直接 ``set_drag_active(False)`` 会把仍在拖拽的鱼
+        打回 10ms 档——档位归属交给鱼侧自己的按-放循环。异常静默降级（岛/桌宠
+        功能不受影响），与 bump/kinetic 挂点同纪律。
+        """
+        overlay = self._overlay
+        controller = getattr(overlay, "_input_controller", None)
+        if controller is None:
+            return  # 无 overlay / 非 Windows / 宿主未建控制器：通道静默降级
+        if getattr(overlay, "_press_global", None) is not None:
+            return
+        try:
+            controller.set_drag_active(bool(dragging))
+        except Exception:
+            logger.debug("island_bridge: 岛拖拽降档同步失败", exc_info=True)
 
     def _wire_island(self) -> None:
         """挂岛的几何回调 + 事件过滤器（幂等；异常静默降级）。"""

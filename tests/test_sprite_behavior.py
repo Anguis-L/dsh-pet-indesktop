@@ -746,6 +746,40 @@ def test_anim_of_reports_bound_clip_without_changing_click_contract():
     assert c.anim_of(sprite) == "click1"      # 点击 clip 已绑定
 
 
+def test_play_once_rejects_name_outside_library():
+    """``play_once`` 入口守卫（旧 window.py:1624-1629）：动画名不在素材库
+    → 直接失败，绝不置 ACTS。
+
+    缺这道守卫时 ``library.movie()`` 抛的 KeyError 虽被壳吞掉，但
+    ``st.state/st.anim`` 已置为 ACTS+陌生名 ⇒ 一次可长达 0.5s 的「假 ACTS」，
+    期间的 agent 联动回待机请求被 ``_link_anim_busy()`` 挡住。
+    """
+
+    class NamedLibrary(FakeLibrary):
+        manifest = None
+        folder_map = None
+        folder_files = None
+
+        def names(self):
+            return ["idle1", "turn1", "walk", "click1"]
+
+    lib = NamedLibrary(idles=[], turns=[], moves=[], clicks=[], frames={})
+    for name in lib.names():
+        lib._clips[name] = FakeClip(name, 24)
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng())
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+    assert c.state_of(sprite) == STATE_IDLE
+
+    assert c.play_once(sprite, "悠闲哼歌") is False   # 不在库名单
+    assert c.state_of(sprite) == STATE_IDLE           # 绝不置 ACTS
+    assert c.anim_of(sprite) == "idle1"               # 当前绑定不动
+
+    assert c.play_once(sprite, "walk") is True        # 库内名照常
+    assert c.state_of(sprite) == STATE_ACTS
+
+
 # ---------------------------------------------------------------- 边界
 def test_move_targets_stay_inside_bounds():
     # 随机长跑：真实 random 播种，任何时刻 sprite 矩形不得出活动边界

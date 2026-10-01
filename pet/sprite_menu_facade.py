@@ -17,14 +17,14 @@ OverlayShell + 被点 sprite + 行为控制器，使**两套建造器原样复�
 
 路由表（legacy 窗侧面 → overlay 落点，逐项等价说明见各方法 docstring）：
 
-    cfg/scale/change_scale/playback_speed/set_playback_speed  → 壳 config + 主 sprite
+    cfg/scale/change_scale/playback_speed/set_playback_speed  → 被点 sprite + 各自那份 config
     on_open_chat / on_open_chat_settings                      → PetInstance.open_chat*
     on_open_modern_settings                                   → OverlayShell.open_settings_for
     on_show_balance / on_check_update / on_open_todo_panel /
     on_voice_chime_* / on_festival_*                          → AppShell（进程级服务）
     toggle_agent_link / set_agent_link_option                 → agent_link_manager（共享 manager）
     toggle_proactive_enabled / set_proactive_option           → proactive_watcher（共享监视器）
-    trigger_golden_spin / look_at_screen / rename_character   → 壳的 sprite 等价实现
+    trigger_golden_spin / look_at_screen / rename_character   → 壳的 sprite 等价实现（作用被点 sprite）
     install_music_lyric / _music_lyric                        → 壳的音乐（歌词）宿主
     set_edge_probe_enabled                                    → config（探头世界每 tick 热读）
     set_context_menu_template / reopen_context_menu           → config + 菜单原位重开
@@ -32,6 +32,13 @@ OverlayShell + 被点 sprite + 行为控制器，使**两套建造器原样复�
 4.2c D13：菜单作用对象 = 右键命中的那一只（``sprite`` 参数）。设置入口按它
 自己的 config 身份传 ``--instance``（子肥鱼 = slot-N），「退出这只」直接接
 ``OverlayShell.exit_pet(sprite)``——主宠退出时由壳负责提升列表首只子宠。
+
+批 B2：作用对象口径对齐旧版一窗一宠（菜单以 ``pet=self`` 建造，每条都作用
+本窗那一只）——读（勾选态/素材清单）与写（动画/速率/大小/拖动物理/回角落/
+黄金回旋/隐藏/看屏幕）一律取 ``self.sprite``，不再混用 ``self._shell.sprite``。
+批 B7b：逐只设置的持久化与读取都按该 sprite 自己的配置走——``cfg`` 是它的
+配置视图（子宠 = ``config-slot-N.json``，缺键回退主配置），``_persist_sprite_setting``
+写它自己的那份（主宠仍写主配置），「切换角色」也只切被点的那一只。
 """
 from __future__ import annotations
 
@@ -99,9 +106,43 @@ class SpriteMenuFacade:
     def _hosts(self) -> tuple:
         return (self._app_shell, self._instance, self._shell)
 
+    @property
+    def _is_main_sprite(self) -> bool:
+        """菜单作用对象是否主宠（决定逐只设置写不写主配置）。"""
+        return self.sprite is self._shell.sprite
+
+    def _persist_sprite_setting(self, key: str, value) -> None:
+        """逐只设置的持久化口径（旧"写本窗自己那份 config"）。
+
+        主宠 → 主配置（``Config.set`` + ``save``）；子宠 → 它自己的
+        ``config-slot-N.json``（B7b：``OverlayShell.persist_sprite_setting`` 原子写
+        单键，**绝不碰主配置**——此前子宠只改运行态、重启即丢，或误写主配置把主宠
+        的尺寸/速率/物理改脏，见审计 C1/C2）。
+        """
+        persist = getattr(self._shell, "persist_sprite_setting", None)
+        if callable(persist):
+            persist(self.sprite, key, value)
+            return
+        # 兜底（旧壳/测试替身无该面）：只主宠写主配置，子宠静默不落盘。
+        if self._is_main_sprite:
+            self.cfg.set(key, value)
+            self._save()
+
     # ---------------------------------------------------------------- 基础属性
     @property
     def cfg(self):
+        """本次菜单作用对象那份配置（主宠 = 主配置；子宠 = 它自己的 slot 视图）。
+
+        旧架构一窗一宠，菜单读的 ``pet.cfg`` 就是本窗那份配置——"切换角色"的勾选态
+        也因此读的是被点那只的角色（B7b）。窗口级/进程级键在视图里原样转发主配置，
+        全局条目（模板/联动/识屏）的读写口径不变。
+        """
+        provider = getattr(self._shell, "_sprite_config", None)
+        if callable(provider):
+            try:
+                return provider(self.sprite)
+            except Exception:
+                log.debug("overlay: 取 sprite 配置视图失败", exc_info=True)
         return self._shell._config
 
     @property
@@ -208,7 +249,7 @@ class SpriteMenuFacade:
 
     # ---------------------------------------------------------------- 素材清单（动画分类建造器）
     def _cats(self) -> dict:
-        return self._shell.behavior._categories(self._shell.sprite.library)
+        return self._shell.behavior._categories(self.sprite.library)
 
     @property
     def idles(self) -> list:
@@ -278,33 +319,52 @@ class SpriteMenuFacade:
 
     @property
     def on_look_screen(self):
-        """「看看屏幕」：``OverlayShell.look_at_screen``（PetWindow.look_at_screen
-        的 sprite 等价物，同样只在聊天可用时注入）。"""
+        """「看看屏幕」：``OverlayShell.look_at_screen(sprite)``（PetWindow.look_at_screen
+        的 sprite 等价物，同样只在聊天可用时注入）。
+
+        闭包绑定本次菜单的作用对象：答复气泡归被点的那一只（旧版一窗一宠天然
+        如此），不绑就等于右击子肥鱼却让主肥鱼答话。
+        """
         if not self._chat_enabled():
             return None
         fn = getattr(self._shell, "look_at_screen", None)
-        return fn if callable(fn) else None
+        if not callable(fn):
+            return None
+        sprite = self.sprite
+        return lambda: fn(sprite)
 
     # ---------------------------------------------------------------- 进程级服务（AppShell）
     @property
     def on_show_balance(self):
         """「DeepSeek 余额」：``AppShell.show_balance``（app._wire_window 注入的
-        同一个方法）；父窗口用 overlay 窗，等价 PetWindow 传自身。"""
+        同一个方法）；父窗传**壳**——与 overlay 点击路径（``overlay_shell:1225``
+        的 ``handler(self)``）同口径，壳具备 ``cfg`` / ``show_bubble`` /
+        ``request_link_anim`` 全套宿主面。传 ``shell.overlay``（OverlayWindow）
+        会让 ``_show_balance_payload`` 在 ``win.show_bubble`` 上 AttributeError。
+        """
         if not self._chat_enabled():
             return None
         fn = _first_callable(self._hosts(), ("show_balance",))
         if fn is None:
             return None
-        return lambda *_ignored: fn(getattr(self._shell, "overlay", None))
+        shell = self._shell
+        return lambda *_ignored: fn(shell)
 
     @property
     def on_check_update(self):
         """「检查更新」：``AppShell.check_update``（窗口版是 ``_slot_wrap`` 包装，
-        这里壳本身即唯一窗，无需槽位前缀）。"""
+        这里壳本身即唯一窗，无需槽位前缀）。
+
+        父窗同 ``on_show_balance`` 传壳：传 OverlayWindow 会在
+        ``target.show_bubble`` 抛 AttributeError——而那句在
+        ``self._update_checking = True`` 之后、复位 connect 之前，异常会让
+        本次会话永久不再检查更新。
+        """
         fn = _first_callable(self._hosts(), ("check_update",))
         if fn is None:
             return None
-        return lambda *_ignored: fn(getattr(self._shell, "overlay", None))
+        shell = self._shell
+        return lambda *_ignored: fn(shell)
 
     @property
     def on_open_todo_panel(self):
@@ -328,32 +388,37 @@ class SpriteMenuFacade:
 
     # ---------------------------------------------------------------- 动画/速率
     def switch_clip(self, name: str) -> None:
-        """播放指定动画（一次性，播完回掷骰链——window.py switch_clip 语义）。"""
-        self._shell.behavior.play_once(self._shell.sprite, name)
+        """播放指定动画（一次性，播完回掷骰链——window.py switch_clip 语义）。
+
+        作用对象 = 被点的那一只（旧版一窗一宠 ``self`` 的等价物）。
+        """
+        self._shell.behavior.play_once(self.sprite, name)
 
     def trigger_move(self, name: str) -> bool:
         """以指定移动素材触发一次移动（window.py trigger_move 语义）。"""
-        return self._shell.behavior.play_move_once(self._shell.sprite, name)
+        return self._shell.behavior.play_move_once(self.sprite, name)
 
     def set_playback_speed(self, value: float) -> None:
-        self._shell.sprite.playback_speed = float(value)
-        clip = getattr(self._shell.sprite, "_clip", None)
+        sprite = self.sprite
+        sprite.playback_speed = float(value)
+        clip = getattr(sprite, "_clip", None)
         setter = getattr(clip, "set_playback_speed", None)
         if callable(setter):
             setter(float(value))
-        self.cfg.set("playback_speed", float(value))
-        self._save()
+        self._persist_sprite_setting("playback_speed", float(value))
 
     # ---------------------------------------------------------------- 窗口能力
     def change_scale(self, scale: float) -> None:
-        self._shell.sprite.scale = float(scale)
-        self.cfg.set("scale", float(scale))
-        self._save()
+        self.sprite.scale = float(scale)
+        self._persist_sprite_setting("scale", float(scale))
+        # 可见气泡随新缩放重排（旧 window.py:1000-1004 bubble.reflow）
+        hook = getattr(self._shell, "on_sprite_scale_changed", None)
+        if callable(hook):
+            hook(self.sprite)
 
     def set_drag_physics(self, on: bool) -> None:
-        self._shell.sprite.drag_physics = bool(on)
-        self.cfg.set("drag_physics", bool(on))
-        self._save()
+        self.sprite.drag_physics = bool(on)
+        self._persist_sprite_setting("drag_physics", bool(on))
 
     def set_no_move(self, on: bool) -> None:
         self._shell.behavior.no_move = bool(on)
@@ -368,19 +433,33 @@ class SpriteMenuFacade:
 
     def go_default_corner(self) -> None:
         shell = self._shell
-        shell.sprite.set_pos(shell._default_corner_pos(
-            shell._bounds, shell.sprite.rect()))
+        sprite = self.sprite
+        sprite.set_pos(shell._default_corner_pos(shell._bounds, sprite.rect()))
 
     def hide(self) -> None:
-        self._shell.set_pet_visible(False)
+        """「隐藏桌宠」：只隐藏被点的那一只（旧版一窗一宠 = 隐藏本窗）。
+
+        子宠走逐只显隐（``set_sprite_visible``，托盘逐只菜单「显示这只」可恢复，
+        且其它宠不受影响）。主宠保持整窗语义（``set_pet_visible``）：主宠即宿主
+        合成窗，逐只隐藏主宠会留下空的可交互窗，且没有子宠时托盘不挂逐只子菜单
+        （``_refresh_tray_menu`` 的 ``if self._spawned:``），主宠无处恢复。
+        """
+        sprite = self.sprite
+        if sprite is None or sprite is self._shell.sprite:
+            self._shell.set_pet_visible(False)
+            return
+        self._shell.set_sprite_visible(sprite, False)
 
     # ---------------------------------------------------------------- 黄金回旋/边缘探头
     def trigger_golden_spin(self) -> None:
-        """「黄金回旋」：``OverlayShell.trigger_golden_spin``（sprite 世界没有
-        GoldenSpinController，壳用同一组角度常量做 sprite 等价实现）。"""
+        """「黄金回旋」：``OverlayShell.trigger_golden_spin(sprite)``（sprite 世界
+        没有 GoldenSpinController，壳用同一组角度常量做 sprite 等价实现）。
+
+        目标 = 被点的那一只（旧版一窗一宠天然只有被点那只）。
+        """
         fn = getattr(self._shell, "trigger_golden_spin", None)
         if callable(fn):
-            fn()
+            fn(self.sprite)
 
     def set_edge_probe_enabled(self, on: bool) -> None:
         """「边缘探头」开关：只写 config 键。
@@ -395,7 +474,12 @@ class SpriteMenuFacade:
 
     # ---------------------------------------------------------------- 角色/设置/退出
     def request_switch_character(self, character_id: str) -> None:
-        self._shell.switch_character(str(character_id))
+        """「切换角色」：作用 = **被点的那一只**（旧版一窗一宠只切本窗）。
+
+        子宠换它自己的库并写它自己的 ``config-slot-N.json['character']``；此前
+        无论点哪只都打在主宠身上（审计 F1）。
+        """
+        self._shell.switch_character(str(character_id), self.sprite)
 
     def rename_character(self) -> None:
         """「重命名当前角色…」：window.py ``rename_character`` 的 sprite 等价物。

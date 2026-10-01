@@ -41,10 +41,73 @@ bind_clip）；drag/thrown 期间位置归鼠标路由与物理控制器，本�
 WebMClip 圈末交付结束标记后停表，只有 start() 能续圈——多圈移动/长拖拽
 的第二个圈起会冻结，故 PetSprite 转发 finished、控制器在「本状态仍有
 剩余时长」时调 restart_clip()（等价 window.py:1802-1821）。
+
+第一个例外是 ACTS 的到点收口（F8）：墙钟到点不等于末帧已交付——播放器
+定时器取整（24fps→42ms、48fps→21ms，均 ≥ 名义帧长）叠加首帧延迟，一圈
+素材实测比 duration 晚 80-164ms 才交付末帧，到点即换绑会把末帧（实测
+237-240）一起换掉。故 ACTS 到点后还要过 `_acts_tail_done` 闸门：末帧交付
+且已有一个 tick 的绘制机会、或 clip finished、或宽限到期，三者任一即收口；
+判据读 clip 的 frameCount/currentFrameNumber，接口缺失或本圈从未交付过帧
+则退回纯墙钟语义。收起 clip 的动作一律留在 tick 里做。
+
+宽限本身按**实测缺口**放大（F8 残余，见 `_acts_tail_grace`）：到点那一刻
+还缺多少帧，乘名义帧间隔，再夹进 [0.35s, 0.5s]。首帧延迟是负载相关量
+（实测 87-384ms），常数预算在 384ms/318ms 那两轮被吃穿、丢了首圈末帧；
+缺口驱动的预算随延迟一起长，实测那一档（剩余等待 ≈0.42s）落在上限之内。
+超出上限的迟到量是**有界失败**：到点即按旧墙钟语义收口、尾巴几帧上不了屏，
+绝不把状态机挂在等帧上（风险与取舍见 `_acts_tail_done`）。
+
+ACTS 也**绝不接 finished 续圈**（P1）：finished 是真实时间口径、elapsed 是
+tick 的 dt 累加口径，TickDriver 的 dt 上限与 GUI 卡顿会让后者落后，单圈
+clip 播完时 `duration - elapsed` 仍 > 0——续圈会把整个动作从第 0 帧重播。
+故 `on_clip_finished` 对 ACTS 只登记「末帧已显示一个帧间隔」的证据（不要求
+等待窗口已开），续圈语义原样保留给 MOVE/DRAG/THROWN 的多圈场景——MOVE 侧多一道
+`move_loops_done` 记账：计划里的**末圈**同样绝不重播（见 `_move_tail_done`）。
+
+IDLE 的到点是**第二个例外**（与圈末重绑的实机诊断同源）：待机是无限循环的
+长驻状态，墙钟到点时本圈通常还差 2-4 帧没交付（实机 frame 237/241），此刻
+换绑会让 `bind_clip` 里旧 clip 的 `stop()` 落在「非圈末」——webm_clip 的软停
+判据（`_natural_end_pending` + `_reader_parked`）不真，走硬停杀 ffmpeg、
+`start()` 换代 spawn 新进程（实机每圈一次进程 churn），且尾巴几帧连交付/绘制
+机会都没有。故 IDLE 到点后同样要过 `_idle_tail_done` 闸门：有 `finished`
+契约的 clip 等 finished 登记（末帧已交付 ≠ reader 已驻留，跨线程无同步点），
+无该接口的有限 clip 才退到「末帧 + 一次绘制机会」，两者都由宽限兜底——等到
+的是真圈末，随后的同 clip 重绑就落在软停 + re-arm 上（webm_clip 的 park 判据
+一字不动）。拿不到帧证据与损坏素材（永不 finished）按各自边界退回旧墙钟语义，
+见 `_idle_tail_done`。
+
+MOVE 是同源的**第三个例外**（`_move_tail_done`），但只推迟状态切换、不推迟
+位置：墙钟到点那一 tick 仍照旧 snap 原定终点 + 速度归零（推迟会让线性档继续
+积分、走过自己的终点），随后由圈末闸门决定何时进 gap/待机。24fps 的播放器定时器
+取整成 42ms ≥ 名义帧长，一圈实测比 duration 晚 96ms 交付末帧、144ms 交付结束
+标记，旧实现到点即 `_enter_idle`，末帧（实测 238/241）连交付机会都没有。有
+`finished` 契约的 clip 等 finished 登记（末帧已交付 ≠ reader 已驻留，跨线程无
+同步点）、无该接口才退到帧证据、宽限兜底；等待期不再跑曲线推进，也不反复走位。
+末圈提前到达的 finished 只登记不重播（`move_loops_done` 记账区分中间圈与末圈），
+中间圈的 re-arm 语义原样保留。
+
+CLICK / TURN 是同源的**第四、五个例外**（共用 `_tail_done`）：两种一次性有限
+素材原先是纯墙钟到点即切，末 2-4 帧被截（"点击没播完就弹回待机 / 转向直接翻面"）
+且旧 clip 的 `stop()` 落在非圈末走硬停换代。判据与 IDLE/MOVE 同一套（有
+`finished` 契约只认它，无该接口退到末帧 + 一次绘制机会，宽限兜底），TURN 的
+facing 翻转随之推迟到真正收口那一刻——旧架构这两条链本来就在真末帧收口
+（window.py:2652-2667 点击段、`_on_anim_ended` 的 turns 分支）。
+
+三处「画面归它、位置不归它」的接线也在本模块：① 唱歌续播（`_continue_sing`）
+——唱歌素材播完且壳报「音乐仍在放」时原地续播，绝不走 gap/掷骰链（旧机
+`_on_anim_ended` 的第一条分支）；判据来自可选的 `sing_continue_provider`
+（默认 None = 现状，音乐态归壳）；② 起飞预热（`_warm_landing_idles`）——进入
+THROWN 时后台预热全部 idle 首帧并打飞行期 `_ffr_landing_pinned`，落地/飞行被
+拖拽打断时按清单精确摘除（旧机 `_warm_landing_idles` / `_unpin_landing_idles`），
+同一飞行窗口内重复进入只提交一次（`warm_landing_submitted`）；③ 飞行边沿
+（`_sync_flight_edge`）——istate 进出 THROWN 的那一 tick 各回调一次可选的
+`on_flight_changed(sprite, flying)`（默认 None = 现状），消费方据此在飞行期
+禁气泡：行为层只报边沿，气泡语义归壳（`overlay_shell._bubble_blocked`）。
 """
 
 from __future__ import annotations
 
+import logging
 import random
 from concurrent.futures import ThreadPoolExecutor
 from weakref import WeakKeyDictionary
@@ -54,6 +117,8 @@ from PySide6.QtCore import QPointF, QRect
 from . import catalog, movement
 from .pet_sprite import INTERACTION_DRAG, INTERACTION_NORMAL, INTERACTION_THROWN
 from .predictive_prewarm import PredictivePrewarm
+
+logger = logging.getLogger(__name__)
 
 # 预测预热共享执行器（单 worker，全控制器共用）：首帧解码（ffmpeg spawn
 # ~50ms）绝不占 GUI 线程——py-spy 慢帧归因（2026-09-24）：_maybe_predict →
@@ -84,6 +149,52 @@ _CAPTURED_STATES = (STATE_DRAG, STATE_THROWN)
 #: 否则第 2 圈起冻结
 _REARM_STATES = (STATE_MOVE, STATE_DRAG, STATE_ACTS, STATE_THROWN)
 
+#: ACTS 末帧收口（F8）：墙钟到点（elapsed ≥ duration）不代表末帧已交付。
+#: 实机缺帧窗口（三条臂，241/481 帧素材）：帧序列臂 239-240 两帧、webm 臂
+#: 237-240 四帧、481 帧 @48fps 臂 478-480 三帧——末帧比 duration 晚 80-164ms
+#: 才交付（播放器定时器取整 42ms/21ms ≥ 名义帧长，再叠加冷启动首帧延迟）。
+#: 宽限 = 常数项与**缺口项**取大，再夹到 [下限, 硬上限]（见 _acts_tail_grace）：
+#: 常数项 = 4× 名义帧间隔与下限取大（慢素材的既有余量，口径不变）；缺口项 =
+#: 到点那一刻实测还缺的帧数 × 名义帧间隔 × 安全系数（F8 残余：首帧延迟是负载
+#: 相关量，实测 87-384ms，常数预算会被吃穿）。到点仍未等到末帧/结束标记就按
+#: 旧墙钟语义收口——绝不把状态机挂在这里，也绝不让慢素材把它拖成秒级。
+_ACTS_TAIL_GRACE_FRAMES = 4
+#: 宽限下限（秒）：24fps 帧间隔 42ms × 4 帧 ≈ 168ms，再留出启动/负载余量
+_ACTS_TAIL_GRACE_MIN_S = 0.35
+#: 缺口项安全系数（F8 残余）：名义帧间隔取 duration/frames（源帧长），比播放器
+#: 定时器的取整口径小 0.8%（24fps：41.67 < 42ms），再乘 1.25 覆盖该取整差、
+#: 逐 tick 的量化误差与「估计值恰好等于真实剩余」的临界档。
+_ACTS_TAIL_GRACE_SAFETY = 1.25
+#: 宽限硬上限（秒）：任何素材、任何负载下 ACTS 收口最多多等这么久
+_ACTS_TAIL_GRACE_MAX_S = 0.5
+
+#: IDLE 圈末等待预算（秒，见 `_idle_tail_done`）：墙钟到点后仍等圈末证据
+#: （finished / 末帧已交付）的上限，超出即按旧墙钟语义掷骰（有界失败，丢尾巴
+#: 几帧）。取值与 ACTS 末帧收口的硬上限同一量级：一圈素材的圈末通常只差 2-4
+#: 帧（实机 80-164ms），冷启动首帧迟到实测最长 384ms，两档都在界内；再大的
+#: 迟到量按有界失败处理，绝不把掷骰链挂在等帧上。
+_IDLE_TAIL_GRACE_S = 0.5
+
+#: MOVE 圈末等待预算：直接复用 IDLE 那一档 0.5s（见 `_move_tail_done`），不另开
+#: 常数。位置在到点那一 tick 就 snap 收口，等待只推迟**状态切换**（gap/待机），
+#: 不推迟位移；实测缺口 96ms（末帧）/144ms（结束标记）落在界内，与 IDLE 同档。
+#: 三档（ACTS/IDLE/MOVE）共用同一条有界失败纪律：拿不到圈末证据时最多多等
+#: 这么久，绝不把决策链挂在等帧上。
+#: CLICK/TURN（`_tail_done`）同用 IDLE 这一档：它们同样是有限一次性素材、
+#: 圈末同样只差 2-4 帧，没有按缺口放大的理由。
+
+
+def _sing_anim_name() -> str:
+    """唱歌动画名（与旧架构同源常量，杜绝第二套字符串）。
+
+    惰性 import：``overlay_shell._sing_anim`` / ``window_alerts.check_music_sing``
+    都是 ``from .window import SING_ANIM`` 这一既定依赖面（本模块不 import
+    window，只在 ``sing_continue_provider`` 真被接线时才付一次模块查找——未开
+    音乐唱歌的进程不多付 ``pet.window`` 的导入）。
+    """
+    from .window import SING_ANIM
+    return SING_ANIM
+
 
 class _SpriteState:
     """单个 sprite 的行为状态（控制器私有，不落在 sprite 上）。"""
@@ -91,7 +202,13 @@ class _SpriteState:
     __slots__ = ("state", "anim", "elapsed", "duration", "move_target",
                  "pending_move", "predictor", "curve", "frames_per_loop",
                  "loops", "loop_duration", "move_start", "suspended",
-                 "gap_remaining")
+                 "gap_remaining", "acts_tail_grace", "acts_final_seen",
+                 "acts_clip_finished", "idle_tail_grace", "idle_final_seen",
+                 "idle_clip_finished", "move_tail_grace", "move_final_seen",
+                 "move_clip_finished", "move_loops_done", "click_tail_grace",
+                 "click_final_seen", "click_clip_finished", "turn_tail_grace",
+                 "turn_final_seen", "turn_clip_finished", "landing_pinned",
+                 "was_flying", "warm_landing_submitted")
 
     def __init__(self) -> None:
         self.state = STATE_IDLE
@@ -114,6 +231,58 @@ class _SpriteState:
         # 动画间隔剩余时长（秒，0 = 不在 gap；M5d，window.py:2547-2594 语义）：
         # 动作/移动播完后强制插入待机/转向氛围步，不让动作连着动作地刷
         self.gap_remaining = 0.0
+        # ACTS 末帧收口（F8，见 _acts_tail_done）：墙钟到点后的末帧等待窗口。
+        # acts_tail_grace = None 表示本圈尚未到点（窗口未开）；开窗时按**实测
+        # 缺口**算好预算（_acts_tail_grace），随后按 tick 递减，到 0 仍未等到
+        # 末帧/结束标记就按旧墙钟语义收口（有界失败，见 _acts_tail_done）。
+        # 三个字段在每次换绑 clip（_bind_with_gen / play_once）时一律清空——
+        # 旧 clip 的末帧证据绝不跨代存活（代次守卫）
+        self.acts_tail_grace: float | None = None
+        self.acts_final_seen = False       # 本圈末帧已交付（观测过）
+        # 本圈 finished 已到（= 末帧已显示一个帧间隔）。可在窗口开启前就置位：
+        # dt 上限/卡顿会让 elapsed 落后真实时间，单圈 clip 可能先播完（P1）
+        self.acts_clip_finished = False
+        # IDLE 圈末收口（见 _idle_tail_done）：墙钟到点后的圈末等待窗口，语义与
+        # ACTS 的三字段一一对应（窗口未开 = None；预算固定 _IDLE_TAIL_GRACE_S，
+        # 待机不按缺口放大——圈末通常只差 2-4 帧）。同样在每次换绑 clip 时清空：
+        # 旧 clip 的圈末证据绝不跨代存活（点击/拖拽打断后的旧 finished 落进新
+        # 绑定就是这条路）
+        self.idle_tail_grace: float | None = None
+        self.idle_final_seen = False       # 本圈末帧已交付（观测过）
+        self.idle_clip_finished = False    # 本圈 finished 已到（可早于墙钟到点）
+        # MOVE 圈末收口（见 `_move_tail_done`）：与 IDLE 三件套一一对应，差别在
+        # 「位置不归它」——到点那一 tick 仍照旧 snap + 速度归零，窗口只决定何时
+        # 切 gap/待机。move_loops_done = 本次绑定已收尾的圈数（中间圈续播记账）：
+        # 末圈的 finished 提前到达时靠它区分「该续圈」与「该登记末圈证据」，
+        # 否则最后一圈会被重播一整圈。四字段同样在每次换绑 clip
+        # （_bind_with_gen / play_once）时清空——旧 clip 的圈末证据与续圈记账
+        # 绝不跨代存活（代次守卫）
+        self.move_tail_grace: float | None = None
+        self.move_final_seen = False       # 本圈末帧已交付（观测过）
+        self.move_clip_finished = False    # 本圈末圈 finished 已到（可早于墙钟到点）
+        self.move_loops_done = 0           # 本次绑定已收尾的圈数（中间圈 re-arm 计数）
+        # CLICK / TURN 圈末收口（与 IDLE/ACTS/MOVE 同款三件套，见 `_tail_done`）：
+        # 两种一次性有限动画共用一处闸门实现，窗口字段仍按状态各存一组（代次
+        # 守卫语义逐位相同：每次换绑一并清空）。旧架构这两条链也由真末帧收口
+        # （window.py:2652-2667 点击段、_on_anim_ended 的 turns 分支）
+        self.click_tail_grace: float | None = None
+        self.click_final_seen = False
+        self.click_clip_finished = False
+        self.turn_tail_grace: float | None = None
+        self.turn_final_seen = False
+        self.turn_clip_finished = False
+        # 飞行期落地首帧 pin（旧 window.py:4356-4420 语义）：非空 = 本 sprite 的
+        # idle 首帧正受「飞行期绝不逐出」保护，落地 / 飞行被拖拽打断时按这份
+        # 清单精确摘除（读清单而不是重查 idle 池：飞行中换角色后池已变，重查
+        # 会摘错对象、把上一只库的 pin 永久留在全局首帧预算里）
+        self.landing_pinned: list = []
+        # 飞行边沿状态（B1）：上一次 tick 见到的"在飞"判定，用于在 istate 进出
+        # THROWN 的那一 tick 各回调一次注入方（见 _sync_flight_edge）
+        self.was_flying = False
+        # 本次飞行窗口（起飞 → 落地/被拖拽打断）是否已向 _WARM_EXECUTOR 提交过
+        # 落地首帧预热（B2）：同一窗口内重复 _enter_thrown 不再重复 submit。
+        # 与 landing_pinned 同生共死（在 _unpin_landing_idles 一并复位）
+        self.warm_landing_submitted = False
 
 
 class BehaviorController:
@@ -151,6 +320,17 @@ class BehaviorController:
         self._predict_lead_s = 0.35
         # 预测预热总开关（config predict_prewarm_lead_ms>0 映射；测试可关）
         self.predict_enabled = True
+        # 唱歌续播判据（window.py:2595-2601 语义）：callable → bool，None = 未接线
+        # （默认即现状——唱歌 clip 播完照旧走掷骰链）。音乐态归壳（``_music_sing_active``
+        # 由 window_alerts 轮询维护），行为层不查音频，只问这一面。
+        # 壳侧接法（一行）：``self.behavior.sing_continue_provider = lambda:
+        # self._music_sing_active``
+        self.sing_continue_provider = None
+        # 飞行边沿回调（B1，可选）：``callable(sprite, flying) -> None``，只在
+        # istate 进出 ``INTERACTION_THROWN`` 的那一 tick 各调一次（首次接管、
+        # 空中被抓住、落地、飞行中被移除都算边沿）。行为层只报边沿，气泡语义
+        # 归消费方（overlay 壳据此禁飞的那只的气泡）；未接线 = 现状。
+        self.on_flight_changed = None
         self._states: dict = {}
         # V-9：按库对象弱引用缓存——旧实现以 id(lib) 为键，库销毁后地址
         # 被新库复用会命中陈旧分类池（换角色/多宠生灭时拿到错素材名），
@@ -194,7 +374,11 @@ class BehaviorController:
             if st is None:
                 st = self._states[sprite] = _SpriteState()
                 st.predictor = self._make_predictor(sprite)
-            if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL:
+            istate = getattr(sprite, "interaction_state", INTERACTION_NORMAL)
+            # 飞行边沿（B1）：走路就是这么走的——在既有的 istate 读取处顺带
+            # 判一次边沿，零额外查询、不新增 timer/线程（见 _sync_flight_edge）
+            self._sync_flight_edge(sprite, st, istate == INTERACTION_THROWN)
+            if istate != INTERACTION_NORMAL:
                 st.suspended = True
                 self._tick_captured(sprite, st)
                 continue
@@ -268,13 +452,34 @@ class BehaviorController:
 
     def play_once(self, sprite, name: str) -> bool:
         """一次性播放指定动画，播完回掷骰链（菜单「播放动画」入口，
-        window.py switch_clip 语义）。"""
+        window.py switch_clip 语义）。
+
+        入口守卫（旧 window.py:1624-1629 ``if name not in self.lib.names()``）：
+        动画名不在当前素材库时直接失败，绝不置 ACTS——否则 ``library.movie()``
+        抛的 KeyError 虽被壳吞掉，``st.state/st.anim`` 已置为 ACTS+陌生名，出现
+        一次可长达 0.5s 的「假 ACTS」（期间 agent 联动回待机请求被
+        ``_link_anim_busy()`` 挡住）。库未暴露 ``names()``（测试替身/轻量库）
+        时跳过守卫，保持既有语义。
+        """
         if getattr(sprite, "interaction_state", INTERACTION_NORMAL) != INTERACTION_NORMAL:
             return False
+        names = getattr(sprite.library, "names", None)
+        if callable(names):
+            try:
+                known = set(names())
+            except Exception:
+                known = None
+            if known is not None and name not in known:
+                return False
         st = self._states.setdefault(sprite, _SpriteState())
         st.state = STATE_ACTS
         st.pending_move = None
         self._clear_move_plan(st)
+        self._clear_acts_tail(st)  # 新一圈 ACTS：旧末帧证据作废（F8）
+        self._clear_idle_tail(st)  # 新绑定：旧 IDLE 圈末证据作废（同款代次守卫）
+        self._clear_move_tail(st)  # 新绑定：旧 MOVE 圈末证据/续圈记账同样作废
+        self._clear_tail(st, "click")  # 旧 CLICK 圈末证据不得跨代存活
+        self._clear_tail(st, "turn")
         sprite.set_velocity(QPointF(0, 0))
         st.elapsed = 0.0
         st.anim = name
@@ -312,7 +517,7 @@ class BehaviorController:
         return st.anim if st is not None else None
 
     def on_clip_finished(self, sprite) -> None:
-        """clip 圈末结束（PetSprite.finished 转发）：本状态还有剩余时长就续圈。
+        """clip 圈末结束（PetSprite.finished 转发）：IDLE/ACTS/CLICK/TURN/MOVE 只登记证据，其余按剩余时长续圈。
 
         WebMClip 圈末交付结束标记后停表，只有 start() 能 re-arm
         （webm_clip.py:1521-1567），不续则多圈移动的第 2 圈起、长拖拽过圈末
@@ -320,17 +525,85 @@ class BehaviorController:
 
         续圈判据用剩余时长（墙钟口径，见模块头）：末圈结束（剩余 ≤ 0）绝不
         续——收口交给 tick 的到点 snap，否则已完成的移动会被重新起播一整圈。
+        MOVE 另按 ``move_loops_done`` 记账：计划里的最后一圈同样绝不续（见下）。
+
+        ACTS 一律不续圈（P1 修正）：ACTS 计划本就只有一圈，而 finished 是
+        **真实时间**口径（播放器定时器 + 解码），``st.elapsed`` 是 tick 的 dt
+        累加口径——TickDriver 的 dt 上限/GUI 卡顿会让后者落后，于是单圈 clip
+        已播完时 ``duration - elapsed`` 仍 > 0，旧代码在这里 restart_clip()
+        把整个动作从第 0 帧重播（视觉闪回）且白付一次解码。故此分支只登记
+        「末帧已有一个帧间隔显示机会」的证据（finished 由两种播放器在末帧
+        之后一个帧间隔才发），切换留给 tick 的 _acts_tail_done——绝不在信号
+        回调里换绑/重启（会重入解码）。
+
+        IDLE 同款（第二个例外，见 _idle_tail_done）：待机是无限循环的长驻状态，
+        圈末既要续圈又要按掷骰链换绑，判据归 tick 的圈末闸门；此处只登记
+        「本圈已播完」的证据，绝不在信号栈里换绑（同款重入风险）。
+
+        MOVE 是第三个（见 _move_tail_done）：末圈的 finished 只登记、绝不
+        restart_clip()。finished 是真实时间口径而 elapsed 是 dt 累加口径，dt 上限/
+        卡顿会让**最后一圈**的 finished 在 ``duration - elapsed > 0`` 时到达，
+        旧口径在这里把末圈重播一整圈（画面从末帧闪回第 0 帧，位置却已按墙钟走到
+        终点）；中间的圈仍照旧 re-arm，多圈轨迹不受影响。
+
+        CLICK / TURN 是第四、五处（见 ``_tail_done``）：一次性有限素材，同样
+        只登记证据、不续圈、不在信号栈里换绑（旧架构这两条链也在真末帧收口）。
         """
         st = self._states.get(sprite)
-        if st is None or st.state not in _REARM_STATES:
+        if st is None:
+            return
+        if st.state == STATE_IDLE:
+            st.idle_clip_finished = True
+            return
+        if st.state == STATE_CLICK:
+            # 点击动画是一次性有限素材：只登记「本圈已播完」的证据，收口
+            # 留给 tick 的 ``_tail_done``（信号栈里换绑会重入解码）
+            st.click_clip_finished = True
+            return
+        if st.state == STATE_TURN:
+            st.turn_clip_finished = True
+            return
+        if st.state not in _REARM_STATES:
+            return
+        if st.state == STATE_ACTS:
+            st.acts_clip_finished = True
+            return
+        if st.state == STATE_MOVE:
+            # MOVE 的圈末一律只登记，重播/切换全留给 tick：信号栈里换绑会重入
+            # 解码，且此刻状态机可能正开在圈末等待窗口上（见 _move_tail_done）。
+            # 两种「不重播」：① 墙钟已到点 = 末圈（位移已由 tick snap 收口）；
+            # ② 本圈是计划里的**最后一圈**却提前发 finished——dt 上限/GUI 卡顿
+            # 让 elapsed 落后真实时间时会发生（finished 是真实时间口径），旧口径
+            # 按「duration - elapsed > 0」在这里 restart_clip() 重播整圈；
+            # 中间的圈照旧续圈，多圈轨迹一分不变。
+            if st.elapsed >= st.duration or st.move_loops_done + 1 >= st.loops:
+                st.move_clip_finished = True
+                return
+            st.move_loops_done += 1
+            sprite.restart_clip()
             return
         if st.duration - st.elapsed <= 0.0:
             return
         sprite.restart_clip()
 
     def forget(self, sprite) -> None:
-        """sprite 从 overlay 移除时清理其状态（可选，防状态表只增不减）。"""
-        self._states.pop(sprite, None)
+        """sprite 从 overlay 移除时清理其状态（可选，防状态表只增不减）。
+
+        同时摘掉飞行期 pin：pin 是打在 clip 上的（全局首帧预算按它免逐出），
+        sprite 若在飞行中被移除而清单随状态表一起丢弃，那些首帧会永久挂在
+        预算里（库销毁前无人再摘）。
+
+        飞行中被移除（托盘退出/换角色）还要补一次"落地"边沿：消费方（壳的
+        飞行集合）靠边沿维护簿记，漏掉这一次就会永久留着这只已注销的 sprite
+        （强引用 + 它的气泡门禁状态永远是"在飞"）。
+        """
+        st = self._states.pop(sprite, None)
+        if st is None:
+            return
+        self._unpin_landing_idles(st)
+        if st.was_flying:
+            st.was_flying = False
+            self._notify_flight_changed(sprite, False)
 
     def _ensure_hooks(self, sprite) -> None:
         """把 clip 圈末回调挂到 sprite（F2），每个 sprite 只挂一次。
@@ -342,6 +615,34 @@ class BehaviorController:
             return
         sprite._clip_finished_cb = self.on_clip_finished
         sprite._clip_finished_owner = self
+
+    # ---------------------------------------------------------------- 飞行边沿（B1）
+    def _sync_flight_edge(self, sprite, st: _SpriteState, flying: bool) -> None:
+        """飞行边沿检测：istate 进/出 THROWN 各回调一次注入方。
+
+        边沿源是**唯一权威**的 ``interaction_state``（飞行由 sprite_physics
+        写入、落地也由它复位），故本方法每 tick 只做一次布尔比较——不新增
+        timer/线程、不轮询位置、不碰物理。回调只在边沿发生，稳态零开销。
+        """
+        flying = bool(flying)
+        if flying == st.was_flying:
+            return
+        st.was_flying = flying
+        self._notify_flight_changed(sprite, flying)
+
+    def _notify_flight_changed(self, sprite, flying: bool) -> None:
+        """调用注入的飞行边沿回调；未接线 = no-op，回调异常绝不掀掉 tick。
+
+        消费失败只降级为「气泡门禁没跟上」（表现 = 飞行期多冒一次泡），
+        绝不能因此打断位置积分/状态机。
+        """
+        callback = self.on_flight_changed
+        if callback is None:
+            return
+        try:
+            callback(sprite, bool(flying))
+        except Exception:
+            logger.exception("飞行边沿回调失败 sprite=%r flying=%s", sprite, flying)
 
     # ---------------------------------------------------------------- 接管态画面
     def _tick_captured(self, sprite, st: _SpriteState) -> None:
@@ -381,24 +682,42 @@ class BehaviorController:
             if st.anim is None:
                 self._enter_idle(sprite, st, self._categories(sprite.library))
             elif st.elapsed >= st.duration:
-                # gap 内待机步播完继续播氛围步；gap 到点才回掷骰链（旧机
-                # _on_anim_ended 的 _animation_gap_active 分支）
-                if st.gap_remaining > 0.0:
-                    self._play_animation_gap_step(sprite, st)
-                else:
-                    self._roll_next(sprite, st)
+                # 到点 ≠ 本圈播完（IDLE 圈末收口）：先过圈末闸门再换绑——换绑要把
+                # bind_clip 里旧 clip 的 stop() 落在真圈末上（webm_clip 的软停
+                # 判据据此成立 → 同 clip 重绑走 re-arm 而非硬停换代），否则实机
+                # 每圈一次 ffmpeg 进程 churn 且尾巴几帧连绘制机会都没有
+                # （见 _idle_tail_done）
+                if self._idle_tail_done(sprite, st, dt):
+                    # gap 内待机步播完继续播氛围步；gap 到点才回掷骰链（旧机
+                    # _on_anim_ended 的 _animation_gap_active 分支）
+                    if st.gap_remaining > 0.0:
+                        self._play_animation_gap_step(sprite, st)
+                    else:
+                        self._roll_next(sprite, st)
             else:
                 self._maybe_predict(sprite, st)
         elif st.state == STATE_MOVE:
-            self._apply_move_curve(sprite, st, dt)
             if st.elapsed >= st.duration:
-                if st.move_target is not None:
-                    sprite.set_pos(st.move_target)  # 到点 snap，消除积分残差
-                sprite.set_velocity(QPointF(0, 0))
-                if not self._start_animation_gap(sprite, st):
-                    self._enter_idle(sprite, st, self._categories(sprite.library))
+                # 到点那一 tick 仍照旧收口位置：snap 原定终点 + 速度归零。这一步
+                # 绝不推迟到等帧之后——等待期继续按曲线/线性积分会走过自己的终点
+                # （线性档每 tick 0.32px），位移超发比截尾更难解释。只 snap 一次：
+                # 窗口已开（move_tail_grace 非 None）就不再重复走位
+                if st.move_tail_grace is None:
+                    if st.move_target is not None:
+                        sprite.set_pos(st.move_target)  # 到点 snap，消除积分残差
+                    sprite.set_velocity(QPointF(0, 0))
+                    # 到点收口期间不再 _apply_move_curve：末帧到位前速度恒 0、
+                    # 位置钉在终点（等待只推迟状态切换，见 _move_tail_done）
+                if self._move_tail_done(sprite, st, dt):
+                    if not self._start_animation_gap(sprite, st):
+                        self._enter_idle(sprite, st, self._categories(sprite.library))
+            else:
+                self._apply_move_curve(sprite, st, dt)
         elif st.state == STATE_TURN:
-            if st.elapsed >= st.duration:
+            # 到点不等于本圈播完：先过圈末闸门（`_tail_done`）——否则末 2-4 帧被截、
+            # 旧 clip 的 stop() 落在非圈末走硬停换代，facing 也会提前翻
+            if (st.elapsed >= st.duration
+                    and self._tail_done(sprite, st, dt, "turn")):
                 if probing:
                     # 探头会话只允许待机/转向且冻结朝向（F7，
                     # window_optional_services.py:223-233/349-350）：turn 播完
@@ -424,13 +743,469 @@ class BehaviorController:
                         self._enter_idle(sprite, st, self._categories(sprite.library))
         elif st.state == STATE_ACTS:
             if st.elapsed >= st.duration:
-                if not self._start_animation_gap(sprite, st):
-                    self._roll_next(sprite, st)
+                # 到点 ≠ 末帧已上屏（F8）：先过末帧收口闸门再切下一个动画
+                if self._acts_tail_done(sprite, st, dt):
+                    # 唱歌素材刚播完且音乐仍在放 → 原地续播，绝不走 gap/掷骰
+                    # （旧机 `_on_anim_ended` 的第一条分支，window.py:2595-2601）
+                    if not self._continue_sing(sprite, st):
+                        if not self._start_animation_gap(sprite, st):
+                            self._roll_next(sprite, st)
             else:
                 self._maybe_predict(sprite, st)
         elif st.state == STATE_CLICK:
-            if st.elapsed >= st.duration:
+            if st.elapsed >= st.duration and self._tail_done(sprite, st, dt, "click"):
                 self._enter_idle(sprite, st, self._categories(sprite.library))
+
+    # ---------------------------------------------------------------- ACTS 末帧收口（F8）
+    @staticmethod
+    def _clear_acts_tail(st: _SpriteState) -> None:
+        """作废 ACTS 末帧等待窗口（换绑 clip / 菜单播一遍时调）。
+
+        代次守卫：末帧证据（acts_final_seen / acts_clip_finished）只对「产生
+        它的那次绑定」有效。换绑后旧 clip 的观测绝不能让新一圈 ACTS 提前
+        收口——否则就是本刀要修的那个 bug 换个方向复发。
+        """
+        st.acts_tail_grace = None
+        st.acts_final_seen = False
+        st.acts_clip_finished = False
+
+    @staticmethod
+    def _bound_clip(sprite):
+        """sprite 当前绑定的 clip（``PetSprite._clip``）；替身无该字段返回 None。
+
+        读 sprite 手上的那个而不是 ``library.movie(anim)``：只有它才是正在
+        交付帧的对象（库换角色/回收后同名映射可能给出另一个 clip）。
+        """
+        return getattr(sprite, "_clip", None)
+
+    @staticmethod
+    def _clip_frame_count(clip) -> int:
+        """clip 的源帧总数（0 = 接口缺失/读取失败 → 回退旧墙钟语义）。"""
+        fn = getattr(clip, "frameCount", None)
+        if not callable(fn):
+            return 0
+        try:
+            return int(fn() or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _clip_frame_index(clip) -> int:
+        """clip 已交付的源帧号（-1 = 接口缺失/读取失败 → 视作无证据）。"""
+        fn = getattr(clip, "currentFrameNumber", None)
+        if not callable(fn):
+            return -1
+        try:
+            return int(fn())
+        except (TypeError, ValueError):
+            return -1
+
+    @staticmethod
+    def _clip_has_finished_signal(clip) -> bool:
+        """clip 是否暴露可连接的 ``finished`` 信号（挂接方同款判据）。
+
+        ``PetSprite.bind_clip`` 对缺该信号的 clip 静默跳过连接
+        （``getattr(clip, "finished", None)``），本判据用同一取法与连接能力检查，
+        不引入新契约。有它 ⇒ 该播放器一定会报圈末，行为层就该等它的登记，而不是
+        靠帧号猜（见 ``_idle_tail_done``）。
+        """
+        return callable(getattr(getattr(clip, "finished", None), "connect", None))
+
+    def _acts_tail_grace(self, st: _SpriteState, frames: int,
+                         deficit: int) -> float:
+        """末帧等待预算（秒）：常数项与实测缺口项取大，硬上限封顶（F8/残余）。
+
+        ``deficit`` = 到点那一刻 clip 还缺的帧数（``frames-1-index``）。剩余
+        等待就是「还要等几个帧间隔」——首帧延迟是负载相关量（同一素材实测
+        87-384ms），常数预算会被它吃穿：r7-new24 首帧迟到 384ms、r8-new48
+        318ms，固定 350ms 在到点 350ms 后就换绑，丢了首圈末帧。故预算的第二
+        项 = ``deficit × 名义帧间隔 × _ACTS_TAIL_GRACE_SAFETY``，随实测缺口
+        一起长（缺口 10 帧 @24fps ≈ 0.52s、20 帧 @48fps ≈ 0.52s，再大由上限
+        截到 0.5s），覆盖实测 0.41-0.42s 的剩余等待。
+
+        第一项保留旧口径（``max(下限, 4× 名义帧间隔)``，慢素材的既有余量）：
+        两项取大 ⇒ 本次改动**只会让预算变长、绝不会变短**，快素材/常规轮次的
+        （缺 2-4 帧）取值与改动前逐位相同。
+
+        上限 ``_ACTS_TAIL_GRACE_MAX_S`` 是硬边界：缺口再大也只等这么久，超出
+        的迟到量按有界失败处理（到点即收口、丢尾巴几帧，绝不挂起）。
+        """
+        interval = st.duration / frames if frames > 0 and st.duration > 0 else 0.0
+        floor = max(_ACTS_TAIL_GRACE_MIN_S, interval * _ACTS_TAIL_GRACE_FRAMES)
+        estimated = deficit * interval * _ACTS_TAIL_GRACE_SAFETY
+        return min(_ACTS_TAIL_GRACE_MAX_S, max(floor, estimated))
+
+    def _acts_tail_done(self, sprite, st: _SpriteState, dt: float) -> bool:
+        """ACTS 到点收口闸门（F8）：返回 True = 可以切下一个动画。
+
+        墙钟到点（elapsed ≥ duration）不等于末帧已交付：播放器定时器取整
+        （24fps→42ms、48fps→21ms，均 ≥ 名义帧长）叠加首帧延迟，一圈素材实测
+        比 duration 晚 80-164ms 才交付末帧——旧代码在到点那一 tick 直接换绑，
+        末帧（实测 237-240）永远没机会上屏。
+
+        判据（命中任一即 True）：
+        1) 末帧已交付且是**上一个 tick 之前**观测到的——即已经过至少一个 tick
+           的绘制机会（帧回调只登记，切换一律留在这里做：在 clip 的 emit 栈里
+           换绑会重入解码）；
+        2) clip finished——两种播放器都在末帧之后一个帧间隔才发结束标记，
+           等价于末帧已有一个帧周期的显示机会。该证据**不要求窗口已开**：
+           finished 可能早于墙钟到点到达（dt 上限/卡顿使 elapsed 落后真实
+           时间），记录后由开窗那一 tick 起的下一个 tick 收口，不消耗宽限；
+        3) 宽限到期（窗口按实测缺口算，见 _acts_tail_grace）——末帧/结束标记
+           始终不来时按旧墙钟语义收口，绝不挂起。
+
+        **有界失败（风险登记）**：宽限封顶 0.5s，故「到点那一刻的剩余等待 >
+        0.5s」这一档（≈ 首帧延迟 > 420ms @24fps、或整圈被拖到半秒以上）仍然
+        会在末帧之前收口、丢尾巴几帧。取舍是刻意的：宁可丢尾巴，也不让 ACTS
+        把动画链挂在等帧上（挂起会连带 gap/掷骰链一起停摆，用户看到的是动作
+        卡死）。这一档的可见代价 = 少于 0.5s 的尾巴缺帧，与改动前的行为一致。
+
+        帧数接口缺失、或本圈从未交付过任何帧（currentFrameNumber ≤ 0，异常
+        clip）→ 直接 True：保持既有墙钟语义（既有测试假库的 clip 帧号恒为 0，
+        走的就是这条）。异常 clip 提前发 finished 且一帧未交付时同样走这条，
+        到点即收口，不因缺末帧而挂起。
+        """
+        clip = self._bound_clip(sprite)
+        frames = self._clip_frame_count(clip)
+        if frames <= 0:
+            return True
+        index = self._clip_frame_index(clip)
+        if st.acts_tail_grace is None:
+            # 首次到点：只开窗口 + 登记本次观测，本 tick 绝不切换。
+            # acts_clip_finished 保留（可能已由提前到达的 finished 置位），
+            # 它随换绑清零，不随开窗清零
+            if index <= 0:
+                return True
+            st.acts_tail_grace = self._acts_tail_grace(
+                st, frames, max(0, frames - 1 - index))
+            st.acts_final_seen = index >= frames - 1
+            return False
+        st.acts_tail_grace = max(0.0, st.acts_tail_grace - dt)
+        if st.acts_clip_finished:
+            return True
+        if index >= frames - 1:
+            if st.acts_final_seen:
+                return True          # 上一个 tick 就见过末帧：至少一次绘制机会
+            st.acts_final_seen = True
+        return st.acts_tail_grace <= 0.0
+
+    # ---------------------------------------------------------------- IDLE 圈末收口
+    @staticmethod
+    def _clear_idle_tail(st: _SpriteState) -> None:
+        """作废 IDLE 圈末等待窗口（每次换绑 clip 时调，与 ACTS 同款代次守卫）。
+
+        圈末证据（idle_final_seen / idle_clip_finished）只对「产生它的那次绑定」
+        有效：点击/拖拽打断、掷骰换绑、菜单播一遍之后，旧 clip 的观测绝不能让
+        新的绑定提前换绑——否则就是本刀要修的问题换个方向复发（旧 clip 的
+        finished 一落进新绑定，新一圈待机立刻被换掉）。
+        """
+        st.idle_tail_grace = None
+        st.idle_final_seen = False
+        st.idle_clip_finished = False
+
+    def _idle_tail_done(self, sprite, st: _SpriteState, dt: float) -> bool:
+        """IDLE 圈末收口闸门：返回 True = 本圈已播完，可以换绑（掷骰 / 续 gap 步）。
+
+        墙钟到点（elapsed ≥ duration）不等于本圈播完：待机是无限循环的长驻状态，
+        到点时本圈通常还差 2-4 帧（实机显示停在 frame 237/241，此时圈末结束标记
+        已入队、reader 已驻留圈边界）。旧代码在到点那一 tick 就换绑，``bind_clip``
+        里旧 clip 的 ``stop()`` 便落在「非圈末」——webm_clip 的软停判据
+        （``_natural_end_pending`` + ``_reader_parked``）不真，走 ``_hard_stop``
+        杀 ffmpeg、``start()`` 换代 spawn 新进程：实机每圈一次进程 churn（3 次
+        重绑 3 个新 PID，re-arm 从未被调用），且尾巴几帧连交付/绘制机会都没有
+        （present 未证，见诊断 REPORT §5）。把换绑推迟到真圈末，同 clip 的重绑就
+        落在软停 + re-arm 上（webm_clip 一字未改）。
+
+        判据（结构对齐 ``_acts_tail_done``，同一套证据纪律）：
+        1) **有 ``finished`` 契约的 clip 只认 finished 登记**（或宽限到期）：末帧
+           已交付 ≠ reader 已驻留圈边界——``_reader_parked`` 由 reader 线程写、
+           GUI 侧读，两者之间没有同步点，按帧号抢先换绑可能恰落在驻留置位之前，
+           于是又走硬停换代（本刀要修的就是它）。等一个帧间隔的 finished 登记，
+           驻留必然就位（reader 在结束标记入队时即置位，标记早于末帧被消费）。
+        2) 无 ``finished`` 接口的有限 clip（旧替身/降级播放器）→ 退到帧号证据：
+           末帧已交付且是**上一个 tick 之前**观测到的（至少一次绘制机会）。
+        3) 宽限到期（``_IDLE_TAIL_GRACE_S``）——上述证据始终不来时按旧墙钟语义
+           换绑，绝不把掷骰链挂在等帧上。
+
+        **有界失败（风险登记）**：拿不到圈末证据时最多多等 0.5s 就照旧掷骰；若此
+        刻连圈末都没到（帧停滞），stop() 仍会硬停换代、尾巴仍会丢——与改动前的
+        代价相同（只是晚 ≤0.5s），宁可如此也不让 IDLE 把动画链挂在等帧上。
+
+        帧接口缺失、或本圈从未交付过任何帧（currentFrameNumber ≤ 0，旧替身/异常
+        clip）→ 直接 True：保持既有墙钟语义（既有测试假库的 clip 帧号恒为 0，走的
+        就是这条；否则一切旧替身都会被拖进等帧）。
+        """
+        clip = self._bound_clip(sprite)
+        frames = self._clip_frame_count(clip)
+        if frames <= 0:
+            return True
+        index = self._clip_frame_index(clip)
+        if st.idle_tail_grace is None:
+            # 首次到点：只开窗口 + 登记本次观测，本 tick 绝不换绑。
+            # idle_clip_finished 保留（可能已由提前到达的 finished 置位，
+            # 它随换绑清零，不随开窗清零）
+            if index <= 0:
+                return True
+            st.idle_tail_grace = _IDLE_TAIL_GRACE_S
+            st.idle_final_seen = index >= frames - 1
+            return False
+        st.idle_tail_grace = max(0.0, st.idle_tail_grace - dt)
+        if st.idle_clip_finished:
+            return True
+        if self._clip_has_finished_signal(clip):
+            # 有 finished 契约 → 只等它（或宽限到期）。末帧交付不等于 reader 已
+            # 驻留圈边界（跨线程无同步点），抢先换绑可能仍落硬停换代
+            return st.idle_tail_grace <= 0.0
+        if index >= frames - 1:
+            if st.idle_final_seen:
+                return True          # 无 finished 接口：末帧 + 至少一次绘制机会
+            st.idle_final_seen = True
+        return st.idle_tail_grace <= 0.0
+
+    # ---------------------------------------------------------------- MOVE 圈末收口
+    @staticmethod
+    def _clear_move_tail(st: _SpriteState) -> None:
+        """作废 MOVE 圈末等待窗口（每次换绑 clip 时调，与 ACTS/IDLE 同款代次守卫）。
+
+        圈末证据（move_final_seen / move_clip_finished）与续圈记账
+        （move_loops_done）只对「产生它的那次绑定」有效：点击/拖拽打断、掷骰换绑、
+        菜单播一遍之后，旧 clip 的观测绝不能让新的绑定提前收口，也不能让新一圈
+        移动少走/多走一圈——否则就是本刀要修的问题换个方向复发。
+        """
+        st.move_tail_grace = None
+        st.move_final_seen = False
+        st.move_clip_finished = False
+        st.move_loops_done = 0
+
+    def _move_tail_done(self, sprite, st: _SpriteState, dt: float) -> bool:
+        """MOVE 到点后的圈末闸门：返回 True = 可以进 gap/待机。
+
+        **位置不归它**：调用方在到点那一 tick 已 snap 原定终点并归零速度，本闸门
+        只决定状态何时切走。旧实现在到点那一 tick 直接 `_enter_idle`，而 24fps 的
+        播放器定时器取整成 42ms（≥ 名义帧长 41.67ms）⇒ 一圈实际比 duration 晚
+        96ms 才交付末帧、144ms 才交付结束标记，末帧（实机 238/241）随换绑一起被
+        换掉——与 IDLE 圈末同源的缺口，只是代价从「每圈一次硬停换代」变成「尾巴
+        1-3 帧连交付机会都没有」。
+
+        判据（结构对齐 `_idle_tail_done`，同一套证据纪律）：
+        1) 有 ``finished`` 契约的 clip 只认 finished 登记（或宽限到期）：末帧已
+           交付 ≠ reader 已驻留圈边界（``_reader_parked`` 由 reader 线程写、GUI 侧
+           读，两者之间没有同步点），按帧号抢先换绑可能仍落硬停换代；且换绑目标
+           通常是 idle 素材，旧 clip 的 ``stop()`` 落在非圈末就会杀进程换代。
+        2) 无 ``finished`` 接口的有限 clip（旧替身/降级播放器）→ 退到帧号证据：
+           末帧已交付且是**上一个 tick 之前**观测到的（至少一次帧交付/绘制机会）。
+        3) 宽限到期（``_IDLE_TAIL_GRACE_S``，与 IDLE 同档）——证据始终不来时按旧
+           墙钟语义切走，绝不把决策链挂在等帧上。
+
+        **有界失败（风险登记）**：拿不到圈末证据时最多多等 0.5s；若此刻帧停滞
+        （预取断链），尾巴照样丢——代价与改动前相同（只是晚 ≤0.5s），宁可如此也
+        不让 MOVE 把决策链挂在等帧上。位移不受影响：到点已 snap、等待期速度恒 0，
+        「多等」只影响画面切换时机，不会多走一像素。
+
+        帧接口缺失、或本圈从未交付过任何帧（``currentFrameNumber`` ≤ 0，既有测试
+        假库的 clip 帧号恒为 0）→ 直接 True：保持既有墙钟语义（零额外等待）。
+        """
+        clip = self._bound_clip(sprite)
+        frames = self._clip_frame_count(clip)
+        if frames <= 0:
+            return True
+        index = self._clip_frame_index(clip)
+        if st.move_tail_grace is None:
+            # 首次到点：只开窗口 + 登记本次观测，本 tick 绝不切换。
+            # move_clip_finished 保留（可能已由提前到达的末圈 finished 置位，
+            # 它随换绑清零，不随开窗清零）
+            if index <= 0:
+                return True
+            st.move_tail_grace = _IDLE_TAIL_GRACE_S
+            st.move_final_seen = index >= frames - 1
+            return False
+        st.move_tail_grace = max(0.0, st.move_tail_grace - dt)
+        if st.move_clip_finished:
+            return True
+        if self._clip_has_finished_signal(clip):
+            # 有 finished 契约 → 只等它（或宽限到期），同 IDLE 的理由
+            return st.move_tail_grace <= 0.0
+        if index >= frames - 1:
+            if st.move_final_seen:
+                return True          # 无 finished 接口：末帧 + 至少一次绘制机会
+            st.move_final_seen = True
+        return st.move_tail_grace <= 0.0
+
+    # ---------------------------------------------------------------- CLICK/TURN 圈末收口
+    @staticmethod
+    def _clear_tail(st: _SpriteState, kind: str) -> None:
+        """作废指定状态的圈末等待窗口（每次换绑 clip 时调，代次守卫）。
+
+        与 ``_clear_acts_tail`` / ``_clear_idle_tail`` / ``_clear_move_tail``
+        同款：圈末证据只对「产生它的那次绑定」有效，换绑后旧 clip 的观测绝不
+        能让新的绑定提前收口。CLICK/TURN 是有限一次性动画，共用本闸门。
+        """
+        setattr(st, f"{kind}_tail_grace", None)
+        setattr(st, f"{kind}_final_seen", False)
+        setattr(st, f"{kind}_clip_finished", False)
+
+    def _tail_done(self, sprite, st: _SpriteState, dt: float, kind: str) -> bool:
+        """CLICK / TURN 到点后的圈末闸门：返回 True = 可以收口切走。
+
+        与 ``_idle_tail_done`` / ``_move_tail_done`` 同一套证据纪律（模块头已
+        说明为什么不能到点即切）：墙钟到点不等于本圈播完。播放器定时器取整
+        （24fps→42ms ≥ 名义帧长）叠加首帧延迟，一圈实测比 duration 晚
+        80-164ms / 2-4 帧才交付末帧，旧实现到点即切 ⇒
+
+        1. 点击反应、转向动画的收尾 2-4 帧被截（"没播完就弹回待机 / 直接翻面"，
+           旧架构这两条链都在真末帧收口：window.py:2652-2667 与
+           ``_on_anim_ended`` 的 turns 分支）；
+        2. ``bind_clip`` 里旧 clip 的 ``stop()`` 落在「非圈末」→ webm_clip 的软停
+           判据不真，走硬停杀 ffmpeg、``start()`` 换代 spawn 新进程（与 IDLE
+           已修的每圈一次进程 churn 同源）。
+
+        判据（结构对齐 ``_idle_tail_done``）：有 ``finished`` 契约的 clip 只认
+        finished 登记（或宽限到期）——末帧已交付 ≠ reader 已驻留圈边界（跨线程
+        无同步点）；无该接口的有限 clip 退到「末帧 + 一次绘制机会」；宽限
+        ``_IDLE_TAIL_GRACE_S`` 兜底（有界失败：证据始终不来时按旧墙钟语义切走，
+        绝不把动画链挂在等帧上）。帧接口缺失或本圈一帧未交付（旧替身）→ 直接
+        True，保持既有墙钟语义。
+
+        ``kind`` 取 "click" / "turn"：两种状态共用本实现，窗口字段各存一组。
+        """
+        clip = self._bound_clip(sprite)
+        frames = self._clip_frame_count(clip)
+        if frames <= 0:
+            return True
+        index = self._clip_frame_index(clip)
+        grace = getattr(st, f"{kind}_tail_grace")
+        if grace is None:
+            # 首次到点：只开窗口 + 登记本次观测，本 tick 绝不切换。
+            # *_clip_finished 保留（可能已由提前到达的 finished 置位，它随换绑
+            # 清零，不随开窗清零）
+            if index <= 0:
+                return True
+            setattr(st, f"{kind}_tail_grace", _IDLE_TAIL_GRACE_S)
+            setattr(st, f"{kind}_final_seen", index >= frames - 1)
+            return False
+        grace = max(0.0, grace - dt)
+        setattr(st, f"{kind}_tail_grace", grace)
+        if getattr(st, f"{kind}_clip_finished"):
+            return True
+        if self._clip_has_finished_signal(clip):
+            # 有 finished 契约 → 只等它（或宽限到期），同 IDLE 的理由
+            return grace <= 0.0
+        if index >= frames - 1:
+            if getattr(st, f"{kind}_final_seen"):
+                return True          # 无 finished 接口：末帧 + 至少一次绘制机会
+            setattr(st, f"{kind}_final_seen", True)
+        return grace <= 0.0
+
+    # ---------------------------------------------------------------- 落地首帧（起飞预热 + 飞行期 pin）
+    def _warm_landing_idles(self, sprite, st: _SpriteState, cats: dict) -> None:
+        """起飞边沿：后台预热全部 idle 首帧并打飞行期 pin（window.py:4356-4404）。
+
+        落地的切换目标是 idle 池（``_enter_idle``），而预测式预热覆盖不到这里
+        ——弹射是事件触发（拖拽打断早已作废预测代次），且交互让路闸门在飞行期
+        会挡住 ``warm_predicted``；故直接调 clip 级 ``warm_first_frame``（幂等、
+        可被取消，见 webm_clip 文档），绕过闸门。
+
+        **后台执行**：预热内部要拉起 ffmpeg（~50ms/条），旧机曾在 GUI 线程同步
+        预热，碰撞风暴下每次撞飞同步拉起一次（~100ms/只），多鱼互撞时连续
+        200ms+ 级卡顿。这里复用预测预热的共享 worker（模块级 ``_WARM_EXECUTOR``，
+        不新开常驻线程），GUI 只付一次 submit。
+
+        pin 打的是 ``_ffr_landing_pinned``（独立标志，绝不与 library 常驻的
+        ``_ffr_pinned`` 混用：idle 池可与高频交互常驻集重叠，混用会让落地摘
+        pin 顺手摘掉常驻保护）。清单落进 ``st.landing_pinned``，摘除按清单精确
+        匹配（见 ``_unpin_landing_idles``）。
+
+        **同一次飞行只提交一次**（B2）：``_WARM_EXECUTOR`` 是 max_workers=1 的
+        单 worker（模块级共享，与预测式预热共用），重复 submit 只会让后一批
+        ffmpeg 排在前一批后面——预热内容一字不变，白白把落地首帧的可用时间
+        推后几百毫秒。开关是 ``st.warm_landing_submitted``：起飞置位，落地 /
+        被拖拽打断（``_unpin_landing_idles``）复位，故下一次飞行照旧预热。
+        """
+        if st.warm_landing_submitted:
+            return  # 本次飞行已提交过：pin 仍在位（清单没被摘），无需重打
+        clips = self._landing_idle_clips(sprite, cats)
+        if not clips:
+            return
+        st.warm_landing_submitted = True
+        st.landing_pinned = clips
+        for clip in clips:          # GUI 线程打标记，warm 在后台完成
+            clip._ffr_landing_pinned = True
+        _WARM_EXECUTOR.submit(self._warm_clips, clips)
+
+    @staticmethod
+    def _warm_clips(clips) -> None:
+        """后台预热条目（worker 线程）：clip 缺 ``warm_first_frame`` 即跳过。
+
+        预热失败静默（落地切换退化为按需同步解码，语义同旧路径）。
+        """
+        for clip in clips:
+            try:
+                warm = getattr(clip, "warm_first_frame", None)
+                if callable(warm):
+                    warm()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _landing_idle_clips(sprite, cats: dict) -> list:
+        """本 sprite 的 idle 池 clip 清单（旧机 ``[lib.movie(n) for n in idles]``）。
+
+        clip 解析留在 GUI 线程（``MovieLibrary.movie`` 不保证线程安全），后台
+        只持有引用跑解码。取不到（库/名缺失）静默跳过。
+        """
+        movie = getattr(getattr(sprite, "library", None), "movie", None)
+        if not callable(movie):
+            return []
+        clips = []
+        for name in cats["idles"] or ():
+            try:
+                clips.append(movie(name))
+            except Exception:
+                pass
+        return clips
+
+    @staticmethod
+    def _unpin_landing_idles(st: _SpriteState) -> None:
+        """摘掉起飞时给的飞行期 pin（landing / 飞行被拖拽打断）。
+
+        只摘 ``_ffr_landing_pinned``，library 常驻 ``_ffr_pinned`` 绝不动；
+        非飞行期调用是 no-op（清单空）。按起飞时记下的 clip 清单摘（不重查
+        idle 池：飞行中换角色后池已变）。
+
+        同时复位起飞预热去重标记（B2）：本方法是飞行窗口（起飞 → 落地/被
+        拖拽打断）唯一的收口点，两个字段同生共死——下一次飞行照旧预热。
+        """
+        for clip in st.landing_pinned:
+            clip._ffr_landing_pinned = False
+        st.landing_pinned = []
+        st.warm_landing_submitted = False
+
+    # ---------------------------------------------------------------- 唱歌续播（N1）
+    def _continue_sing(self, sprite, st: _SpriteState) -> bool:
+        """唱歌素材播完且音乐仍在放 → 原地续播（window.py:2595-2601 语义）。
+
+        旧机 ``_on_anim_ended`` 的第一条分支：``name == SING_ANIM and
+        _music_sing_enabled and _music_sing_active`` → ``_switch(SING_ANIM)``，
+        绝不走掷骰链（"唱一句 → 切随机动作 → 再唱"就是把唱歌循环打碎了）。
+
+        音乐态归壳（``_music_sing_active`` 由 ``window_alerts`` 轮询维护），
+        行为层不查音频 COM，只问注入的 ``sing_continue_provider``（默认 None =
+        现状：照旧走 gap/掷骰链）。判据抛异常时按「不续播」处理——续唱是附加
+        能力，绝不反过来打断动画链。
+
+        返回 True = 已续播，调用方绝不再走 gap/掷骰。
+        """
+        provider = self.sing_continue_provider
+        if provider is None:
+            return False
+        try:
+            if st.anim != _sing_anim_name() or not provider():
+                return False
+        except Exception:
+            return False
+        self._enter_acts(sprite, st, self._categories(sprite.library),
+                         forced_name=st.anim)
+        return True
 
     # ---------------------------------------------------------------- 预测式预热
     def _make_predictor(self, sprite) -> PredictivePrewarm:
@@ -481,8 +1256,19 @@ class BehaviorController:
 
         返回 ``sprite.bind_clip`` 是否被接受（F6）：起播被拒时不推进预测
         代次，调用方据此放弃依赖该动画的状态（移动计划等）。
+
+        换绑同时作废 ACTS 末帧等待窗口（F8 代次守卫）、IDLE 圈末等待窗口、MOVE
+        圈末等待窗口与 CLICK/TURN 圈末等待窗口：点击/拖拽/掷骰链任何一次换绑之后，
+        旧 clip 的末帧/圈末观测都不得让新的绑定提前收口（否则旧 finished 一落进
+        新绑定，新一圈待机立刻被换掉 / 新一圈移动少走一圈 / 点击反应被旧证据
+        提前收口）。
         """
         ok = sprite.bind_clip(name)
+        self._clear_acts_tail(st)
+        self._clear_idle_tail(st)
+        self._clear_move_tail(st)
+        self._clear_tail(st, "click")
+        self._clear_tail(st, "turn")
         if ok and st.predictor is not None:
             st.predictor.begin_anim(name)
         return bool(ok)
@@ -510,16 +1296,37 @@ class BehaviorController:
         return [n for n in (cats["idles"] + cats["turns"]) if n not in cats["moves"]]
 
     def _play_animation_gap_step(self, sprite, st: _SpriteState) -> None:
-        """播一段 gap 氛围步（待机或转向）；池空回退待机（防御）。"""
+        """播一段 gap 氛围步（待机或转向）；池空回退待机（防御）。
+
+        掷中转向素材同样要过朝向闸门（旧机 gap 步走 ``_play_roll``，
+        window.py:2699-2707 + :2743-2763）：无需纠正（中线滞回带内或已朝内）时
+        降级待机，**朝向绝不由随机数翻转**——否则开启动画间隔后氛围步会背对
+        屏内方向随机转身（转向素材占 gap 池的比例即该概率）。
+        """
         cats = self._categories(sprite.library)
         name = self._pick(self._gap_pool(cats), exclude=st.anim)
         if name is None:
             self._enter_idle(sprite, st, cats)
             return
         if name in cats["turns"]:
-            self._enter_turn(sprite, st, cats, forced_name=name)
+            want = self._facing_want(sprite)
+            if cats["idles"] and (want is None or want == sprite.facing):
+                self._enter_idle(sprite, st, cats)   # 降级待机（旧 _play_roll 同款）
+            else:
+                self._enter_turn(sprite, st, cats, forced_name=name)
         else:
             self._enter_idle(sprite, st, cats, forced_name=name)
+
+    def _facing_want(self, sprite) -> str | None:
+        """中线滞回判出的「应朝方向」（None = 带内，无需纠正）。
+
+        朝向只跟随屏幕位置与移动目标，绝不由随机数翻转（window.py:2735-2745）。
+        掷骰链与 gap 氛围步共用这一处判据，两条链的口径不允许分叉。
+        """
+        off_x, _off_y, bw, _bh = self._body_geometry(sprite)
+        cx, left, right = movement.body_reach(
+            self.bounds.left(), self.bounds.right(), sprite.pos.x() + off_x, bw, self.margin)
+        return movement.inward_facing(cx, left, right)
 
     def _roll_next(self, sprite, st: _SpriteState) -> None:
         """待机播完掷骰：30% 待机 / 10% 转向 / 40% 待机（acts 桶让位）/ 20% 移动。
@@ -551,10 +1358,7 @@ class BehaviorController:
             return
         # 朝向闸门（window.py:2735-2745）：需要纠正朝向时一律播转向；
         # 掷中转向但无需纠正 → 降级待机。朝向绝不由随机数凭空翻转。
-        off_x, _off_y, bw, _bh = self._body_geometry(sprite)
-        cx, left, right = movement.body_reach(
-            self.bounds.left(), self.bounds.right(), sprite.pos.x() + off_x, bw, self.margin)
-        want = movement.inward_facing(cx, left, right)
+        want = self._facing_want(sprite)
         if action == STATE_ACTS:
             self._enter_acts(sprite, st, cats)
         elif want is not None and want != sprite.facing and cats["turns"]:
@@ -580,6 +1384,10 @@ class BehaviorController:
 
     def _enter_idle(self, sprite, st: _SpriteState, cats: dict,
                     forced_name: str | None = None) -> None:
+        # 离开接管态（含飞行落地收口）→ 摘掉飞行期首帧 pin：pin 只覆盖
+        # 「起飞 → 落地」窗口（window.py:4289 _stop_physics 同点）。放在最前，
+        # 与落地切待机同一 tick 内完成（无产出点，不会被穿插的逐出利用）
+        self._unpin_landing_idles(st)
         st.state = STATE_IDLE
         st.pending_move = None
         self._clear_move_plan(st)
@@ -609,10 +1417,12 @@ class BehaviorController:
         """进入拖拽接管态（F1）：绑 drag 悬空 clip（缺素材回退 idle 池）。
 
         velocity 不动（拖拽位置归鼠标；``on_press`` 已归零）。探针/掷骰链
-        的一切排定计划在此作废。
+        的一切排定计划在此作废。飞行被空中抓住（thrown → drag）时同时摘掉
+        飞行期首帧 pin（window.py:4318 同点语义）。
         """
         cats = self._categories(sprite.library)
         name = cats["drag"][0] if cats["drag"] else self._pick(cats["idles"])
+        self._unpin_landing_idles(st)
         st.state = STATE_DRAG
         st.pending_move = None
         self._cancel_gap(st)  # 拖拽接管打断 gap（window.py:4178 同款取消点）
@@ -631,6 +1441,11 @@ class BehaviorController:
         ——收口由 tick 的接管态自愈完成，本方法不碰速度/位置。播放速率由
         sprite_physics 每 tick 按速度叠加（physics.flight_anim_speed，
         window.py:4328-4340）。
+
+        起飞边沿同时预热 idle 首帧并打飞行期 pin（window.py:4314
+        ``_warm_landing_idles``）：落地的切换目标就是 idle 池，冷首帧会在
+        GUI 线程同步拉 ffmpeg（实测 ~100ms），pin 则挡住 8MB 首帧预算在
+        预热浪涌里把刚暖好的落地首帧挤掉。
         """
         cats = self._categories(sprite.library)
         name = cats["drag"][0] if cats["drag"] else self._pick(cats["idles"])
@@ -644,6 +1459,7 @@ class BehaviorController:
         if name is not None:
             # 起播被拒也静默：飞行段的位置积分不能因动画失败而中断
             self._bind_with_gen(sprite, st, name)
+        self._warm_landing_idles(sprite, st, cats)
 
     def _enter_acts(self, sprite, st: _SpriteState, cats: dict,
                     forced_name: str | None = None) -> None:
