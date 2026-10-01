@@ -951,8 +951,11 @@ def _prune_dead_meta_file_cache(cache: dict) -> int:
     体检实现：按父目录分组、每组一次 ``os.scandir`` 列名单比对，而不是逐条
     ``os.path.exists``。本机实测（真实缓存 4972 条 / 139 个目录）：分组 34.9ms vs
     逐条 462.6ms（Windows 上逐条 stat 病态昂贵，见 ``ByteOffsetTailer`` 注释）。
-    判定等价：目录列不出来 = 其下所有源文件都不存在。Windows 大小写不敏感，
-    比对时统一小写。
+    判定等价：目录列不出来 = 其下所有源文件都不存在。文件名比对用
+    ``os.path.normcase``：Windows 上折叠大小写（路径大小写不敏感，同一文件的
+    大小写变体算「存在」）；posix 上恒等（路径大小写敏感，``/tmp/A`` 与
+    ``/tmp/a`` 是两个不同文件，无条件折叠会把不存在的那一个误判为存活、
+    永远逐不出去）。
     """
     groups: dict[str, dict[str, list[str]]] = {}
     for key in cache:
@@ -966,9 +969,9 @@ def _prune_dead_meta_file_cache(cache: dict) -> int:
             for keys in names.values():   # 目录没了 / 读不了：其下条目一律视为死
                 dead.extend(keys)
             continue
-        lowered = {name.lower() for name in listed}
+        existing = {os.path.normcase(entry) for entry in listed}
         for name, keys in names.items():
-            if name.lower() not in lowered:
+            if os.path.normcase(name) not in existing:
                 dead.extend(keys)
     for key in dead:
         cache.pop(key, None)

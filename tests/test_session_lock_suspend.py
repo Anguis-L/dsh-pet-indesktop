@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 
 import pytest
 from ctypes import wintypes
@@ -175,6 +176,8 @@ def test_suspend_repeat_is_forwarded_but_state_is_tracked():
 
 
 # ---------------------------------------------------------------- WTS 注册（win32 边界打桩）
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="WTSRegisterSessionNotification 是 Windows 专有 API")
 def test_register_session_notifications_is_idempotent_and_unregisters(monkeypatch):
     calls: list = []
 
@@ -203,6 +206,8 @@ def test_register_session_notifications_is_idempotent_and_unregisters(monkeypatc
     assert len(calls) == 2
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="WTSRegisterSessionNotification 是 Windows 专有 API")
 def test_register_failure_degrades_without_raising(monkeypatch, caplog):
     """注册失败 → 降级为不支持并记日志（绝不让启动路径炸掉）。"""
     def _register(hwnd, flags):
@@ -217,6 +222,25 @@ def test_register_failure_degrades_without_raising(monkeypatch, caplog):
     # 未注册成功 ⇒ 反注册不得调用（绝不误摘别人的注册）
     monkeypatch.setattr(sw_mod, "_wts_unregister_session_notification",
                         lambda hwnd: pytest.fail("未注册成功不得反注册"))
+    watcher.unregister_session_notifications()
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX 降级路径：Windows 上走真实 WTS 注册（上面两条用例覆盖）")
+def test_register_session_notifications_noop_on_posix(monkeypatch):
+    """非 Windows：注册/反注册为无操作——返回 False 且绝不触碰 WTS 边界。
+
+    产品契约（session_watcher 模块 docstring / install_session_watcher）：非
+    Windows 平台降级为不支持锁屏探测，注册调用静默短路。本用例把这条降级
+    契约锁死，避免「Windows 专有」用例被门控后 POSIX 路径裸奔。
+    """
+    monkeypatch.setattr(sw_mod, "_wts_register_session_notification",
+                        lambda hwnd, flags: pytest.fail("POSIX 上不得触碰 WTS 注册边界"))
+    monkeypatch.setattr(sw_mod, "_wts_unregister_session_notification",
+                        lambda hwnd: pytest.fail("POSIX 上不得触碰 WTS 反注册边界"))
+    watcher = sw_mod.SessionWatcher(app=None, on_session_end=lambda: None,
+                                    install_native_filter=False)
+    assert watcher.register_session_notifications(12345) is False
     watcher.unregister_session_notifications()
 
 

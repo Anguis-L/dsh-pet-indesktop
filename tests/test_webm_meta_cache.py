@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import types
 
@@ -129,8 +130,11 @@ def test_meta_file_cache_evicts_entries_whose_source_file_is_gone(
     live.write_bytes(b"fake-live")
     live_stat = live.stat()
     live_key = f"{live}|{live_stat.st_mtime_ns}|{live_stat.st_size}"
-    # 大小写不同的同类路径必须算「存在」（Windows 路径大小写不敏感）
+    # 大小写变体的存活是平台语义：Windows 路径大小写不敏感，大写变体指向同一
+    # 文件，必须算「存在」；posix 大小写敏感，大写后的父目录根本不存在，该
+    # 条目就是死条目，必须被逐出。
     upper_key = f"{str(live).upper()}|{live_stat.st_mtime_ns}|{live_stat.st_size}"
+    live_keys = {live_key, upper_key} if os.name == "nt" else {live_key}
 
     cache_file = tmp_path / "meta.json"
     cache_file.write_text(
@@ -148,15 +152,15 @@ def test_meta_file_cache_evicts_entries_whose_source_file_is_gone(
     monkeypatch.setattr(webm_clip, "_META_FILE_CACHE", None)
     monkeypatch.setattr(webm_clip, "_META_FILE_CACHE_DEAD", set())
 
-    # 加载边界：源文件已删的条目逐出，活条目（含大小写变体）保留
-    assert set(webm_clip._get_meta_file_cache()) == {live_key, upper_key}
+    # 加载边界：源文件已删的条目逐出，活条目保留（大小写变体按平台语义，见上）
+    assert set(webm_clip._get_meta_file_cache()) == live_keys
 
     # 落盘边界：下一次写入把死条目从磁盘文件里一并带走
     webm_clip._META_FILE_CACHE = None
     webm_clip._save_meta_file_cache_entry(
         f"{live}|{live_stat.st_mtime_ns}|{live_stat.st_size}", 24, 1.0)
     raw = json.loads(cache_file.read_text(encoding="utf-8"))
-    assert set(raw) == {live_key, upper_key}
+    assert set(raw) == live_keys
     app.processEvents()
 
 

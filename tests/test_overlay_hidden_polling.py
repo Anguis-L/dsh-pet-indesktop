@@ -86,6 +86,10 @@ def _isolate_visibility_gate():
         gate._visible.add(widget)
 
 # ---------------------------------------------------------------- 穿透轮询表
+# 逐像素穿透控制器（WindowsPerPixelInputController）仅在 Windows 由 showEvent
+# 创建（overlay_window.showEvent 的 win32 门；posix 的 QRegion setMask 穿透是
+# spec 开放问题 Q1，尚未实现），下面三条穿透轮询用例仅 Windows 可跑。
+@pytest.mark.skipif(os.name != "nt", reason="逐像素穿透控制器仅 Windows 创建")
 def test_hide_stops_through_polling_and_show_resumes():
     overlay = _overlay()
     try:
@@ -100,6 +104,7 @@ def test_hide_stops_through_polling_and_show_resumes():
         overlay.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="逐像素穿透控制器仅 Windows 创建")
 def test_hidden_overlay_polls_nothing(monkeypatch):
     """隐藏 0.4s 内 0 次 refresh；可见窗口跑同一时长必须真在轮询（对照）。"""
     cursor = _CountingCursor(QPoint(-500, -500))
@@ -119,6 +124,7 @@ def test_hidden_overlay_polls_nothing(monkeypatch):
         overlay.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="逐像素穿透控制器仅 Windows 创建")
 def test_show_refreshes_through_state_immediately(monkeypatch):
     """显示后立即刷新一次：穿透态与当前命中口径一致，不留吞点击窗口。"""
     clicks = _CountingClickThrough()
@@ -211,8 +217,10 @@ def test_tray_hide_and_screen_migration_stay_paired(tmp_path):
         assert overlay_peripherals.visible_overlay_count() == base + 1, (
             "旧 overlay 必须从闸门里摘掉（hide/close 成对）")
         assert shell._watcher._cursor_timer.isActive()
-        ctl = shell.overlay._input_controller
-        assert ctl is not None and ctl._timer.isActive(), "新 overlay 必须重新轮询"
+        if os.name == "nt":
+            # 逐像素穿透轮询仅 Windows 创建（posix 穿透未实现，见文件头注释）
+            ctl = shell.overlay._input_controller
+            assert ctl is not None and ctl._timer.isActive(), "新 overlay 必须重新轮询"
     finally:
         shell.stop()
         shell._delete_runtime_marker()

@@ -1010,6 +1010,11 @@ def _bridge_writer_alive(pid: int) -> bool | None:
     try:
         from .slot_manager import pid_alive
         return bool(pid_alive(pid))
+    except OverflowError:
+        # posix 侧 os.kill 对超出 pid_t 表示范围的 pid 抛 OverflowError（非
+        # OSError，穿透 pid_alive 的 OSError 捕获）：这样的 pid 不可能存在，
+        # 判定为已死，与 Windows（OpenProcess 失败 → False）口径对齐。
+        return False
     except Exception:
         log.debug("桥文件写者探活失败 pid=%s", pid, exc_info=True)
         return None

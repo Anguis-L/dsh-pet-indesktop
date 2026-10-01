@@ -455,6 +455,19 @@ class TestDirGlobTailer:
         assert str(legacy) in tailer._tailers, "无 pid 线索的旧版文件保守保留"
         assert str(fresh_dead) in tailer._tailers, "未超龄的死写者文件保守保留"
 
+    def test_bridge_writer_alive_treats_out_of_range_pid_as_dead(self, monkeypatch):
+        """超出 pid_t 表示范围的 pid：posix ``os.kill`` 抛 OverflowError，判定为已死。
+
+        复现 CI（ubuntu/macos）：``_bridge_writer_alive(2**32-8)`` 返回 None
+        而非 False——OverflowError 非 OSError，穿透 ``pid_alive`` 的捕获后被
+        上层兜底成「判定失败」。本用例在 Windows 上也能钉死这条分支。
+        """
+        def raise_overflow(pid):
+            raise OverflowError("pid is out of range")
+
+        monkeypatch.setattr("pet.slot_manager.pid_alive", raise_overflow)
+        assert agent_link._bridge_writer_alive(4294967288) is False
+
     def test_scan_keeps_stale_file_when_liveness_cannot_be_decided(self, tmp_path, monkeypatch):
         """探活判定失败（返回 None）时按保守处理：不清理、仍参与轮询。"""
         old = time.time() - 3 * 24 * 3600

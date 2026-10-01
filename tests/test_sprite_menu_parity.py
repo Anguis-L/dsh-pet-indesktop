@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -83,6 +84,11 @@ MUSIC_LABELS = (
     "打开QQ音乐给主人放歌",
 )
 CHAT_GATED_LABELS = ("AI 对话", "AI 设置", "看看屏幕", "主动识屏", "DeepSeek 余额")
+# Windows 专有项：主动识屏 v1 依赖 win32 前台窗口/截屏能力（vision.py /
+# proactive.py 仅 win32 起监视器），菜单注册处 shared.add_proactive_menu 与
+# registry proactive_screen 均按 sys.platform == "win32" 门控——posix 上
+# 两侧建造器都不产出该项，期望模板须按平台分流（test_menu_layout.py 同先例）。
+WIN32_ONLY_LABELS = ("主动识屏",)
 
 
 # ---------------------------------------------------------------- 假件
@@ -321,7 +327,13 @@ def test_legacy_template_missing_entries_all_present(tmp_path):
     try:
         menu = build_sprite_full_menu(shell)
         labels = _all_labels(menu)
-        for label in REQUIRED_LABELS:
+        expected = REQUIRED_LABELS
+        if sys.platform != "win32":
+            expected = tuple(
+                label for label in REQUIRED_LABELS if label not in WIN32_ONLY_LABELS)
+            for label in WIN32_ONLY_LABELS:
+                assert label not in labels, f"posix 不应出现 Windows 专有项：{label}"
+        for label in expected:
             assert label in labels, f"legacy 模板缺项：{label}"
         # overlay 侧保留的、legacy.py 没有的三个入口（删掉就是实机可见回退）
         for label in ("桌宠设置", "隐藏桌宠"):
@@ -475,10 +487,12 @@ def test_menu_routes_legacy_service_semantics(tmp_path, monkeypatch):
         assert abs(shell.sprite.scale - expected_scale) < 1e-9
         assert config.get("scale") == shell.sprite.scale
         # 主动识屏 → proactive_screen 配置 + 共享监视器 apply_config
-        proactive_menu = _find(menu, "主动识屏").menu()
-        _find(proactive_menu, "开启主动识屏").setChecked(True)
-        assert config.get("proactive_screen", {}).get("enabled") is True
-        assert watcher_calls, "主动识屏开关必须让共享监视器重读配置"
+        # （Windows 专有：posix 菜单按设计不含该项，路由无从点击）
+        if sys.platform == "win32":
+            proactive_menu = _find(menu, "主动识屏").menu()
+            _find(proactive_menu, "开启主动识屏").setChecked(True)
+            assert config.get("proactive_screen", {}).get("enabled") is True
+            assert watcher_calls, "主动识屏开关必须让共享监视器重读配置"
         # Agent 联动 → 共享 manager.set_enabled
         link_menu = _find(menu, "Agent 联动").menu()
         _find(link_menu, "Claude Code").setChecked(True)
