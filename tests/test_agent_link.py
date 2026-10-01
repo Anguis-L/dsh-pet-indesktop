@@ -288,6 +288,11 @@ class TestDirGlobTailer:
         assert [json.loads(x)["event"] for x in tailer.read_new_lines()] == ["one"]
         second = tmp_path / "dsh-session-2.jsonl"
         second.write_text('{"event":"new-session"}\n', encoding="utf-8")
+        # Windows 目录时间戳惰性更新（本机 _probe_dir_mtime.py 实测 25/50 次不变），
+        # 「建文件 → 目录 mtime 变」不是确定前提；显式推新目录时间戳，确定性制造
+        # 目录变化信号（与 test_directory_change_within_interval_is_discovered 同款）。
+        stat = tmp_path.stat()
+        os.utime(tmp_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
         # Directory change bypasses the long periodic interval; startup
         # backfill still skips content written before this file was discovered.
         assert tailer.read_new_lines() == []
