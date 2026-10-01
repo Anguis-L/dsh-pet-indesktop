@@ -7,19 +7,20 @@
   remove 后不再触发 / remove_sprite 连带清理；
 - 气泡锚点换算纯函数 sprite_anchor_rect_global（overlay 局部 → 全局）；
 - 真实 PetSpeechBubble 经 SpriteBubbleFollower 跟随 sprite 位移；
-- IslandCollisionBridge：静态成员注册/注销/几何更新（假岛喂几何）、
-  撞岛事件（pair 含 ISLAND_MEMBER_ID 且超阈值 → bump + 音效；未超不触发）、
-  真实 DynamicIsland 构造接线。
+- IslandWindowBridge：静态成员注册/注销/几何更新（假岛喂几何）、
+  撞岛事件（pair 含 ISLAND_MEMBER_ID 且超阈值 → bump；未超不触发；音效由
+  世界监听侧单入口派发，桥内不再重复调用）、
+  真实 DynamicIsland 构造接线；
+- 可见性闸门 OverlayVisibilityGate（O2）：光标探测表只在有可见 overlay 时跑，
+  全屏探测表不受影响（隐藏后它是恢复显示的唯一路径）。
 
 纪律：同步直调 _on_tick(dt=...) / 事件处理器，不启动真实 QTimer、不固定
-sleep 赌时序（AGENTS.md 时序测试纪律）。demo 模块无 PET_OVERLAY_DEMO 也可
-import（env 守卫在 main() 内）。
+sleep 赌时序（AGENTS.md 时序测试纪律）。
 """
 from __future__ import annotations
 
-import importlib.util
+import gc
 import os
-from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -28,19 +29,16 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QWidget
 
 from pet import collision as collision_mod
+from pet import overlay_peripherals
 from pet.config import Config
 from pet.dynamic_island import DynamicIsland
+from pet.island_bridge import IslandWindowBridge
+from pet.overlay_peripherals import FullscreenCursorWatcher, OverlayVisibilityGate
 from pet.overlay_window import OverlayWindow
+from pet.sprite_bubble import SpriteBubbleFollower, sprite_anchor_rect_global
 from pet.sprite_collision import CollisionEvent, SpriteCollisionWorld
 
 app = QApplication.instance() or QApplication([])
-
-# demo 不是包内模块：按路径装载（其模块级只有 import/常量，env 守卫在 main 内）
-_DEMO_PATH = (Path(__file__).resolve().parents[1]
-              / ".scratch" / "single-overlay-window" / "run_overlay_demo.py")
-_spec = importlib.util.spec_from_file_location("run_overlay_demo", _DEMO_PATH)
-demo = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(demo)
 
 
 # ---------------------------------------------------------------- 假件
@@ -170,13 +168,13 @@ def test_remove_sprite_drops_position_listeners():
 # ---------------------------------------------------------------- 气泡锚点换算（纯函数）
 def test_sprite_anchor_rect_global_converts_origin():
     sprite = FakeSprite((100, 50), size=(80, 60))
-    anchor = demo.sprite_anchor_rect_global(sprite, QPoint(10, 20))
+    anchor = sprite_anchor_rect_global(sprite, QPoint(10, 20))
     assert anchor == QRect(110, 70, 80, 60)
 
 
 def test_sprite_anchor_rect_global_zero_origin():
     sprite = FakeSprite((7, 9), size=(40, 30))
-    anchor = demo.sprite_anchor_rect_global(sprite, QPoint(0, 0))
+    anchor = sprite_anchor_rect_global(sprite, QPoint(0, 0))
     assert anchor == QRect(7, 9, 40, 30)
 
 
@@ -185,7 +183,7 @@ def test_bubble_follower_real_bubble_follows_sprite():
     overlay = _overlay()
     sprite = FakeSprite((100, 200), movable=True)
     overlay.add_sprite(sprite)
-    follower = demo.SpriteBubbleFollower(overlay, sprite)
+    follower = SpriteBubbleFollower(overlay, sprite)
     try:
         assert follower.bubble is not None
         assert follower.say("测试一句") is True
@@ -210,7 +208,7 @@ def test_island_static_member_registered_and_updated():
     island = FakeIsland()
     island.setGeometry(500, 300, 200, 44)
     island.show()
-    bridge = demo.IslandCollisionBridge(island, world, overlay, sound=StubSound())
+    bridge = IslandWindowBridge(island, world, overlay, sound=StubSound())
     try:
         member = world._static_members.get(collision_mod.ISLAND_MEMBER_ID)
         assert member == (500 - origin.x(), 300 - origin.y(), 200, 44)
@@ -232,22 +230,23 @@ def test_island_static_member_registered_and_updated():
 
 
 # ---------------------------------------------------------------- 撞岛反馈
-def test_island_hit_above_threshold_bumps_and_plays_sound():
+def test_island_hit_above_threshold_bumps_and_defers_sound_to_world_listener():
     overlay = _overlay()
     world = SpriteCollisionWorld()
     island = FakeIsland()
     island.setGeometry(500, 300, 200, 44)
     island.show()
     sound = StubSound()
-    bridge = demo.IslandCollisionBridge(island, world, overlay, sound=sound)
+    bridge = IslandWindowBridge(island, world, overlay, sound=sound)
     try:
         bridge.on_collision(_island_event(100.0))
         assert island.bump_calls == [(0.25, 0.6, 0.8)]  # min(3, 100/400)；b=岛 → +n
-        assert len(sound.events) == 1
         # a=岛：方向取反（岛被顶的方向 = 从对方指向岛）
         bridge.on_collision(_island_event(900.0, a=collision_mod.ISLAND_MEMBER_ID, b="sprite-9"))
         assert island.bump_calls[-1] == (2.25, -0.6, -0.8)
-        assert len(sound.events) == 2
+        # 音效不再由桥派发：同一个 SpriteSoundPlayer 已注册在世界监听侧
+        # （overlay_shell._build），桥内再调一次 = 每个岛击事件两遍 on_collision
+        assert sound.events == []
     finally:
         bridge.close()
         island.close()
@@ -259,7 +258,7 @@ def test_island_hit_below_threshold_no_feedback():
     island = FakeIsland()
     island.show()
     sound = StubSound()
-    bridge = demo.IslandCollisionBridge(island, world, overlay, sound=sound)
+    bridge = IslandWindowBridge(island, world, overlay, sound=sound)
     try:
         bridge.on_collision(_island_event(30.0))
         bridge.on_collision(_island_event(500.0, a="x", b="y"))  # pair 不含岛
@@ -277,7 +276,7 @@ def test_real_dynamic_island_registers_in_collision_world(tmp_path):
     world = SpriteCollisionWorld()
     cfg = Config(base=tmp_path)
     island = DynamicIsland(cfg)
-    bridge = demo.IslandCollisionBridge(island, world, overlay, sound=StubSound())
+    bridge = IslandWindowBridge(island, world, overlay, sound=StubSound())
     try:
         island.show()
         g = island.geometry()
@@ -290,3 +289,88 @@ def test_real_dynamic_island_registers_in_collision_world(tmp_path):
         bridge.close()
         island.close()
     assert collision_mod.ISLAND_MEMBER_ID not in world._static_members
+
+
+# ---------------------------------------------------------------- 可见性闸门（O2）
+def _watcher(gate, probes: list) -> FullscreenCursorWatcher:
+    return FullscreenCursorWatcher(
+        fullscreen_probe=lambda: False,
+        cursor_probe=lambda: probes.append(1) or "UNKNOWN",
+        overlay_visibility=gate)
+
+
+def test_cursor_timer_follows_overlay_visibility():
+    """没有可见 overlay 就不跑光标探测；有则跑；全屏表始终不受影响。"""
+    gate = OverlayVisibilityGate()
+    probes: list = []
+    w = _watcher(gate, probes)
+    widget = QWidget()
+    try:
+        w.set_fullscreen_enabled(True)
+        w.set_cursor_enabled(True)
+        assert not w._cursor_timer.isActive(), "无可见 overlay：不空转"
+        assert w._fs_timer.isActive()
+
+        gate.note(widget, True)
+        assert w._cursor_timer.isActive()
+        probes.clear()
+        gate.note(widget, False)
+        assert not w._cursor_timer.isActive()
+        assert probes == [], "隐藏后不得再探测光标"
+        assert w._fs_timer.isActive(), "全屏探测表不受显隐影响"
+
+        gate.note(widget, True)
+        assert w._cursor_timer.isActive()
+        assert probes, "恢复显示必须立即补一次探测（停表对去抖状态机透明）"
+    finally:
+        w.stop()
+        widget.close()
+
+
+def test_cursor_gate_off_wins_over_visibility():
+    """配置门关：即使有可见 overlay 也不跑；再开时按当前可见性决定。"""
+    gate = OverlayVisibilityGate()
+    probes: list = []
+    w = _watcher(gate, probes)
+    widget = QWidget()
+    w.set_cursor_enabled(True)
+    try:
+        gate.note(widget, True)
+        assert w._cursor_timer.isActive()
+        w.set_cursor_enabled(False)
+        assert not w._cursor_timer.isActive()
+        gate.note(widget, False)
+        w.set_cursor_enabled(True)
+        assert not w._cursor_timer.isActive(), "门开了但窗口仍隐藏：不跑"
+        gate.note(widget, True)
+        assert w._cursor_timer.isActive()
+    finally:
+        w.stop()
+        widget.close()
+
+
+def test_gate_drops_destroyed_widgets():
+    """弱引用登记：窗口被回收即自动摘除，不会把闸门永久顶开。"""
+    gate = OverlayVisibilityGate()
+    widget = QWidget()
+    gate.note(widget, True)
+    assert gate.any_visible() is True
+    assert gate.count() == 1
+    widget.close()
+    del widget
+    gc.collect()
+    assert gate.any_visible() is False
+
+
+def test_module_gate_reports_real_overlay_visibility():
+    """真 OverlayWindow 的 show/hide 走模块级闸门（生产路径）。"""
+    overlay = OverlayWindow()
+    base = overlay_peripherals.visible_overlay_count()
+    try:
+        overlay.show()
+        assert overlay_peripherals.visible_overlay_count() == base + 1
+        overlay.hide()
+        assert overlay_peripherals.visible_overlay_count() == base
+    finally:
+        overlay.close()
+    assert overlay_peripherals.visible_overlay_count() == base

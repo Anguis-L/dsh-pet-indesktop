@@ -9,6 +9,7 @@ QApplication。覆盖：清单原子读写/顺序保持、缺失=首次运行、
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -129,3 +130,102 @@ def test_slot_geometry_drops_illegal_values(tmp_path):
 def test_slot_geometry_empty_write_is_rejected(tmp_path):
     assert ovs.write_slot_geometry(tmp_path, 1, {"rx": None, "facing": "up"}) is False
     assert ovs.slot_config_exists(tmp_path, 1) is False
+
+
+# ---------------------------------------------------------------- B7b：通用 slot 读/写点
+def test_read_slot_config_missing_is_none_corrupt_is_empty(tmp_path):
+    """缺文件 → None（调用方继承主配置）；损坏/非对象 → {}（逐键回默认）。"""
+    assert ovs.read_slot_config(tmp_path, 1) is None
+    _write(tmp_path / "config-slot-1.json", "{ broken")
+    assert ovs.read_slot_config(tmp_path, 1) == {}
+    _write(tmp_path / "config-slot-1.json", "[1, 2]")
+    assert ovs.read_slot_config(tmp_path, 1) == {}
+
+
+def test_read_slot_config_returns_raw_dict(tmp_path):
+    _write(tmp_path / "config-slot-2.json",
+           json.dumps({"version": 4, "playback_speed": 0.5,
+                       "self_talk_texts": ["台词"]}))
+    data = ovs.read_slot_config(tmp_path, 2)
+    assert data["playback_speed"] == 0.5
+    assert data["self_talk_texts"] == ["台词"]
+
+
+def test_write_slot_setting_preserves_other_keys_and_is_atomic(tmp_path):
+    """单键写入保留该身份其它键；原子替换（无 .tmp 残留）；不碰主配置。"""
+    _write(tmp_path / "config-slot-1.json",
+           json.dumps({"version": 4, "character": "nova", "rx": 0.5}))
+    assert ovs.write_slot_setting(tmp_path, 1, "playback_speed", 0.5) is True
+    raw = json.loads((tmp_path / "config-slot-1.json").read_text(encoding="utf-8"))
+    assert raw["playback_speed"] == 0.5
+    assert raw["character"] == "nova" and raw["rx"] == 0.5
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_write_slot_setting_missing_file_creates_it(tmp_path):
+    """身份文件不存在也照写（旧版子宠进程的 Config 会自行落种）。"""
+    assert ovs.write_slot_setting(tmp_path, 3, "drag_physics", True) is True
+    raw = json.loads((tmp_path / "config-slot-3.json").read_text(encoding="utf-8"))
+    assert raw["drag_physics"] is True
+    assert raw["version"] == 4
+
+
+def test_write_slot_setting_user_customized_flag(tmp_path):
+    """``user_customized=True`` 置位（旧契约：用户主动设置过的 slot 不再被主设置刷新）。"""
+    assert ovs.write_slot_setting(tmp_path, 1, "scale", 1.5,
+                                  user_customized=True) is True
+    raw = json.loads((tmp_path / "config-slot-1.json").read_text(encoding="utf-8"))
+    assert raw["user_customized"] is True
+    # 不传 = 保持原值（后台自存写盘不置位）
+    assert ovs.write_slot_setting(tmp_path, 1, "scale", 1.6) is True
+    raw = json.loads((tmp_path / "config-slot-1.json").read_text(encoding="utf-8"))
+    assert raw["user_customized"] is True
+
+    _write(tmp_path / "config-slot-2.json", json.dumps({"version": 4}))
+    assert ovs.write_slot_setting(tmp_path, 2, "scale", 1.2) is True
+    raw = json.loads((tmp_path / "config-slot-2.json").read_text(encoding="utf-8"))
+    assert "user_customized" not in raw
+
+
+def test_write_slot_setting_rejects_empty_key(tmp_path):
+    assert ovs.write_slot_setting(tmp_path, 1, "", 1.0) is False
+    assert ovs.write_slot_setting(tmp_path, 1, "   ", 1.0) is False
+    assert ovs.slot_config_exists(tmp_path, 1) is False
+
+
+# ------------------------------------------ 写盘瞬时共享冲突（Windows 实机 S1）
+def test_write_slot_setting_retries_transient_share_conflict(tmp_path, monkeypatch):
+    """实机：目录 watcher / 3s 轮询读 slot 配置时撞上 ``os.replace`` → WinError 5。
+
+    ``MSVCRT _wopen`` 的共享模式不含 FILE_SHARE_DELETE，读方与写方撞同一文件即
+    PermissionError；瞬时冲突必须退避重试，否则子宠设置静默丢失。
+    """
+    target = tmp_path / "config-slot-1.json"
+    real = os.replace
+    seen = {"n": 0}
+
+    def flaky(src, dst, *args, **kwargs):
+        if os.fspath(dst) == os.fspath(target) and seen["n"] < 1:
+            seen["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    assert ovs.write_slot_setting(tmp_path, 1, "playback_speed", 0.5) is True
+    assert seen["n"] == 1
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    assert raw["playback_speed"] == 0.5
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_writers_clean_temp_on_persistent_conflict(tmp_path, monkeypatch):
+    """冲突不消失：三个原子写都返回 False，且都不留 ``.tmp`` 残留。"""
+    def boom(src, dst, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "replace", boom)
+    assert ovs.save_active_slots(tmp_path, [1]) is False
+    assert ovs.write_slot_setting(tmp_path, 1, "scale", 1.5) is False
+    assert ovs.write_slot_geometry(tmp_path, 1, {"rx": 0.5, "ry": 0.5}) is False
+    assert list(tmp_path.glob("*.tmp")) == []

@@ -485,3 +485,136 @@ def test_overlay_sprite_hit_at_dpr_uses_logical_coords():
     assert overlay.sprite_at(QPoint(105, mid_y)) is sprite          # 左半不透明
     assert overlay.sprite_at(QPoint(100 + LOGICAL_W // 2 + 5, mid_y)) is None
     assert overlay.sprite_at(QPoint(100 - 1, mid_y)) is None        # 矩形粗筛外
+
+
+# ================================================================ O1：帧重建链恒等短路
+class _TransformProbe(QImage):
+    """记录重建链上每个变换调用的真实 QImage（子类即 seam，不做像素级替身）。
+
+    产品代码 ``_rebuild_pixmap`` 调的是这张图的公开方法；断言"该跳的整条链都跳、
+    该做的仍然按序做"，而不是数像素或 mock 产品对象。变换结果继续用探针包装
+    （同尺寸浅拷贝）并共享同一份日志，因此 convert→scaled 的**顺序**也能钉住。
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.calls: list[str] = []
+        if args and isinstance(args[0], QImage):
+            super().__init__(args[0])
+        else:
+            super().__init__(*args, **kwargs)
+
+    def _derive(self, image):
+        probe = _TransformProbe(image)
+        probe.calls = self.calls                           # 子图继续写同一份日志
+        return probe
+
+    def convertToFormat(self, fmt, *a, **kw):
+        self.calls.append("convert")
+        return self._derive(super().convertToFormat(fmt, *a, **kw))
+
+    def scaled(self, *a, **kw):
+        self.calls.append("scaled")
+        return self._derive(super().scaled(*a, **kw))
+
+    def flipped(self, *a, **kw):
+        self.calls.append("flipped")
+        return self._derive(super().flipped(*a, **kw))
+
+    def mirrored(self, *a, **kw):
+        self.calls.append("mirrored")           # 废弃 API：重建链不该再走它
+        return self._derive(super().mirrored(*a, **kw))
+
+
+def _premultiplied_frame(w, h):
+    """已是 ARGB32_Premultiplied 的帧（GifClip/预乘来源素材的形态）。"""
+    img = _TransformProbe(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    painter.fillRect(0, 0, w, h, QColor(0, 255, 0, 255))
+    painter.end()
+    return img
+
+
+def test_identity_frame_skips_convert_and_scale():
+    """O1：格式已是 ARGB32_Premultiplied 不 convert；目标尺寸==源尺寸不 scaled。
+
+    scale=0.5 × dpr=1.0 的目标物理尺寸恰为 320×180（=源尺寸），格式也已预乘：
+    整条链都是恒等变换。两条短路的成本收益在真素材上量不出（Qt 自己对同格式
+    convert / 同尺寸 smooth scaled 已各短路到 ~1-2µs，见证据目录微基准），
+    保留它们是为了不再白调那两次 API；这里钉的是**语义不变**：结果尺寸/格式/
+    命中图仍与逐级变换一致，且命中图绝不与帧缓冲别名。
+    """
+    frame = _premultiplied_frame(LOGICAL_W, LOGICAL_H)      # 320×180 预乘
+    sprite = _make_sprite(scale=SCALE, dpr=1.0, clip=FakeClip(frame))
+    frame.calls.clear()
+
+    sprite._frame_sig = None                                # 作废签名 → 强制整链重建
+    assert sprite._rebuild_pixmap() is True
+
+    assert frame.calls == [], f"恒等帧不得走任何变换：{frame.calls}"
+    assert (sprite._pixmap.width(), sprite._pixmap.height()) == (LOGICAL_W, LOGICAL_H)
+    # V-15 别名面：整链短路后 img 就是帧本身，命中图必须是独立缓冲（深拷贝）
+    assert sprite._hit_image.cacheKey() != frame.cacheKey()
+    assert sprite._hit_image.format() == QImage.Format.Format_ARGB32_Premultiplied
+    assert sprite._hit_image is not None
+    assert sprite.alpha_at(QPoint(5, LOGICAL_H // 2)) == 255
+
+
+def test_needed_transforms_still_run_in_order():
+    """O1 反向守门：源格式/尺寸不匹配时链条逐级照旧（顺序 = 先预乘再缩放）。"""
+    raw = _TransformProbe(catalog.CANVAS_W, catalog.CANVAS_H,
+                          QImage.Format.Format_ARGB32)      # 640×360 直通 alpha
+    raw.fill(Qt.GlobalColor.transparent)
+    sprite = _make_sprite(scale=SCALE, dpr=1.0, clip=FakeClip(raw))
+
+    raw.calls.clear()
+    sprite._frame_sig = None                                # 320×180 目标：两级都不恒等
+    assert sprite._rebuild_pixmap() is True
+    assert raw.calls == ["convert", "scaled"]               # 顺序不可交换（防暗边）
+    assert (sprite._pixmap.width(), sprite._pixmap.height()) == (LOGICAL_W, LOGICAL_H)
+
+    raw.calls.clear()
+    sprite.set_dpr(2.0)                                     # 640×360 目标：缩放恒等
+    assert raw.calls == ["convert"]
+    assert (sprite._pixmap.width(), sprite._pixmap.height()) == (LOGICAL_W * 2, LOGICAL_H * 2)
+
+    sprite.facing = "right"                                 # 镜像分支：flipped 在最前
+    raw.calls.clear()
+    sprite._frame_sig = None
+    sprite._rebuild_pixmap()
+    assert raw.calls == ["flipped", "convert"]
+
+
+def test_mirror_uses_flipped_horizontal():
+    """O1：mirrored(True, False) → flipped(Qt.Horizontal)，轴向不变（左右镜像）。
+
+    左上角小块镜像后必须落在右上角；上下镜像/不镜像都过不了这组断言。
+    """
+    img = _TransformProbe(catalog.CANVAS_W, catalog.CANVAS_H,
+                          QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(img)
+    painter.fillRect(0, 0, 64, 32, QColor(0, 255, 0, 255))  # 源像素左上 64×32
+    painter.end()
+
+    sprite = _make_sprite(scale=SCALE, dpr=1.0, clip=FakeClip(img))
+    sprite.facing = "right"
+    img.calls.clear()
+    sprite._frame_sig = None
+    assert sprite._rebuild_pixmap() is True
+
+    assert img.calls == ["flipped", "convert", "scaled"], \
+        f"镜像必须走 flipped（mirrored 已废弃）：{img.calls}"
+    out = sprite._pixmap.toImage()
+    # 64×32 源块 ×0.5 → 物理 32×16，镜像后贴右边缘
+    assert out.pixelColor(LOGICAL_W - 8, 8) == QColor(0, 255, 0, 255)
+    assert out.pixelColor(8, 8).alpha() == 0                 # 左半已空（确实镜像了）
+    assert out.pixelColor(8, LOGICAL_H - 8).alpha() == 0     # 不是上下镜像
+    assert out.pixelColor(LOGICAL_W - 8, LOGICAL_H - 8).alpha() == 0
+
+    sprite.facing = "left"                                   # 回正：不镜像
+    img.calls.clear()
+    sprite._frame_sig = None
+    sprite._rebuild_pixmap()
+    assert img.calls == ["convert", "scaled"]                # 无 flipped
+    assert sprite._pixmap.toImage().pixelColor(8, 8) == QColor(0, 255, 0, 255)

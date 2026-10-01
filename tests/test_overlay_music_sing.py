@@ -100,7 +100,16 @@ def test_music_sing_switches_to_sing_anim_and_back(tmp_path):
 
 
 def test_music_sing_replays_clip_while_music_continues(tmp_path):
-    """唱歌 clip 播完而音乐仍在放 → 无缝续播（window.py:2473-2481 语义）。"""
+    """唱歌 clip 播完而音乐仍在放 → 无缝续播（window.py:2595-2601 语义）。
+
+    收口判据归状态机（``BehaviorController.sing_continue_provider``），不再是
+    extras 链观测到的「ACTS → IDLE 下降沿」：后者只在掷骰恰好落到待机时才成立，
+    旧测试用 ``ScriptedRng(rolls=[0.05])`` 强行掷中待机桶，属自证式通过——掷骰
+    0.85（移动桶，占比 20%）时唱歌照样被打断。
+
+    判据来源是本壳构造期自己接的（``_init_music_sing`` 一行）——测试**不再**
+    手工注入 provider，否则「壳到底接没接」永远测不到。
+    """
     shell, lib = _make_shell(tmp_path, {"music_sing_enabled": True})
     from pet.window import SING_ANIM
     lib._clips[SING_ANIM] = fac.FakeClip(SING_ANIM, 24)
@@ -113,25 +122,84 @@ def test_music_sing_replays_clip_while_music_continues(tmp_path):
         sprite = shell.sprite
         shell._music_sing_active = True
         shell.switch_clip(SING_ANIM)
-        chain = shell._music_sing_chain
-        chain.tick([sprite], 0.016)                 # 观测到"正在唱歌"
-        assert chain._was_singing is True
+        assert shell.behavior.state_of(sprite) == STATE_ACTS
 
-        # 唱歌 clip 到点 → 行为链回待机（确定性 rng：掷中待机桶）
-        shell.behavior.rng = ScriptedRng(rolls=[0.05])
+        assert callable(shell.behavior.sing_continue_provider), \
+            "壳构造期必须把唱歌续播判据接到状态机（_init_music_sing 一行）"
+        # 唱歌 clip 到点：掷骰 0.85 命中的是移动桶，续唱不得依赖掷骰结果
+        shell.behavior.rng = ScriptedRng(rolls=[0.85])
         shell.behavior.tick([sprite], 24 * 42 / 1000.0 + 0.1)
-        assert shell.behavior.state_of(sprite) == "idle"
-
-        chain.tick([sprite], 0.016)                 # 音乐仍在放 → 续播
         assert shell.behavior.state_of(sprite) == STATE_ACTS
         assert shell.behavior.anim_of(sprite) == SING_ANIM
 
         # 纯音乐标志 / 音乐停止 → 不再续播
         shell.set_instrumental_playing(True)
         assert shell._music_sing_active is False
+        shell.behavior.tick([sprite], 24 * 42 / 1000.0 + 0.1)
+        assert shell.behavior.anim_of(sprite) != SING_ANIM
     finally:
         shell.overlay.close()
         shell._delete_runtime_marker()
+
+
+def _sing_scene():
+    """BehaviorController 直连现场：唱歌素材当一次性动画播（无壳/无 extras 链）。"""
+    from pet.sprite_behavior import BehaviorController
+    from tests.test_sprite_behavior import (
+        BOUNDS,
+        ScriptedRng,
+        _make_library,
+        _make_sprite,
+    )
+    from pet.window import SING_ANIM
+
+    lib = _make_library(idles=["idle1", SING_ANIM])
+    sprite = _make_sprite(lib, facing="right")
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=[0.85], ints=(100, 0)))
+    c.predict_enabled = False
+    assert c.play_once(sprite, SING_ANIM) is True
+    return c, sprite, lib, SING_ANIM
+
+
+def _sing_expire(c, sprite, lib, sing):
+    from pet.sprite_behavior import STATE_ACTS
+    assert c.state_of(sprite) == STATE_ACTS
+    c.tick([sprite], lib.duration(sing) + 0.1)
+
+
+def test_behavior_continues_singing_when_roll_lands_outside_idle():
+    """掷骰命中移动桶（0.85）也必须续唱：判据在状态机，不看掷骰结果。"""
+    from pet.sprite_behavior import STATE_ACTS
+
+    c, sprite, lib, sing = _sing_scene()
+    c.sing_continue_provider = lambda: True
+    _sing_expire(c, sprite, lib, sing)
+
+    assert c.state_of(sprite) == STATE_ACTS
+    assert c.anim_of(sprite) == sing
+
+
+def test_behavior_does_not_continue_singing_without_provider_or_when_false():
+    """默认（壳未注入）与 provider 返假：都走原掷骰链——默认行为零变化。"""
+    from pet.sprite_behavior import STATE_ACTS
+
+    for provider in (None, lambda: False):
+        c, sprite, lib, sing = _sing_scene()
+        c.sing_continue_provider = provider
+        _sing_expire(c, sprite, lib, sing)
+        assert (c.state_of(sprite), c.anim_of(sprite)) != (STATE_ACTS, sing), \
+            "未注入/返假时不得续唱（唱歌随掷骰结果自然打断）"
+
+
+def test_behavior_does_not_continue_singing_for_other_anim():
+    """续唱只认唱歌素材本身：同一 provider 对普通动作绝不放行。"""
+    from pet.sprite_behavior import STATE_ACTS
+
+    c, sprite, lib, sing = _sing_scene()
+    c.sing_continue_provider = lambda: True
+    assert c.play_once(sprite, "idle1") is True
+    _sing_expire(c, sprite, lib, sing)
+    assert c.anim_of(sprite) != sing
 
 
 def test_music_sing_config_hot_toggle(tmp_path):

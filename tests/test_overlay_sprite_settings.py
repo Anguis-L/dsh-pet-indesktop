@@ -7,6 +7,7 @@ throw_speed_cap=6000 vs standard=4800）——开箱行为不一致 + 重启即�
 """
 from __future__ import annotations
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 import tests.test_overlay_window_capabilities as cap
@@ -148,3 +149,132 @@ def test_island_hit_below_300_still_squashes(tmp_path):
         shell._delete_runtime_marker()
     finally:
         shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- B7a：碰撞物理 4 键
+def test_collision_physics_keys_reach_world(tmp_path):
+    """设置页「碰撞参数（高级）」4 键 → 世界求解参数（此前 overlay 零消费）。
+
+    旧架构每只宠各读自己 cfg 并逐次求解时使用（collision_client.py:140-145 /
+    :558-563）；新版此前只写 ``SpriteCollisionWorld()`` 默认值，改了什么都不会变。
+    """
+    shell, config = _make_shell(tmp_path, {})
+    try:
+        world = shell.collision
+        config.set("collision_restitution", 0.5)
+        config.set("collision_friction", 0.2)
+        config.set("collision_mass_scale", 1.5)
+        config.set("collision_impulse_cap", 4000.0)
+        shell.refresh_settings()
+        assert world.restitution == pytest.approx(0.5)
+        assert world.friction == pytest.approx(0.2)
+        assert world.mass_scale == pytest.approx(1.5)
+        assert world.impulse_cap == pytest.approx(4000.0)
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_collision_physics_keys_reach_solver(tmp_path, monkeypatch):
+    """4 键必须在运行期真的进求解器入参（不只是写在世界属性上）。"""
+    import tests.test_overlay_collision_toggle as toggle
+    from pet import collision as collision_mod
+
+    shell, _cfg = toggle._make_slot_shell(tmp_path, collision_enabled=True)
+    seen: dict = {}
+    real_solve = collision_mod.solve_multi_body_collision
+
+    def spy(members, **kwargs):
+        seen.update(kwargs)
+        return real_solve(members, **kwargs)
+
+    monkeypatch.setattr(collision_mod, "solve_multi_body_collision", spy)
+    try:
+        shell.spawn_pet()
+        shell.spawn_pet()
+        sprites = list(shell.overlay.sprites)
+        shell._config.set("collision_restitution", 0.5)
+        shell._config.set("collision_friction", 0.2)
+        shell._config.set("collision_mass_scale", 1.5)
+        shell._config.set("collision_impulse_cap", 4000.0)
+        shell.refresh_settings()
+        toggle._setup(shell.collision, sprites, vx=500.0)
+        shell.collision.tick(list(shell.overlay.sprites), 0.016)
+        assert seen, "前提：真 tick 走到了多体求解"
+        assert seen["restitution"] == pytest.approx(0.5)
+        assert seen["friction"] == pytest.approx(0.2)
+        assert seen["impulse_cap"] == pytest.approx(4000.0)
+        assert shell.collision.mass_scale == pytest.approx(1.5)
+    finally:
+        monkeypatch.undo()
+        toggle._teardown(shell)
+
+
+def _collision_relative_speed(tmp_path, restitution: float) -> float:
+    """单案例现场：真壳 + 迎面真撞一次 → 撞后相对速度（每案例独立壳/世界）。
+
+    必须一案一壳：世界的扫掠快照/重叠去抖是跨 tick 的，同一实例连撞两次时
+    第二拍的冲量口径与首拍不同（实测），会把「恢复系数有没有生效」这件事测糊。
+    """
+    import tests.test_overlay_collision_toggle as toggle
+
+    case_dir = tmp_path / f"rest{restitution}"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    shell, cfg = toggle._make_slot_shell(case_dir, collision_enabled=True)
+    try:
+        shell.spawn_pet()
+        shell.spawn_pet()
+        sprites = list(shell.overlay.sprites)
+        cfg.set("collision_restitution", restitution)
+        cfg.set("collision_mass_scale", 1.0)
+        cfg.set("collision_impulse_cap", 12000.0)
+        shell.refresh_settings()
+        toggle._setup(shell.collision, sprites, vx=500.0)
+        shell.collision.tick(list(shell.overlay.sprites), 0.016)
+        assert sprites[0].interaction_state == "thrown", "前提：真撞发生了"
+        return abs(sprites[0].velocity.x() - sprites[1].velocity.x())
+    finally:
+        toggle._teardown(shell)
+
+
+def test_collision_restitution_changes_real_solve(tmp_path):
+    """端到端：恢复系数真的改变弹开速度（0.95 明显比 0.2 弹得开）。"""
+    slow = _collision_relative_speed(tmp_path, 0.2)
+    fast = _collision_relative_speed(tmp_path, 0.95)
+    assert fast > slow + 100.0, f"恢复系数未影响求解：0.2→{slow}, 0.95→{fast}"
+
+
+
+# ---------------------------------------------------------------- B7b：per-slot 生效
+def test_scale_applies_at_runtime(tmp_path):
+    """设置页改大小 → refresh_settings 即生效；子宠按**它自己**的 slot 配置取源。
+
+    B7b 改写：原断言锁"子宠 scale 本批不动（归 B7b）"——那是 B7a 的过渡口径。
+    新契约 = 旧版"每只宠各读自己那份 config"：子宠的缩放/速率由它自己的
+    ``config-slot-N.json`` 决定，主宠的设置不再拖走子宠，反之亦然。
+    """
+    import tests.test_overlay_collision_toggle as toggle
+    from pet import overlay_spawn_state as ovs
+
+    shell, cfg = toggle._make_slot_shell(tmp_path, scale=0.5)
+    try:
+        assert shell.sprite.scale == pytest.approx(0.5)
+        cfg.set("scale", 1.0)
+        shell.refresh_settings()
+        assert shell.sprite.scale == pytest.approx(1.0)
+
+        shell.spawn_pet()
+        child = shell._spawned[0]
+        # 这只子肥鱼自己的设置页保存了 0.5 → 只有它按 0.5 走
+        assert ovs.write_slot_setting(cfg.dir, 1, "scale", 0.5,
+                                      user_customized=True)
+        shell._on_settings_command_dir_changed(str(cfg.dir))
+        assert child.scale == pytest.approx(0.5)
+        assert shell.sprite.scale == pytest.approx(1.0)
+
+        # 主配置再改：主宠跟着变，子宠按自己那份不变
+        cfg.set("scale", 0.72)
+        shell.refresh_settings()
+        assert shell.sprite.scale == pytest.approx(0.72)
+        assert child.scale == pytest.approx(0.5)
+    finally:
+        toggle._teardown(shell)

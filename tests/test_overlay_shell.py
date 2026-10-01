@@ -3,8 +3,9 @@
 
 覆盖：is_overlay_topology env 契约；OverlayShell 构建期 dpr/bounds/默认右下
 角落位；tick 顺序协议（行为→碰撞→物理，装桩记录调用序）；start/stop 幂等；
-geometryChanged 的 rx/ry 比例迁移；屏拔除的 overlay 重建与拖拽收尾；会话结束
-与退出收口；app.py 拓扑分支（默认路径不构造 OverlayShell）。
+音效预热接线（首次可见前预热一次、开关关闭零调用）；geometryChanged 的 rx/ry
+比例迁移；屏拔除的 overlay 重建与拖拽收尾；会话结束与退出收口；app.py 拓扑
+分支（默认路径不构造 OverlayShell）。
 纪律：同步直调 handler / _on_tick(dt=...)，不 sleep 赌时序（AGENTS.md 时序
 测试纪律）；sprite/库/屏用纯假实现，不碰 webm 素材与 ffmpeg。
 """
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import QApplication
 
 import pet.app as app_mod
 import pet.overlay_shell as overlay_shell_mod
+from pet import click_sound
 from pet.app import AppShell
 from pet.config import Config
 from pet.overlay_shell import OverlayShell, is_overlay_topology
@@ -115,12 +117,16 @@ class FakeLibrary:
         self.folder_files = {}
         self.stopped_all = 0
         self.paused = 0
+        self.provision_cancels = 0
 
     def names(self):
         return []
 
     def stop_all_clips(self):
         self.stopped_all += 1
+
+    def cancel_frameseq_provision(self):
+        self.provision_cancels += 1
 
     def pause_warm(self):
         self.paused += 1
@@ -266,6 +272,100 @@ def test_start_stop_idempotent():
     assert not shell.overlay._timer.isActive()
 
 
+# ---------------------------------------------------------------- 音效预热接线（P1 音频冷启动）
+class _BodySprite(FakeSprite):
+    """FakeSprite + body_rect（spawn 落位需要主宠身体矩形）。"""
+
+    def body_rect(self):
+        return self.rect()
+
+
+def _warm_spy(monkeypatch, calls, shell=None):
+    """替换音效预热入口（模块级 OS 音频边界），记录参数与调用时的可见性。
+
+    替换的是 ``pet.click_sound.warm_click_sound_effects``（产品侧以模块属性
+    调用），与 ``tests/test_requested_regressions.py`` 替换设置页同名入口同风格——
+    不碰 winmm/DLL/声卡。
+    """
+    def spy(pack, data_dir=None, limit=8):
+        visible = shell.overlay.isVisible() if shell is not None else None
+        calls.append((pack, data_dir, visible))
+    monkeypatch.setattr(click_sound, "warm_click_sound_effects", spy)
+
+
+def test_start_warms_sound_before_overlay_visible(tmp_path, monkeypatch):
+    """overlay 首次可见前必须预热音效后端（口径 = legacy app.py:535-539）。
+
+    缺这段接线时 overlay 拓扑一次都不预热，本进程第一次发声要付 winmm
+    ``waveOutOpen`` 冷启动（实测 159.6ms，落在 GUI 事件循环里：
+    .scratch/arch-ab/CTL-COLL-SOUND-NEW-10-REPORT.md）。参数必须与 legacy
+    同一入口同一来源：真 Config 的 click_sound_pack + config.dir。
+    """
+    pack = {"kind": "builtin", "id": "duck"}
+    config = Config(tmp_path)
+    config.set("click_sound_enabled", True)
+    config.set("click_sound_pack", pack)
+    shell, _, _ = _make_shell(instance=FakeInstance(config))
+    calls = []
+    _warm_spy(monkeypatch, calls, shell)
+
+    shell.start()
+
+    assert calls == [(config.get("click_sound_pack"), config.dir, False)]
+    assert shell.overlay.isVisible()             # 反证：prewarm 时确实还没可见
+
+
+def test_start_skips_sound_warm_when_both_switches_off(monkeypatch):
+    """两开关都关：绝不预热（同 legacy 的 OR 闸门），不无谓拉起音频后端。"""
+    config = FakeConfig(
+        {"click_sound_enabled": False, "collision_sound_enabled": False})
+    shell, _, _ = _make_shell(instance=FakeInstance(config))
+    calls = []
+    _warm_spy(monkeypatch, calls)
+
+    shell.start()
+
+    assert calls == []
+
+
+def test_three_in_process_pets_warm_sound_once(monkeypatch):
+    """三宠同进程（overlay 多宠 = spawn 进同一壳）：预热只发生一次。"""
+    instance = FakeInstance(FakeConfig({"click_sound_enabled": True}))
+    shell = OverlayShell(
+        app, instance,
+        screen=FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040)),
+        sprite_factory=lambda lib, pos, scale: _BodySprite(lib, pos, scale))
+    shell._create_main_library = FakeLibrary
+    calls = []
+    _warm_spy(monkeypatch, calls)
+
+    shell.start()
+    shell.spawn_pet()
+    shell.spawn_pet()
+
+    assert len(shell._spawned) == 2  # 前提：三宠确实同进程存在
+    assert len(calls) == 1
+
+
+def test_stop_start_does_not_repeat_sound_warm(monkeypatch):
+    """stop→start（重 show）不重复预热：池是进程级，重复预热纯浪费。
+
+    配置顺带走「只开碰撞音效」分支（OR 闸门的另一半）：点击音效关时也必须
+    预热，否则碰碰车场景的碰撞音效仍在首次发声付冷启动。
+    """
+    shell, _, _ = _make_shell(instance=FakeInstance(
+        FakeConfig({"click_sound_enabled": False,
+                    "collision_sound_enabled": True})))
+    calls = []
+    _warm_spy(monkeypatch, calls)
+
+    shell.start()
+    shell.stop()
+    shell.start()
+
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------- 屏事件：geometryChanged 比例迁移
 def test_geometry_change_migrates_sprite_proportionally():
     screen = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040), dpr=1.0)
@@ -359,6 +459,40 @@ def test_about_to_quit_pauses_warm_and_stops_tick():
     shell._on_about_to_quit()
     assert shell.lib.paused == 1
     assert not shell.overlay._timer.isActive()
+
+
+def test_about_to_quit_cancels_frameseq_provision():
+    """退出收口必须取消在飞的帧序列供给线程（B1）。
+
+    供给线程**不是**预热线程：``pause_warm`` 管不到它，而它自己派生转换 ffmpeg
+    ——退出/关机窗口里最不该有的派生（issue #111）；库随本壳销毁时活线程还会被
+    一起析构（Qt fatal）。原来的退出收口只 pause_warm，这条改用例会红。
+    """
+    shell, _, _ = _make_shell()
+    shell._on_about_to_quit()
+    assert shell.lib.paused == 1
+    assert shell.lib.provision_cancels == 1
+
+
+def test_about_to_quit_cancels_provision_for_spawned_libraries(monkeypatch):
+    """子肥鱼各持独立库（M8）：逐库取消，不只主库。"""
+    instance = FakeInstance(FakeConfig({"click_sound_enabled": False}))
+    shell = OverlayShell(
+        app, instance,
+        screen=FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040)),
+        sprite_factory=lambda lib, pos, scale: _BodySprite(lib, pos, scale))
+    shell._create_main_library = FakeLibrary
+    calls = []
+    _warm_spy(monkeypatch, calls)
+    shell.start()
+    shell.spawn_pet()
+    spawned = list(shell._spawned_libs.values())
+    assert spawned                                     # 前提：确实有子库
+
+    shell._on_about_to_quit()
+
+    assert shell.lib.provision_cancels == 1
+    assert [lib.provision_cancels for lib in spawned] == [1] * len(spawned)
 
 
 # ---------------------------------------------------------------- app.py 拓扑分支

@@ -9,12 +9,14 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QImage, QMouseEvent, QPainter, QRegion
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication
 
 from pet.overlay_window import ALPHA_HIT_THRESHOLD, OverlayWindow
@@ -502,3 +504,110 @@ def test_windows_per_pixel_controller_integration():
     overlay._press_global = None
     overlay.close()
     assert overlay._input_controller is None          # closeEvent 复位样式并停轮询
+
+
+# ---------------------------------------------------------------- O1：帧序列渲染链
+class _FrameseqLibrary:
+    """PetSprite 取帧所需的最小库替身（只服务 movie()/no_mirror）。"""
+
+    def __init__(self, clip):
+        self._clip = clip
+        self.no_mirror: frozenset[str] = frozenset()
+
+    def movie(self, _name):
+        return self._clip
+
+
+def _make_scratch_frameseq(dir_path, count=4):
+    """现场生成真 webp 帧序列素材（真文件真解码，不 mock 播放器）。"""
+    dir_path.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        img = QImage(640, 360, QImage.Format.Format_ARGB32)     # = catalog.CANVAS_W/H
+        img.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(img)
+        # 左上 1/4 实色块：既证明"帧真的画上去了"，颜色又随帧号变化
+        painter.fillRect(0, 0, 320, 180, QColor(0, 128 + i * 20, 255, 255))
+        painter.end()
+        assert img.save(str(dir_path / f"f_{i + 1:04d}.webp"), "webp", 100)
+    (dir_path / "meta.json").write_text(
+        json.dumps({"fps": 240.0, "frames": count}), encoding="utf-8")
+
+
+def _settle_frameseq_clip(clip):
+    """帧序列 clip 的收尾同步（与 tests/test_frame_path_waste.py::_settle 同形）。
+
+    预取 worker 的 deleteLater 在共享线程执行、析构时断开 `loaded` 连接：若 GUI
+    队列里还压着跨线程交付、或 clip 正被引用计数销毁，销毁顺序就落进 teardown 与
+    共享线程的竞态（本仓已知的 access violation 漂移类，见 fix-20260927-O1/
+    CRASH-NOTES.md）。先把在途交付派发完再关。
+    """
+    deadline = time.monotonic() + 3.0
+    while getattr(clip, "_wanted", -1) != -1 and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.002)
+    clip.close()
+    try:
+        import shiboken6
+    except Exception:
+        return
+    worker = getattr(clip, "_worker", None)
+    while worker is not None and shiboken6.isValid(worker) \
+            and time.monotonic() < deadline:
+        time.sleep(0.002)
+
+
+def test_overlay_render_of_frameseq_sprite_builds_no_per_frame_pixmap(
+        tmp_path, monkeypatch):
+    """O1：overlay 渲染链只吃 ``currentImage()``——播放期间零 QPixmap.fromImage。
+
+    改前 FrameSeqClip 每上一帧（``_apply``）就 QPixmap.fromImage，而 overlay
+    渲染链（sprite.paint → library.clip_current_image）从不读它：全画布级的纯
+    浪费，预热线程里更是在非 GUI 线程构建 QPixmap。托盘/灵动岛图标那类消费者
+    仍必须拿到非空同帧 pixmap（本用例第二段）。
+    """
+    from pet import frameseq_clip
+
+    built: list[str] = []
+
+    class _PixmapProbe:
+        @staticmethod
+        def fromImage(image):
+            built.append("fromImage")
+            return QPixmap.fromImage(image)
+
+    monkeypatch.setattr(frameseq_clip, "QPixmap", _PixmapProbe)
+
+    frames_dir = tmp_path / "clip"
+    _make_scratch_frameseq(frames_dir, count=4)
+    clip = frameseq_clip.FrameSeqClip(frames_dir)
+    sprite = PetSprite(_FrameseqLibrary(clip), pos=QPointF(40, 40), scale=0.5)
+    overlay = OverlayWindow()
+    overlay.add_sprite(sprite)
+    seen: list[int] = []
+    clip.frameChanged.connect(seen.append)
+    try:
+        assert sprite.bind_clip("idle") is True
+        assert clip.currentPixmap() is not None, "图标消费者接口照旧可用"
+        n_pixmaps = len(built)
+
+        deadline = time.monotonic() + 10.0
+        while 3 not in seen and time.monotonic() < deadline:
+            app.processEvents()
+            image = QImage(overlay.size(), QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            overlay.render(image)               # 真 paintEvent → sprite.paint
+            assert image.pixelColor(45, 45).alpha() == 255, "角色必须真的画上去"
+            assert len(built) == n_pixmaps, "渲染每帧不得构建 QPixmap"
+            time.sleep(0.002)
+        # 帧 0 会通知两次（jumpToFrame(0) 一次 + 起播复用一次，均指同一帧，
+        # 改前也是两次：jumpToFrame 一次 + 异步到货一次），故按集合断言
+        assert sorted(set(seen)) == [0, 1, 2, 3], f"4 帧真播放未完成：{seen}"
+        assert clip.currentFrameNumber() == 3
+        assert len(built) == n_pixmaps
+        # 消费者语义不变：仍是当前显示帧、仍非空（托盘/灵动岛图标路径）
+        pm = clip.currentPixmap()
+        assert pm is not None and not pm.isNull()
+        assert len(built) == n_pixmaps + 1
+    finally:
+        _settle_frameseq_clip(clip)
+        overlay.close()

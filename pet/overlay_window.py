@@ -37,11 +37,13 @@ from __future__ import annotations
 
 import sys
 
+import shiboken6
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QCursor, QPainter, QRegion, QScreen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from . import catalog
+from . import overlay_peripherals
 from .sprite_menu import build_sprite_menu
 from .sprite_slingshot import SlingshotController
 from .tick_driver import TickDriver
@@ -156,12 +158,22 @@ class OverlayWindow(QWidget):
         self._driver.stop()
 
     # ---------------------------------------------------------------- M-1 闲置降档（挂点）
+    def _note_user_input(self) -> None:
+        """真实按键输入：交给 driver 做挂起自愈（丢了解锁消息也能点醒）。"""
+        note = getattr(self._driver, "note_user_input", None)
+        if callable(note):
+            note()
+
     def _note_kinetic(self) -> None:
         """运动/输入信号（M-1：升档同步立即，不等下一个 tick）。
 
         M-2 后档位状态机、四档降档与 QTimer 应用整体在 TickDriver；overlay
         只把事件侧信号转发进去——鼠标事件与 sprite 位移回调都走这里。
         """
+        if not self._alive():
+            # sprite 的 _kinetic_cb 通道：窗口已销毁时驱动器侧任何一步
+            # （_sync_tier 读 overlay.isVisible / 写 QTimer）都会抛（见 _alive）
+            return
         self._driver.note_kinetic()
 
     def showEvent(self, event) -> None:
@@ -170,12 +182,37 @@ class OverlayWindow(QWidget):
         self._feed_dpr()               # V-11：DPR 由 overlay 统一喂
         self._arm_dpr_change_watch()   # D2/P1：屏 DPR 变化 → 重喂 + 重建
         self._note_kinetic()           # M-1：可见即回 T0（从 T3 唤醒）
-        if sys.platform == "win32" and self._input_controller is None:
-            # 逐像素穿透：未命中任何 sprite 的屏幕区域点击直达下层应用——
-            # 全屏 overlay 不抢占桌面交互（硬指标"体验不回退"的底线）。
-            self._input_controller = WindowsPerPixelInputController(self)
-            # 点击宠物不夺前台焦点（issue #98 语义沿用）。
+        # O2：可见性上报（隐藏期停掉的光标探测在这里恢复，且立即补一次探测）
+        overlay_peripherals.note_overlay_visibility(self, True)
+        if sys.platform == "win32":
+            if self._input_controller is None:
+                # 逐像素穿透：未命中任何 sprite 的屏幕区域点击直达下层应用——
+                # 全屏 overlay 不抢占桌面交互（硬指标"体验不回退"的底线）。
+                self._input_controller = WindowsPerPixelInputController(self)
+            else:
+                # 隐藏期停过表：重开轮询并立即收敛一次穿透态（显示后不能有
+                # 一段时间按陈旧样式吞点击）。
+                self._input_controller.resume()
+            # 点击宠物不夺前台焦点（issue #98 语义沿用）。每次显示都补一次：
+            # on_top 开关会重建原生窗口，新句柄不带 WS_EX_NOACTIVATE。
             _set_windows_no_activate(int(self.winId()))
+
+    def hideEvent(self, event) -> None:
+        """隐藏期不轮询（O2）：不可见窗口不收输入，两条探测链路都是空转。
+
+        - 逐像素穿透轮询（10/50ms：QCursor.pos + GetWindowLongW）停表；
+        - 光标可见性探测（20Hz）停表——由可见性闸门转达（overlay 不认识
+          watcher，多屏多 overlay 时语义也是进程级的「全都在隐藏」）；
+        - 全屏探测 1Hz 表**不**停：它是全屏避让后恢复显示的唯一路径。
+
+        三条隐藏路径都会走到这里：全屏避让（``_on_fullscreen_changed``）、
+        托盘隐藏（``set_pet_visible(False)``）、屏迁移（旧 overlay close）。
+        恢复侧见 ``showEvent``。
+        """
+        super().hideEvent(event)
+        if self._input_controller is not None:
+            self._input_controller.stop()
+        overlay_peripherals.note_overlay_visibility(self, False)
 
     def closeEvent(self, event) -> None:
         # V-12：关窗即停 tick（M-2：从驱动器摘除本 overlay；最后一个摘除时
@@ -186,6 +223,42 @@ class OverlayWindow(QWidget):
             self._input_controller.stop()
             self._input_controller = None
         super().closeEvent(event)
+
+    # ---------------------------------------------------------------- 存活守卫
+    def _alive(self) -> bool:
+        """窗口 C++ 侧是否仍存活（shiboken 包装器可能已被销毁）。
+
+        下面三族入口都是**异步**投递：投递方不知道窗口已经销毁——屏热插拔重建
+        overlay 时在途帧交付打到旧窗（overlay_shell 的 ``ShellOverlayWindow``
+        重建路径），测试收尾也只用 deleteLater 销毁窗口而不走 closeEvent 摘线。
+        死对象上的任何 Qt 调用都会以 ``RuntimeError: ... already deleted`` 从
+        信号槽/事件泵里冒成 unraisable（pytest 按未捕获异常判败），故它们先
+        过本闸：
+
+        1. sprite 侧回调（``_dirty_cb`` → ``_on_sprite_dirty``、
+           ``_kinetic_cb`` → ``_note_kinetic``）；
+        2. TickDriver 每 tick 的 ``tick_advance``；
+        3. QScreen 的 DPR/几何信号（``_on_window_screen_changed`` /
+           ``_on_screen_dpi_changed`` / ``_on_screen_geometry_changed``）。
+
+        同步 API（add_sprite/remove_sprite/事件处理）**不**过闸：调用方是窗口
+        持有者，拿已销毁窗口调它们是持有者的缺陷，应当炸出来。
+        """
+        return shiboken6.isValid(self)
+
+    def isVisible(self) -> bool:  # noqa: N802 (Qt 命名)
+        """死窗口报「不可见」而不是抛异常（见 ``_alive``）。
+
+        本属性被**本文件之外**的异步路径读：TickDriver 的档位评估
+        （``_visible_for_tier`` 对每个已挂载 overlay 调 ``o.isVisible()``）在
+        窗口销毁后仍会跑（closeEvent 没执行过的销毁路径摘不掉驱动器成员）。
+        tick_driver 不在本文件、没法各自过 ``_alive`` 闸，把访问器本身做成
+        死安全是这里唯一能一次覆盖全部调用方的做法——死窗口既不显示也不该
+        参与档位评估，"不可见"正是它的真值。活窗口逐位转发 super()，语义不变。
+        """
+        if not self._alive():
+            return False
+        return super().isVisible()
 
     # ---------------------------------------------------------------- sprite 管理
     def add_sprite(self, sprite) -> None:
@@ -200,6 +273,10 @@ class OverlayWindow(QWidget):
         self.sprites.append(sprite)
 
         def _on_sprite_dirty(old, new):
+            if not self._alive():
+                # 窗口已销毁（见 _alive）：这一步既动驱动器也 update，
+                # 死对象上两者都会抛 RuntimeError 落成 unraisable。
+                return
             if old != new:
                 # 位移 = 运动信号（M-1）：物理/拖拽/行为位移同步升档
                 self._note_kinetic()
@@ -270,7 +347,9 @@ class OverlayWindow(QWidget):
 
         Qt 6.11 的 QScreen 没有 devicePixelRatioChanged：显示缩放变化由
         logical/physicalDotsPerInchChanged 上报；geometryChanged 覆盖分辨率/
-        模式切换（可能连带 DPR 变化）。名字与 PetWindow 同族方法一致，
+        模式切换（可能连带 DPR 变化）；refreshRateChanged 覆盖同分辨率下的
+        刷新率切换（60↔165Hz，几何不变但 tick 档位必须重读，任务A 缺口）。
+        名字与 PetWindow 同族方法一致，
         能力断言按 sprite 侧等价物对照（tests/test_sprite_dpr.py）。
         """
         if screen is None:
@@ -283,13 +362,15 @@ class OverlayWindow(QWidget):
         self._dpr_watch_screen = screen
         for name in ("logicalDotsPerInchChanged", "physicalDotsPerInchChanged"):
             self._connect_screen_signal(screen, name, self._on_screen_dpi_changed)
-        for name in ("geometryChanged", "availableGeometryChanged"):
+        for name in ("geometryChanged", "availableGeometryChanged",
+                     "refreshRateChanged"):
             self._connect_screen_signal(screen, name, self._on_screen_geometry_changed)
 
     def _disconnect_screen_signals(self, screen) -> None:
         for name in ("logicalDotsPerInchChanged", "physicalDotsPerInchChanged"):
             self._disconnect_screen_signal(screen, name, self._on_screen_dpi_changed)
-        for name in ("geometryChanged", "availableGeometryChanged"):
+        for name in ("geometryChanged", "availableGeometryChanged",
+                     "refreshRateChanged"):
             self._disconnect_screen_signal(screen, name, self._on_screen_geometry_changed)
 
     def _arm_dpr_change_watch(self) -> None:
@@ -327,6 +408,8 @@ class OverlayWindow(QWidget):
         窗口不动时跨屏（副屏 DPI 配置不同）也走这条：新屏从此成为 DPR 与
         几何的取数源，sprite 立即按新 DPR 重建，不等 tick/重绘。
         """
+        if not self._alive():
+            return  # 屏信号可能晚于窗口销毁（见 _alive）
         if screen is not None:
             self._screen = screen
             self._wire_screen_dpi_signals(screen)
@@ -336,6 +419,8 @@ class OverlayWindow(QWidget):
 
     def _on_screen_dpi_changed(self, *_args) -> None:
         """系统显示缩放变化（窗口未移动）→ 按新 DPR 重喂 + 重绘。"""
+        if not self._alive():
+            return  # 屏信号可能晚于窗口销毁（见 _alive）
         self._feed_dpr()
         self.update()
 
@@ -345,6 +430,8 @@ class OverlayWindow(QWidget):
         分辨率/模式切换常连带 DPR 与刷新率变化；几何同步对未接壳层的裸
         overlay 必需（壳层路径另有 _sync_geometry，重复设置同值是 no-op）。
         """
+        if not self._alive():
+            return  # 屏信号可能晚于窗口销毁（见 _alive）
         screen = self._screen
         if screen is not None:
             geo = screen.geometry()
@@ -410,6 +497,25 @@ class OverlayWindow(QWidget):
         if not listeners:
             self._position_listeners.pop(sprite, None)
 
+    def _sync_follow_now(self, sprite) -> None:
+        """拖拽起止关键帧：强制该 sprite 的跟随方立即同步一次（旧机 0ms 去抖）。
+
+        沿用位置监听通道：监听方可选实现 ``follow_now()``——跟随器"不看 30Hz
+        节流窗口"的强制同步入口（见 ``sprite_bubble.SpriteBubbleFollower``）；
+        未实现的监听方（壳层簿记、聊天跟随窗等）原样跳过。锚点由跟随方自算，
+        本类既不认识跟随器的存在形式，也不依赖壳层。
+        """
+        for cb in list(self._position_listeners.get(sprite, [])):
+            flush = getattr(cb, "follow_now", None)
+            if not callable(flush):
+                continue
+            try:
+                flush()
+            except Exception:
+                # 外围跟随方失败绝不打断拖拽主链路（气泡同款静默降级）：
+                # 其余监听方与后续拖拽收尾照旧。
+                pass
+
     # ---------------------------------------------------------------- 统一 tick
     def before_sprites_advance(self, dt: float) -> None:
         """行为层钩子（**deprecation**）：仅由"未挂控制器"的驱动器调用。
@@ -428,7 +534,14 @@ class OverlayWindow(QWidget):
         advance → 脏矩形 → 位置监听 fanout → update。V-3/V-4 语义不变：脏区
         取 advance 上报的旧|新 rect；帧到达直驱重绘另行由 sprite 的
         ``_dirty_cb``（见 add_sprite）保证，不依赖本段。
+
+        入口过存活闸（见 ``_alive``）：驱动器持有的 overlay 可能已被销毁
+        （closeEvent 没跑过的销毁路径摘不掉成员），此时整段无事可做——推进
+        已死窗口的 sprite、fanout 给它们的跟随方、往死窗口 update 都是错的，
+        后者还会抛 RuntimeError 落成 unraisable。
         """
+        if not self._alive():
+            return
         dirty = QRegion()
         moved = []
         for sprite in list(self.sprites):
@@ -523,6 +636,7 @@ class OverlayWindow(QWidget):
             # event() 拦下，这里兜底直调路径）
             event.ignore()
             return
+        self._note_user_input()
         self._note_kinetic()  # M-1：输入事件同步升档
         target = self.sprite_at(event.pos())
         if target is None:
@@ -534,6 +648,7 @@ class OverlayWindow(QWidget):
         event.accept()
 
     def mousePressEvent(self, event) -> None:
+        self._note_user_input()
         self._note_kinetic()  # M-1：输入事件同步升档
         if event.button() != Qt.MouseButton.LeftButton:
             if (event.button() == Qt.MouseButton.RightButton
@@ -624,6 +739,10 @@ class OverlayWindow(QWidget):
         cb = getattr(self, "_drag_committed_cb", None)
         if callable(cb):
             cb(grab)
+        # 拖拽第一帧立即同步跟随方（旧 window.py:3330 的 _position_sync_now）：
+        # 位置通知只在 tick 扇出里发，起步拍不做这一步气泡要等一次 tick + 可能
+        # 一次 30Hz 补发（最坏 ≈50ms 拖尾）。
+        self._sync_follow_now(grab)
 
     def mouseMoveEvent(self, event) -> None:
         if self.slingshot.aiming:
@@ -707,6 +826,9 @@ class OverlayWindow(QWidget):
         （on_release 的语义与弹射结果冲突，转发会把初速覆盖回拖拽估算值）。
         """
         grab, self._mouse_grab = self._mouse_grab, None
+        # 只有真拖拽才有关键帧要同步（旧机 _position_sync_now 也只在拖拽分支里）：
+        # 单击没挪窝，强制一次落位只是白交一次 SetWindowPos 税
+        committed = self._drag_committed
         self._press_global = None
         self._drag_committed = False
         self._press_click_only = False
@@ -714,6 +836,9 @@ class OverlayWindow(QWidget):
             self._input_controller.set_drag_active(False)
         if grab is not None and forward:
             grab.on_release(position)
+        if grab is not None and committed:
+            # 松手终位立即同步（旧 window.py:3401），不等 tick/30Hz 补发
+            self._sync_follow_now(grab)
         cb = getattr(self, "_grab_finished_cb", None)
         if callable(cb):
             cb()  # 4.1b：shell 冲刷光标恢复滞留等拖拽后状态

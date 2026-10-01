@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import logging
 import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -674,6 +676,50 @@ def _clean_collision_data(value: dict) -> dict:
     return result
 
 
+#: os.replace 的瞬时共享冲突判定用 WinError：ERROR_ACCESS_DENIED(5) 与
+#: ERROR_SHARING_VIOLATION(32)。Windows 上 MSVCRT ``_wopen`` 的共享模式是
+#: _SH_DENYNO（FILE_SHARE_READ|WRITE，**不含** FILE_SHARE_DELETE），所以
+#: read_text 的读句柄还开着时 ``os.replace`` 覆盖同一文件即 WinError 5；
+#: 杀软/索引服务扫描刚落盘的文件同样是 5/32。两者都会很快自行消失。
+_REPLACE_CONFLICT_WINERRORS = (5, 32)
+_REPLACE_RETRY_BASE_DELAY = 0.02   # 20ms 起步
+_REPLACE_RETRY_MAX_DELAY = 0.2     # 封顶 200ms
+
+
+def _is_replace_conflict(exc: OSError) -> bool:
+    """该 OSError 是否属"马上重试就能过"的瞬时共享冲突。"""
+    if isinstance(exc, PermissionError):
+        return True
+    return (getattr(exc, "winerror", None) in _REPLACE_CONFLICT_WINERRORS
+            or exc.errno in (errno.EACCES, errno.EPERM))
+
+
+def atomic_replace_with_retry(temp, target, attempts: int = 5) -> None:
+    """``os.replace(temp, target)``，遇瞬时共享冲突时有界退避重试。
+
+    实机背景（Windows，独立设置进程的「保存并退出」报"配置未能写入磁盘"）：
+    主进程 3s 轮询 / 目录 watcher 触发的瞬时 ``read_text()`` 与设置进程
+    ``os.replace(temp, config.json)`` 撞在同一配置文件上 → PermissionError
+    (WinError 5) → ``Config.save`` 返回 False → 用户"什么都没调也关不了设置"。
+
+    只重试共享冲突（PermissionError / WinError 5、32 / EACCES、EPERM）：这类
+    失败重试代价仅秒级且会自愈；其它 OSError（ENOENT、ENOSPC、跨设备……）是
+    真实错误，立即上抛交给调用方诚实上报，不做无谓等待。重试耗尽后最后一次
+    异常照常上抛（调用方的失败分支不变）。
+    """
+    delay = _REPLACE_RETRY_BASE_DELAY
+    limit = max(1, int(attempts))
+    for attempt in range(1, limit + 1):
+        try:
+            os.replace(temp, target)
+            return
+        except OSError as exc:
+            if attempt >= limit or not _is_replace_conflict(exc):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY)
+
+
 class Config:
     def __init__(self, base=None, instance_id: str | None = None):
         base = Path(base) if isinstance(base, str) else (base or _default_base())
@@ -739,7 +785,7 @@ class Config:
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
             "click_show_balance": False,  # 点击显示 DeepSeek 余额
             "click_show_self_talk": False,  # 点击随机显示自定义自言自语
-            "self_talk_speak_enabled": True,  # 点击自言自语同句朗读（复用语音报时音频通道）
+            "self_talk_speak_enabled": False,  # 点击自言自语同句朗读（复用语音报时音频通道，默认关）
             "self_talk_voice_precache_enabled": False,  # 台词/点击绑定本地语音预缓存（需本机 TTS 服务，默认关）
             "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
             "balance_tier_labels_mode": "default",  # 峰谷提示文案：default / liangwen / custom
@@ -1271,7 +1317,7 @@ class Config:
         self.data["self_talk_image_chance"] = int(_float_or_default(self.data.get("self_talk_image_chance"), float(DEFAULT_SELF_TALK_IMAGE_CHANCE), 0.0, 100.0))
         self.data["bubble_text_scale"] = int(_float_or_default(self.data.get("bubble_text_scale"), 100.0, 50.0, 300.0))
         self.data["self_talk_enabled"] = bool(self.data.get("self_talk_enabled", False))
-        self.data["self_talk_speak_enabled"] = _bool_or_default(self.data.get("self_talk_speak_enabled"), True)
+        self.data["self_talk_speak_enabled"] = _bool_or_default(self.data.get("self_talk_speak_enabled"), False)
         self.data["self_talk_voice_precache_enabled"] = _bool_or_default(self.data.get("self_talk_voice_precache_enabled"), False)
         self.data["cursor_hidden_passthrough"] = _bool_or_default(self.data.get("cursor_hidden_passthrough"), True)
         self.data["spawn_inherit_size"] = _bool_or_default(self.data.get("spawn_inherit_size"), True)
@@ -1576,17 +1622,22 @@ class Config:
 
         写盘使用 _redacted_data() 的副本，self.data 本身不动，保证运行期
         key 在内存可见而不会明文落盘。
-        临时文件名加入 PID 后缀，避免错误并发写入撞名。
+        临时文件名加入 PID 后缀，避免错误并发写入撞名；替换走
+        ``atomic_replace_with_retry``（骑过 Windows 读句柄造成的瞬时共享
+        冲突），任何出口都必须把临时文件清掉（失败残留会污染配置目录）。
         """
         try:
             self._normalize_pet_settings()
             self.dir.mkdir(parents=True, exist_ok=True)
             temp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-            temp.write_text(
-                json.dumps(self._redacted_data(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(temp, self.path)
+            try:
+                temp.write_text(
+                    json.dumps(self._redacted_data(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                atomic_replace_with_retry(temp, self.path)
+            finally:
+                temp.unlink(missing_ok=True)
         except OSError as exc:
             logging.warning("保存配置失败: %s (%s)", self.path, exc)
             return False

@@ -29,6 +29,7 @@ from PySide6.QtCore import QObject, Signal
 from . import platform_win
 from . import vision as vision_mod
 from .agent_link import AgentLinkManager
+from .overlay_settings_command import is_overlay_topology
 from .proactive import ProactiveScreenWatcher
 
 log = logging.getLogger("dsh-pet-standalone")
@@ -368,6 +369,10 @@ class SharedFullscreenWatcher(QObject):
     可见性；通过 Qt 信号（queued→GUI 线程）扇出到全部注册窗。任一窗的
     ``_on_fullscreen_changed`` / ``_on_cursor_visibility_changed`` 照常处理。
     仅当「任一窗需要」时才真正探测（``_any_wants`` 自省），否则线程空转。
+
+    线程由 ``SharedSubsystems.start()`` 起，**overlay 拓扑不起**（sprite 世界的
+    壳自持 ``FullscreenCursorWatcher``，且不暴露本类自省所需的面 → 本线程只会
+    空转）；legacy 拓扑下各窗 ``_watch_required`` 自省决定是否真探测。
     """
 
     fullscreen_changed = Signal(bool)
@@ -481,7 +486,14 @@ class SharedSubsystems:
         _LIVE_SHARED_SUBSYSTEMS.add(self)
 
     def start(self) -> None:
-        self.fs.start()
+        # overlay 拓扑不启共享全屏 watcher：sprite 世界的壳自持
+        # ``FullscreenCursorWatcher``（4.1b），且刻意不暴露 ``_watch_required``
+        # / ``_cursor_hidden_passthrough_enabled`` / ``auto_hide_fullscreen``
+        # → 本线程的 ``_any_wants()`` 恒 False，只会 1s 一醒地空转到进程退出；
+        # 广播目标 ``instances[].win`` 在 overlay 下也恒为 None（扇出无接收方）。
+        # legacy 拓扑逐位不变（各窗 ``_watch_required`` 自省决定是否真探测）。
+        if not is_overlay_topology():
+            self.fs.start()
 
     def stop_all(self) -> None:
         """进程级收口：停共享定时器/探测线程 + 释放 Qt 生命周期引用。

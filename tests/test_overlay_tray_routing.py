@@ -25,7 +25,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMenu
 
 import tests.test_overlay_window_capabilities as cap
 import tests.test_sprite_menu_facade as fac
@@ -101,15 +101,6 @@ def _teardown(shell) -> None:
     shell._delete_runtime_marker()
     if getattr(shell, "tray", None) is not None:
         shell.tray.hide()
-
-
-class _FakeMenu:
-    def __init__(self):
-        self.exec_calls = []
-
-    def exec(self, *args):
-        self.exec_calls.append(args)
-        return None
 
 
 class _FakeContextEvent:
@@ -256,6 +247,66 @@ def test_tray_unavailable_keeps_shell_alive(tmp_path, monkeypatch):
         shell._delete_runtime_marker()
 
 
+def test_tray_survives_menu_build_failure(tmp_path, monkeypatch):
+    """缺口 C：建菜单异常不得连带把已建好的托盘判死。
+
+    旧实现把「建托盘 + 建菜单」包在同一个 try 里，菜单阶段任何异常都会
+    ``self.tray = None``，而 ``start()`` 判 None 永不 show → 用户看到的是
+    「托盘里完全没有桌宠条目」，只留一行 log（正是用户报的现象）。
+    """
+    from pet import overlay_shell as overlay_shell_mod
+
+    class _BoomMenu:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("menu boom")
+
+    monkeypatch.setattr(overlay_shell_mod, "QMenu", _BoomMenu)
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert shell.tray is not None, "菜单异常不得连带丢弃托盘"
+        shell.start()
+        assert shell.tray.isVisible() is True, "托盘照常 show（用户至少能看到条目）"
+    finally:
+        if shell.tray is not None:
+            shell.tray.hide()
+        shell.stop()
+        shell._delete_runtime_marker()
+
+
+def test_tray_menu_has_mouse_through_and_autostart(tmp_path):
+    """托盘菜单补「鼠标穿透」「开机自启」（legacy app.py:3333-3343 两项）。
+
+    穿透开关只在托盘/设置页有取消入口；开机自启此前只有右键菜单有勾选项。
+    """
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        menu = _tray_menu(shell)
+        through = _action(menu, "鼠标穿透")
+        assert through.isCheckable()
+        auto = _action(menu, "开机自启")
+        assert auto.isCheckable()
+
+        # 穿透：走壳的用户意愿收编入口（记意愿 + 持久化 + 复合重算）
+        assert shell._config.get("mouse_through", False) is False
+        through.trigger()
+        assert through.isChecked() is True
+        assert shell._config.get("mouse_through") is True
+        assert shell.overlay.mouse_through is True
+        through.trigger()
+        assert shell.overlay.mouse_through is False
+
+        # 开机自启：转发到实例的 _set_autostart(enabled, 壳)——壳具 show_bubble 宿主面
+        calls: list = []
+        shell._instance._set_autostart = (
+            lambda enabled, win=None: calls.append((enabled, win)) or True)
+        auto.trigger()
+        assert len(calls) == 1, "勾选必须真的写系统登录项"
+        assert calls[0][0] == auto.isChecked()
+        assert calls[0][1] is shell, "失败提示的宿主必须是壳（overlay 无 PetWindow）"
+    finally:
+        _teardown(shell)
+
+
 # ================================================================ D12 指令消费
 def test_command_watch_installed_with_config_dir(tmp_path):
     shell, _ = _make_persistent_shell(tmp_path)
@@ -364,13 +415,17 @@ def test_context_menu_builder_receives_clicked_sprite(tmp_path):
         child._rebuild_pixmap()                # 命中图惰性重建：绘制前手工触发
         child.set_pos(QPointF(300, 300))
         seen: list = []
-        fake_menu = _FakeMenu()
+        exec_calls: list = []
+        # 真 QMenu + 实例级 exec 桩：菜单建造器/收口都按真实契约（QMenu）走，
+        # offscreen 下真 exec 会进模态嵌套事件循环（挂死），只能桩掉。
+        fake_menu = QMenu()
+        fake_menu.exec = lambda *args: exec_calls.append(args) or 0
         shell.overlay._full_menu_builder = (
             lambda target: (seen.append(target), fake_menu)[1])
         event = _FakeContextEvent(child.rect().center())
         shell.overlay.contextMenuEvent(event)
         assert seen == [child], "菜单建造器必须拿到被点 sprite"
-        assert event.accepted is True and fake_menu.exec_calls
+        assert event.accepted is True and exec_calls
     finally:
         _teardown(shell)
 

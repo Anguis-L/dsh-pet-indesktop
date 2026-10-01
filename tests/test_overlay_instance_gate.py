@@ -21,6 +21,7 @@ import os
 import signal
 import subprocess
 import sys
+import sysconfig
 import time
 from pathlib import Path
 
@@ -33,8 +34,8 @@ from pet.slot_manager import pid_alive
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 子进程持门脚本：抢到门后写就绪标记（"1 <自己 pid>"），然后挂住直到被杀
-# （模拟"第一个 overlay"）。pid 由子进程自报——Windows 上 venv 的 python.exe
-# 是启动器，Popen.pid 与真正解释器 pid 不同。
+# （模拟"第一个 overlay"）。pid 由子进程自报，启动 seam 保证它就是 Popen.pid
+# （见 _holder_interpreter）。
 _GATE_HOLDER = """
 import os, sys, time
 from pathlib import Path
@@ -59,10 +60,42 @@ def _wait_for(predicate, message: str, *, timeout: float = 60.0) -> None:
     raise AssertionError(message)
 
 
+def _holder_interpreter() -> tuple[str, dict | None]:
+    """持门子进程的 (解释器, env)；env=None = 原样继承父进程环境。
+
+    Windows 上 venv 的 `Scripts/python.exe` 是 redirector（启动器）：它自己
+    re-exec 到项目基础解释器，于是 `Popen.pid` 是启动器 pid，与子进程自报的
+    `os.getpid()` 不是同一个进程。
+    test_crash_residue_lock_reclaimed_by_pid_staleness 要的是「进程已被杀、但父
+    进程仍持着它的句柄」这个未 reap 窗口，被杀进程必须是 Popen 直接持有的那一个
+    ——否则句柄随启动器退出而关闭，旧 pid_alive（只判句柄能否打开）也能蒙对，
+    用例就抓不到回归。所以 Windows 下直接跑基础解释器 `sys._base_executable`
+    （非 venv 时它就等于 `sys.executable`，行为不变）；直接跑基础解释器会丢掉
+    venv 的 site-packages（pyvenv.cfg 默认 include-system-site-packages=false，
+    依赖只在 venv 里），故把当前解释器的 site-packages 经 PYTHONPATH 带过去。
+    其他平台保留原启动方式。
+    """
+    python = sys.executable
+    if sys.platform == "win32":
+        base = getattr(sys, "_base_executable", "")
+        if base and Path(base).exists():
+            python = str(base)
+    if python == sys.executable:
+        return python, None
+    env = os.environ.copy()
+    purelib = sysconfig.get_paths().get("purelib")
+    if purelib:
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (purelib, env.get("PYTHONPATH")) if part)
+    return python, env
+
+
 def _spawn_gate_holder(config_dir: Path, ready: Path) -> subprocess.Popen:
+    python, env = _holder_interpreter()
     return subprocess.Popen(
-        [sys.executable, "-c", _GATE_HOLDER, str(config_dir), str(ready)],
+        [python, "-c", _GATE_HOLDER, str(config_dir), str(ready)],
         cwd=str(_REPO_ROOT),
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -180,11 +213,19 @@ def test_crash_residue_lock_reclaimed_by_pid_staleness(tmp_path):
         assert status == "1"
         holder_pid = int(holder_pid_text)
         assert holder_pid != os.getpid()
+        # 启动 seam 的不变式：被子进程写进锁文件的那个 pid，就是 Popen 直接持有的
+        # 进程（否则下面杀完进程，句柄的持有者另有其人，未 reap 窗口根本不存在）。
+        assert proc.pid == holder_pid
         lock_path = config_dir / gate_mod.LOCK_NAME
         assert lock_path.exists() is True
         assert gate_mod.OverlayInstanceGate(config_dir).holder_pid() == holder_pid
         _kill_hard(holder_pid)  # 模拟第一个 overlay 进程崩溃：不走 release
-        _wait_for(lambda: not pid_alive(holder_pid), "持有进程未被强杀掉", timeout=30)
+        # 等到子进程真的退出（poll 只是 WaitForSingleObject，不关句柄）。
+        # 关键窗口：_reap(proc) 在 finally，晚于下面的断言 —— Popen 的句柄仍被本
+        # 进程持住，Windows 上死进程对象不会销毁，OpenProcess 一路成功；所以
+        # pid_alive 必须回答「进程是否已退出」，不能把「句柄打得开」当活着。
+        _wait_for(lambda: proc.poll() is not None, "持有进程未被强杀掉", timeout=30)
+        assert pid_alive(holder_pid) is False  # 已终止且未 reap 时也必须为 False
     finally:
         _reap(proc)
 

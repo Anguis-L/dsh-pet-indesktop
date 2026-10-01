@@ -176,6 +176,10 @@ def _close_qt_top_level_widgets():
     try:
         from pet import webm_clip as _webm_clip_mod
         _webm_clip_mod._reset_session_ending_for_tests()
+        # 首帧**跨库共享表**持有 QImage 强引用（同进程多库共用的首帧）：不逐用例
+        # 清空会让上一个用例的首帧常驻到预算耗尽（内存噪声 + 命中计数被前序用例
+        # 污染，用例断言随之不再自洽）。
+        _webm_clip_mod.reset_first_frame_share()
     except Exception:
         pass
     # collision IPC：4.4b 随多进程多宠退役层删除——collision_ipc 会话不再存在，

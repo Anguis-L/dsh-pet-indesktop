@@ -231,7 +231,7 @@ def test_click_uses_bound_talk_text_for_current_anim_and_speaks(tmp_path):
     """逐动画台词：绑定过的 click 动画名出绑定文本，并把同一句交给朗读通道。"""
     shell, _config = _make_shell(
         tmp_path,
-        _talk_values(click_show_self_talk=True),
+        _talk_values(click_show_self_talk=True, self_talk_speak_enabled=True),
         bindings={"click1": ["绑定台词"]},
     )
     spoken: list[str] = []
@@ -363,8 +363,10 @@ def test_image_branch_cache_miss_falls_back_to_text(tmp_path):
 
 
 def test_warm_self_talk_images_prescales_big_images(tmp_path):
-    """配图缓存按显示盒 ~2× 预缩放（长边 ≤640）：24 张原图解码 = 114MB
-    的内存回压（任务管理器实锤），预缩放后 ≈10MB。"""
+    """配图缓存按**实际绘制盒**（显示盒 × 配图大小 × DPR × 余量）预缩放：
+    24 张原图解码 = 114MB 的内存回压（任务管理器实锤）。旧实现固定长边
+    ≤640，用户小尺寸/1× 屏时多存一倍以上（实测 36.8MB）；改成现算后只多留
+    1.1 倍余量（N2）。"""
     import time as _time
 
     shell, _config = _make_shell(tmp_path, _talk_values(self_talk_image_chance=100))
@@ -386,7 +388,7 @@ def test_warm_self_talk_images_prescales_big_images(tmp_path):
             _time.sleep(0.02)
 
         cached = shell._self_talk_image_cache[str(path)]
-        assert max(cached.width(), cached.height()) <= 640
+        assert max(cached.width(), cached.height()) == shell._self_talk_image_cache_edge()
         assert not cached.isNull()
         shell._delete_runtime_marker()
     finally:

@@ -20,7 +20,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, QPointF, Signal
+from PySide6.QtCore import QObject, QPointF, QRect, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
@@ -307,3 +307,83 @@ def test_bind_jumps_for_frameseq_without_frame(tmp_path):
     sprite = _make_sprite(clip)
     assert sprite.bind_clip("walk") is True
     assert jumps == [0]
+
+
+# ---------------------------------------------------------------- F-PERF P1：慢速爬行不空转重绘
+def _dirty_recorder(sprite) -> list[tuple[QRect, QRect]]:
+    """挂脏上报桩（overlay.add_sprite 的同款接缝：``_dirty_cb(old, new)``）。"""
+    calls: list[tuple[QRect, QRect]] = []
+    sprite._dirty_cb = lambda old, new: calls.append((QRect(old), QRect(new)))
+    return calls
+
+
+def test_subpixel_move_does_not_report_dirty():
+    """慢速移动（每拍 <1px）整数绘制矩形未变 → 不上报脏矩形。
+
+    overlay 的脏上报直驱 ``update()``：位移不足 1px 时重绘的矩形像素内容
+    逐位不变，白白刷一帧（用户主诉：速度慢下来/多鱼挤压时帧数明显低）。
+    越过 1px 边界后必须恢复上报，位置换算口径不能被吞掉。
+    """
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    sprite.advance(0.0)          # 消费 bind_clip 的首帧待上屏标记（帧已上屏）
+    calls = _dirty_recorder(sprite)
+    rect_before = sprite.paint_bounds()
+
+    for _ in range(4):           # 累计 0.8px：整数矩形不动
+        sprite.set_pos(sprite.pos + QPointF(0.2, 0.0))
+    assert sprite.paint_bounds() == rect_before, "前提：位移累计不足 1px"
+    assert calls == [], f"整数矩形未变且无待上屏帧时不得报脏，实际 {calls}"
+
+    sprite.set_pos(sprite.pos + QPointF(1.0, 0.0))   # 越过 1px 边界
+    assert sprite.paint_bounds() != rect_before, "前提：位移已让绘制矩形变化"
+    assert len(calls) == 1, f"矩形变化必须上报一次，实际 {calls}"
+    assert calls[0] == (rect_before, sprite.paint_bounds())
+
+
+def test_subpixel_move_reports_while_frame_pending():
+    """待上屏新帧未消费时，慢速位移仍须报脏（新帧要有机会上屏）。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True   # _frame_dirty 仍为真（帧未上屏）
+    calls = _dirty_recorder(sprite)
+
+    sprite.set_pos(sprite.pos + QPointF(0.2, 0.0))
+
+    assert len(calls) == 1, f"帧待上屏时不得吞掉上报，实际 {calls}"
+
+
+def test_frame_arrival_still_reports_dirty():
+    """帧到达（frameChanged）直驱重绘的报脏不变——慢速位移的抑制不得波及。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    sprite.advance(0.0)
+    calls = _dirty_recorder(sprite)
+
+    sprite.set_pos(sprite.pos + QPointF(0.3, 0.0))    # 慢速位移：不报
+    assert calls == []
+
+    clip.frame = 1
+    clip.frameChanged.emit(1)                        # 帧到达：必须报
+    assert len(calls) == 1, f"帧到达必须报脏，实际 {calls}"
+    assert calls[0] == (sprite.paint_bounds(), sprite.paint_bounds())
+
+
+def test_advance_reports_dirty_when_slow_move_crosses_pixel_boundary():
+    """advance 的 tick 路径同样走抑制口径：跨像素边界的位移照旧上报。"""
+    clip = FakeClip()
+    sprite = _make_sprite(clip)
+    assert sprite.bind_clip("walk") is True
+    sprite.advance(0.0)
+    calls = _dirty_recorder(sprite)
+
+    sprite.velocity = QPointF(0.3, 0.0)
+    sprite.advance(1.0)          # 一次积分 0.3px：矩形不变，返回 None
+    assert calls == []
+    assert sprite.advance(1.0) is None
+
+    sprite.velocity = QPointF(1.0, 0.0)
+    changed = sprite.advance(1.0)
+    assert changed is not None, "跨像素边界的位移必须让 advance 上报脏区域"

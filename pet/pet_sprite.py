@@ -53,6 +53,17 @@ class PetSprite(QObject):
     # 不产生任何变换、不分配对象，与改造前路径同成本。
     _throw_angle = 0.0
 
+    # 几何记忆化（F-PERF：实机 py-spy 下 rect() 2.1% + _logical_size() 1.3%
+    # GUI 线程时间）。两个字段同样是「惰性实例字段 + 类级默认」：首次写入
+    # 才落到实例 __dict__。签名即输入值本身，故无作废钩子可漏：
+    # - ``_logical_size_cache = (scale, (w, h))``（只依赖 scale）；
+    # - ``_rect_cache = (x, y, w, h, QRect)``（只依赖整数化 pos + 逻辑尺寸）。
+    # 线程语义：rect/_logical_size 只在 GUI 线程被调用（tick 驱动器 QTimer、
+    # 绘制、事件、控制器全部在主线程），故不加锁；单个元组赋值在 CPython 里
+    # 原子，最坏情况只是并发下重算一次。
+    _logical_size_cache = None
+    _rect_cache = None
+
     def __init__(
         self,
         library: MovieLibrary,
@@ -120,6 +131,10 @@ class PetSprite(QObject):
         self.throw_speed_cap = physics_mod.MAX_THROW_SPEED
         # 播放速率（菜单「播放速率」写入口）：bind_clip 起播时应用到新 clip
         self.playback_speed = 1.0
+        # ffmpeg 圈边界回收阈值（分钟，0=关闭；config 缺省 10）：由集成层
+        # `_sync_sprite_settings` 按设置写入，bind_clip 起播时推给新 clip。
+        # 归一/夹取（0=关、[2,120]）在 webm_clip.set_recycle_minutes，不在此重复。
+        self.ffmpeg_recycle_minutes = 10
         # Q 弹挤压（点击/碰撞反馈，window.py _squash_geometry 语义）：
         # None = 未激活；否则 0..1 进度，advance 按 220ms 推进
         self._squash_progress: float | None = None
@@ -130,6 +145,9 @@ class PetSprite(QObject):
         # 逐只显隐（M14 / PHASE4_DESIGN 4.1b）：False = 不绘制、不命中、不进
         # 位置 fanout（隐藏是"整只退出合成与交互面"，不是"变透明"）。默认 True。
         self._visible = True
+        # 播放节拍暂停（O3）：隐藏/挂起期间为 True——clip 的定时器停摆，当前
+        # 帧/播放位置/在途帧全部原地保留，恢复时从暂停处续播（不重放）。
+        self._clip_paused = False
 
     # ---------------------------------------------------------------- 显隐（M14）
     @property
@@ -153,6 +171,39 @@ class PetSprite(QObject):
         rect = self.paint_bounds()
         self._visible = visible
         self._notify_dirty(rect, rect)
+
+    # ---------------------------------------------------------------- 播放节拍暂停（O3）
+    def pause_clip(self) -> None:
+        """停当前 clip 的播放节拍（隐藏/挂起期零帧推进）。
+
+        只停 clip 自身的定时器：当前帧、播放位置（``_cur``）、在途预取帧
+        （``_pending``）与显示图全部原地保留——恢复时从暂停处续播，绝不
+        ``restart_clip`` / ``jumpToFrame(0)``（隐藏再显示不得闪回第 0 帧，也不
+        出现首帧等待）。无 clip / clip 无该接口（GifClip）时按 no-op 处理。
+        幂等：重复暂停不做第二次下推（隐藏与挂起可能叠加触发）。
+        """
+        if self._clip_paused:
+            return
+        self._clip_paused = True
+        clip = self._clip
+        pause = getattr(clip, "pause", None)
+        if callable(pause):
+            pause()
+
+    def resume_clip(self) -> None:
+        """恢复播放节拍（从暂停处续播，不重置播放位置）。幂等。"""
+        if not self._clip_paused:
+            return
+        self._clip_paused = False
+        clip = self._clip
+        resume = getattr(clip, "resume", None)
+        if callable(resume):
+            resume()
+
+    @property
+    def clip_paused(self) -> bool:
+        """当前是否处于"播放节拍暂停"（隐藏/挂起；诊断与测试的只读面）。"""
+        return self._clip_paused
 
     # ---------------------------------------------------------------- 几何
     @property
@@ -179,11 +230,22 @@ class PetSprite(QObject):
         self._notify_dirty(old_rect, self.paint_bounds())
 
     def _logical_size(self) -> tuple[int, int]:
-        """逻辑大小（CANVAS*scale）：rect/命中/碰撞坐标系的尺寸，与 DPR 无关。"""
-        return (
-            max(1, int(round(catalog.CANVAS_W * self.scale))),
-            max(1, int(round(catalog.CANVAS_H * self.scale))),
+        """逻辑大小（CANVAS*scale）：rect/命中/碰撞坐标系的尺寸，与 DPR 无关。
+
+        F-PERF 记忆化：只依赖 scale（DPR 不参与，见 ``_scaled_size``）。缓存
+        以 scale 为签名做值比较，故任何写入路径（含直接改 ``_scale``）都自动
+        失效，不需要额外的作废钩子。
+        """
+        scale = self._scale
+        cached = self._logical_size_cache
+        if cached is not None and cached[0] == scale:
+            return cached[1]
+        size = (
+            max(1, int(round(catalog.CANVAS_W * scale))),
+            max(1, int(round(catalog.CANVAS_H * scale))),
         )
+        self._logical_size_cache = (scale, size)
+        return size
 
     def _scaled_size(self) -> tuple[int, int]:
         """物理像素大小（CANVAS*scale*dpr）：渲染/命中图的像素尺寸。"""
@@ -213,9 +275,30 @@ class PetSprite(QObject):
 
         恒为逻辑坐标（CANVAS*scale 逻辑大小）——位置/命中/碰撞全部留在
         逻辑坐标系，只有渲染像素随 DPR（D2）。
+
+        F-PERF 记忆化：输入只有 ``(int(pos.x), int(pos.y), 逻辑 w, h)``，
+        绘制/命中/区域判断/气泡锚点每 tick 每 sprite 各调它一次（实机
+        py-spy：2.1% GUI 线程），故按这四元组签名缓存 QRect 本体。
+        ``center``/``body_rect``/``radius``/``paint_bounds`` 都经由本方法
+        取值，自动同等受益，不各自另建缓存。
+
+        返回的是**共享对象**：签名一变即换新 QRect，旧对象不被原地改写，
+        因此调用点拿到的始终是「取值当时的快照」。调用点已 grep 确认没有
+        原地修改矩形的地方（产品代码只有 ``translated()`` 这类 const 接口，
+        tests 里零处改动动词）；后续若有人写出原地改写，会破坏本契约，须
+        改成返回 ``QRect(rect)`` 副本。
         """
+        pos = self.pos
+        x = int(pos.x())
+        y = int(pos.y())
         w, h = self._logical_size()
-        return QRect(int(self.pos.x()), int(self.pos.y()), w, h)
+        cached = self._rect_cache
+        if (cached is not None and cached[0] == x and cached[1] == y
+                and cached[2] == w and cached[3] == h):
+            return cached[4]
+        rect = QRect(x, y, w, h)
+        self._rect_cache = (x, y, w, h, rect)
+        return rect
 
     def center(self) -> QPointF:
         r = self.rect()
@@ -356,13 +439,37 @@ class PetSprite(QObject):
         # 同一事件轮次内的多次调用，tick 内多次 set_pos 不会放大 paint。
         # 脏矩形口径 = 绘制外接矩形（含探头旋转溢出），45° 姿态下只报
         # rect() 会在旋转角上留残影。
-        self._notify_dirty(old_rect, self.paint_bounds())
+        # F-PERF P1：整数化绘制矩形未变且无待上屏新帧 → 重绘的就是「像素内容
+        # 逐位相同」的同一块矩形，纯浪费（慢速爬行/多鱼挤压时每拍都报，用户
+        # 主诉帧数明显低）。此时跳过上报，位置仍然写入（换算口径不变）。
+        # 待上屏帧（_frame_dirty）照旧上报：帧到达路径的报脏语义不变，新帧
+        # 有机会上屏。帧到达/换帧另有 _on_frame_changed 直驱通道，不依赖这里。
+        new_rect = self.paint_bounds()
+        if new_rect == old_rect and not self._frame_dirty:
+            return
+        self._notify_dirty(old_rect, new_rect)
 
     def _notify_dirty(self, old: QRect, new: QRect) -> None:
-        """向 overlay 上报脏矩形（add_sprite 挂接；未挂接时 no-op）。"""
+        """向 overlay 上报脏矩形（add_sprite 挂接；未挂接时 no-op）。
+
+        消费方（overlay/其宿主窗口）C++ 侧已销毁时，回调会以
+        ``RuntimeError: ... already deleted`` 抛出。本方法被 ``_on_frame_changed``
+        （clip 信号槽）与 ``set_pos``（鼠标/行为/物理链路）调用，抛出就落成
+        信号槽里的 unraisable（pytest 按未捕获异常判败）。脏上报是
+        fire-and-forget：消费方没了就没有上屏对象，就地丢弃。
+
+        **只吞这一种**——RuntimeError 是 shiboken「包装器已死」的口径，其它
+        异常照旧外抛，不掩盖消费方活着的真实缺陷；窗口侧还有更早的一道守卫
+        （``overlay_window.OverlayWindow._alive``），这层兜的是"回调实现不
+        自己守卫"的情况。正常路径（活消费方）零行为变化。
+        """
         cb = self._dirty_cb
-        if cb is not None:
+        if cb is None:
+            return
+        try:
             cb(old, new)
+        except RuntimeError:
+            pass
 
     def set_velocity(self, velocity: QPointF) -> None:
         self.velocity = QPointF(velocity)
@@ -586,6 +693,12 @@ class PetSprite(QObject):
         setter = getattr(clip, "set_playback_speed", None)
         if callable(setter):
             setter(self.playback_speed)
+        # 圈边界回收阈值同点推送（旧 window.py `_switch` 的同位置推送，
+        # `:1558`）：纯写一个标量，不 start/spawn/重启；缺该方法的 clip
+        # （Gif/测量桩）按旧 `_push_recycle` 的 hasattr 门跳过。
+        recycle = getattr(clip, "set_recycle_minutes", None)
+        if callable(recycle):
+            recycle(self.ffmpeg_recycle_minutes)
         # start() 前同步取第 0 帧的策略（py-spy 慢帧归因 2026-09-24）：
         # - 显示槽已有可显示帧（预热/上一圈残留）→ 不跳（start 不清槽，
         #   修复 1 已保证显示连续）；
@@ -605,7 +718,14 @@ class PetSprite(QObject):
         start = getattr(clip, "start", None)
         if not callable(start):
             return True
-        return start() is not False
+        accepted = start() is not False
+        if self._clip_paused:
+            # 隐藏中换绑（行为链照常推进）：新 clip 立刻回到暂停——否则隐藏
+            # 的那只又开始按帧率解码，"隐藏期零推进"的契约被换绑悄悄破坏。
+            pause = getattr(clip, "pause", None)
+            if callable(pause):
+                pause()
+        return accepted
 
     def restart_clip(self) -> bool:
         """原地续播当前 clip（圈末 re-arm，F2）；返回是否被接受。
@@ -636,7 +756,14 @@ class PetSprite(QObject):
             jump(0)
         self._frame_sig = None
         self._frame_dirty = True
-        return start() is not False
+        accepted = start() is not False
+        if self._clip_paused:
+            # 圈末续圈（行为链）打断不了"隐藏期零推进"：重新压回暂停（口径
+            # 与 bind_clip 同点，见那里的注释）。
+            pause = getattr(clip, "pause", None)
+            if callable(pause):
+                pause()
+        return accepted
 
     def _on_clip_finished(self) -> None:
         """clip 圈末结束（F2）：转发给行为控制器决定是否续圈。
@@ -655,8 +782,12 @@ class PetSprite(QObject):
 
         由 sprite_physics 每 tick 按当拍速度调用（倍率本身是纯函数
         physics.flight_anim_speed，见 window.py:4328-4340）。速率变化小于
-        0.05 时跳过写入——WebMClip.set_playback_speed 会重设 QTimer 间隔，
-        速度平稳段没必要反复写。
+        0.05 时跳过写入——省一次跨模块调用；**帧表节拍的保护不在这里**：真正
+        "同值不写、真变速顺延到下次 timeout 落地"的判据按取整后的 interval 在
+        clip 内部（``WebMClip._apply_interval`` / ``FrameSeqClip._apply_interval``）
+        ——只有 clip 知道 fps 与解码节流除数，间隔口径在那里才不会漂。原先是
+        每次写入都重设 QTimer，把当拍倒计时截断、帧交付被压慢（实机"上下飞帧数
+        上不去"，见 tests/test_flight_frame_pacing.py）。
         """
         clip = self._clip
         if clip is None:
@@ -735,11 +866,20 @@ class PetSprite(QObject):
         """按签名缓存重建当前帧：返回是否真正重建（False = 快路径复用）。
 
         签名 = (clip 身份, 源帧号, 镜像, 缩放, DPR)；任一变化才走
-        取帧→镜像→预乘→Smooth 缩放 整条链。转换顺序与 window.py 一致：
-        先转 ARGB32_Premultiplied 再缩放，避免直通 alpha 缩放产生暗边；
-        缩放后的预乘图同时充任命中测试的 alpha 源（预乘不动 alpha 字节）。
+        取帧→镜像→预乘→Smooth 缩放 整条链（每步先判恒等，见下）。转换顺序与
+        window.py 一致：先转 ARGB32_Premultiplied 再缩放，避免直通 alpha 缩放
+        产生暗边；缩放后的预乘图同时充任命中测试的 alpha 源（预乘不动 alpha
+        字节）。镜像用 Qt6 的 ``flipped(Horizontal)``（``mirrored(True, False)``
+        已废弃，轴向相同：左右镜像）。
         D2：缩放目标是物理像素（CANVAS*scale*dpr），pixmap 携带
         setDevicePixelRatio(dpr)，Qt 按逻辑大小绘制，HiDPI 下不糊。
+
+        O1 恒等短路：源已是 ARGB32_Premultiplied 就不 convert，源尺寸已是目标
+        物理尺寸就不 scaled——两步都不再白调（Qt 自己对同格式 convert / 同尺寸
+        Smooth 缩放已各短路到 ~1.4µs / ~2µs，故收益只在 µs 级，见证据目录
+        BENCH-frame-path.txt 变换级微基准；真素材上的重建耗时差异在各档都落在
+        重复测量噪声内）。结果逐位不变：输出仍是 ARGB32_Premultiplied、
+        尺寸 = ``_scaled_size()``。
         """
         clip = self._clip
         if clip is None:
@@ -756,18 +896,20 @@ class PetSprite(QObject):
             # 首帧未就绪/素材损坏：保留上一帧（若有），跳过本次重建
             return False
         if self._mirror_frame():
-            img = img.mirrored(True, False)
+            img = img.flipped(Qt.Orientation.Horizontal)
         w, h = self._scaled_size()
-        img = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-        img = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
-                         Qt.TransformationMode.SmoothTransformation)
+        if img.format() != QImage.Format.Format_ARGB32_Premultiplied:
+            img = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        if (img.width(), img.height()) != (w, h):
+            img = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
         pm = QPixmap.fromImage(img)
         pm.setDevicePixelRatio(self._dpr)
         self._pixmap = pm
-        # V-15：显式深拷贝——convertToFormat（同格式）与 scaled（同尺寸）
-        # 都可能返回隐式共享副本，不拷贝则 _hit_image 会别名 clip 的活帧
-        # 缓冲（scale=1.0&dpr=1 时实测同指针），后台解码线程写缓冲时
-        # 命中图被跨线程改。一帧一次 memcpy，成本可忽略
+        # V-15：显式深拷贝——convertToFormat（同格式）与 scaled（同尺寸）都会
+        # 返回隐式共享副本，恒等短路后 img 更可能**直接就是 clip 的活帧缓冲**，
+        # 不拷贝则 _hit_image 会与解码侧的图别名（scale=1.0&dpr=1 时实测同指针），
+        # 后台解码线程写缓冲时命中图被跨线程改。一帧一次 memcpy，成本可忽略
         self._hit_image = img.copy()
         self._frame_sig = sig
         return True

@@ -26,6 +26,8 @@ import os
 import re
 from pathlib import Path
 
+from .config import atomic_replace_with_retry
+
 # 活跃宠清单：运行时状态文件。刻意不带 config- 前缀——既不进旧 slot 配置
 # glob（agent_link/config 迁移），也不与 runtime 标记 glob 相撞。
 ACTIVE_PETS_FILENAME = "overlay-active-pets.json"
@@ -94,7 +96,7 @@ def load_active_slots(config_dir: Path | str) -> list[int]:
 
 
 def save_active_slots(config_dir: Path | str, slots) -> bool:
-    """原子写活跃宠清单（tmp + os.replace）。返回是否落盘成功。"""
+    """原子写活跃宠清单（tmp + os.replace，瞬时占用有界重试）。返回是否落盘成功。"""
     path = active_pets_path(config_dir)
     payload = {
         "version": ACTIVE_PETS_VERSION,
@@ -103,9 +105,12 @@ def save_active_slots(config_dir: Path | str, slots) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        os.replace(temp, path)
+        try:
+            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            atomic_replace_with_retry(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
     except OSError:
         logging.warning("overlay: 写活跃宠清单失败: %s", path, exc_info=True)
         return False
@@ -206,6 +211,101 @@ def read_slot_geometry(config_dir: Path | str, slot_id: int) -> dict:
     return _clean_geometry(_load_slot_config(config_dir, slot_id))
 
 
+def read_slot_config(config_dir: Path | str, slot_id: int) -> dict | None:
+    """读 slot 身份配置的原始 dict（**通用只读读点**，B7b 的 per-slot 取源入口）。
+
+    旧实现（base-2786c15）：每只桌宠是独立进程、各读自己的
+    ``config-slot-N.json``（``Config(instance_id="slot-N")`` + ``window.py``
+    逐键读 ``self.cfg``）。单进程壳只有一份主配置，per-slot 取源必须从这份文件
+    读回来——本函数就是那条"读点"，语义与 ``Config`` 的加载口径对齐：
+
+    - 文件缺失 / 不可读 → ``None``：旧启动语义是"按主配置落种"，调用方据此
+      **继承主配置**（不是回默认值）；
+    - 内容损坏（非 JSON）→ ``{}``：旧 ``Config.reload`` 的口径是备份 + 整份回
+      默认值；这里**只读**（不备份、不落盘、不改主配置），空 dict 让调用方逐键
+      走默认值回退；
+    - 非法 JSON 类型（数组/标量）→ ``{}``（同上）；
+    - 合法对象 → 原样 dict（含空对象 ``{}``）。
+
+    纯读、无副作用；调用方负责缓存（配置同步边界读一次，不逐帧读）。
+    """
+    if not slot_config_exists(config_dir, slot_id):
+        return None
+    data = _load_slot_config(config_dir, slot_id)
+    return data if isinstance(data, dict) else {}
+
+
+def write_slot_setting(config_dir: Path | str, slot_id: int, key: str, value,
+                       *, user_customized: bool | None = None) -> bool:
+    """把**一个** sprite 级设置键写进该 slot 身份配置（保留其它键；原子替换）。
+
+    B7b：子肥鱼右键菜单/切角色的设置曾经只改运行态（写主配置会污染主宠），
+    按旧契约它们本该落到**这只子肥鱼自己的** ``config-slot-N.json``——旧架构
+    里"右键改大小"就是这个语义（``window.py:998-1001``：写本窗 cfg + 置位
+    ``user_customized``）。
+
+    ``user_customized=True``（用户主动设置）时一并置位该旗标，与旧契约一致：
+    ``seed_slot_config_from_main`` 对已自定义的 slot 一个键都不碰（下次生成
+    不被主设置刷新）。位置/朝向等后台自存写盘**不置位**（见
+    ``write_slot_geometry``）——调用方按需传 None 保持原值。
+    """
+    name = str(key or "").strip()
+    if not name:
+        return False
+    path = slot_config_path(config_dir, slot_id)
+    data = _load_slot_config(config_dir, slot_id)
+    data.setdefault("version", 4)
+    data[name] = value
+    if user_customized is not None:
+        data["user_customized"] = bool(user_customized)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            temp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            atomic_replace_with_retry(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+    except OSError:
+        logging.warning("overlay: 写 slot 设置键失败: %s (%s)", path, name,
+                        exc_info=True)
+        return False
+    return True
+
+
+def read_slot_collision_enabled(config_dir: Path | str, slot_id: int, *,
+                                default: bool = True,
+                                fallback: bool | None = None) -> bool:
+    """读 slot 身份配置里的 ``collision_enabled``（旧契约：每只桌宠各自的 config）。
+
+    旧实现（base-2786c15）：子宠进程按 ``--instance slot-N`` 起自己的 ``Config``
+    （``config.py:683-689``：该 slot 文件不存在 → 先按主配置落种；存在 → 一个键
+    都不碰），运行期读的也是**自己的** ``config-slot-N.json``（``window.py:3929``
+    ``bool(self.cfg.get('collision_enabled', True))``）。本函数把这条语义收敛成
+    一个只读"读点"：
+
+    - 文件存在 + 键合法（``config._bool_or_default`` 口径，字符串 true/false 也认）
+      → 该值；
+    - 文件存在但缺键 / 值为 None / 类型非法 → ``default``（旧 Config 清洗填默认）；
+    - 文件缺失 → ``fallback``（旧启动语义是"按主配置落种"，即继承主配置当前值；
+      未给 ``fallback`` 时退 ``default``）；
+    - 文件损坏 / 非 JSON 对象 → ``default``（旧 ``Config.reload`` 是备份 + 回默认
+      值；这里**只读**：不备份、不落盘、绝不改主配置或别宠的文件）。
+
+    纯读、无副作用；只在配置同步边界调用（不逐帧；目录事件与壳既有的 3s 兜底
+    轮询都会触发，属既有轮询通道，非新增）。
+    """
+    if not slot_config_exists(config_dir, slot_id):
+        return bool(default if fallback is None else fallback)
+    data = _load_slot_config(config_dir, slot_id)
+    if not data:
+        return bool(default)  # 损坏/非对象/空对象：旧 Config 的默认值回退口径
+    from .config import _bool_or_default  # 惰性：避免 config ↔ 本模块的导入环
+
+    return bool(_bool_or_default(data.get("collision_enabled"), default))
+
+
 def write_slot_geometry(config_dir: Path | str, slot_id: int, geometry) -> bool:
     """把几何键合并写回 slot 配置（保留该身份其它键；原子替换）。
 
@@ -222,9 +322,12 @@ def write_slot_geometry(config_dir: Path | str, slot_id: int, geometry) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        os.replace(temp, path)
+        try:
+            temp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            atomic_replace_with_retry(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
     except OSError:
         logging.warning("overlay: 写 slot 几何失败: %s", path, exc_info=True)
         return False

@@ -207,7 +207,9 @@ WINDOW_PY_LINE_BUDGET = 4671
 # 本文件只做一次分支与身份回填（slot_from_instance_id）。
 # 2026-09-24 上调到 2391：合入上游更新页接线（更新页主体在 pet/update_settings.py）。
 # 实测 2391；按文件约定只随实测校准，不为达标压行（拆分仍是待办）。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2391
+# 2026-09-27 上调到 2393：overlay 文案如实（省电模式 hint 改调 settings_pet_controls、
+# 窗口级键「对所有桌宠生效」标注接线 +2 行）。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2393
 
 
 def _read(name: str) -> str:

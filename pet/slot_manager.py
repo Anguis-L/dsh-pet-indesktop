@@ -320,17 +320,29 @@ def migrate_legacy_spawns(config_dir: Path | str) -> bool:
 
 
 def pid_alive(pid: int) -> bool:
-    """跨平台探活：Windows 用 OpenProcess，其余用 kill(pid, 0)。"""
+    """跨平台探活：Windows 用 OpenProcess + GetExitCodeProcess，其余用 kill(pid, 0)。"""
     if pid <= 0:
         return False
     if sys.platform == "win32":
         import ctypes
-        # PROCESS_QUERY_LIMITED_INFORMATION
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        # PROCESS_QUERY_LIMITED_INFORMATION（Vista+ 即可查退出码）
+        handle = kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        try:
+            # 句柄打得开 ≠ 进程还活着：进程被 TerminateProcess 后，只要还有人
+            # 持着它的句柄（如父进程的 Popen 尚未 reap），进程对象不会销毁，
+            # OpenProcess 一路成功。只有退出码仍是 STILL_ACTIVE 才算存活。
+            # 同 pet/harness_launcher.py::_windows_pid_alive 的既有判定口径。
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
