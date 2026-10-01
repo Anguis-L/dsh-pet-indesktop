@@ -142,6 +142,10 @@ def test_advance_waits_without_frame_skip(tmp_path):
     clip.frameChanged.connect(frames.append)
     try:
         clip.start()
+        # 确定性纪律（同 test_playthrough_ends_with_finished）：停表后推进只来自
+        # 显式 _advance 与到货回调。不停表时计时器会在「帧 1 上屏、awaiting 复位」
+        # 的断言窗口内再抢跑一拍，把 awaiting 登记成 2（macOS CI 实测一红）。
+        clip._timer.stop()
         _pump_until(lambda: frames == [0])
         clip._awaiting = -1
         clip._pending.clear()                  # 制造"未预取"状态
