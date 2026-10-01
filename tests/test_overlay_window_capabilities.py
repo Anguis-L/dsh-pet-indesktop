@@ -42,6 +42,7 @@ class FakeClock:
 class FakeScreen(QObject):
     geometryChanged = Signal(QRect)
     availableGeometryChanged = Signal(QRect)
+    refreshRateChanged = Signal(float)
 
     def __init__(self, geo, avail, *, dpr=1.0, refresh=60.0):
         super().__init__()
@@ -61,6 +62,11 @@ class FakeScreen(QObject):
 
     def refreshRate(self):
         return self._refresh
+
+    def set_refresh(self, rate):
+        """同分辨率下切刷新率（60↔165/180）：触发 refreshRateChanged。"""
+        self._refresh = float(rate)
+        self.refreshRateChanged.emit(self._refresh)
 
 
 class CapSprite:
@@ -335,4 +341,20 @@ def test_refresh_settings_reapplies(tmp_path):
     shell.refresh_settings()
     assert shell.overlay.mouse_through is True
     assert not (shell.overlay.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+    shell._delete_runtime_marker()
+
+
+def test_refresh_rate_change_rewires_tick_interval(tmp_path):
+    """同分辨率切刷新率（60→180Hz）时 refreshRateChanged 应让 tick 间隔立即重读。
+
+    回归：此前只接 geometryChanged，同分辨率模式切换不重读刷新率，
+    运行中的桌宠卡在 16ms(60Hz) 档直到重启（任务A 实锤缺口）。
+    """
+    screen = FakeScreen((0, 0, 1920, 1080), (0, 0, 1920, 1040), refresh=60.0)
+    shell = _make_shell(tmp_path, {"on_top": False}, screen=screen)
+    shell.start()
+    driver = shell.overlay.tick_driver
+    assert driver._timer.interval() == 16
+    screen.set_refresh(180.0)
+    assert driver._timer.interval() == 6
     shell._delete_runtime_marker()

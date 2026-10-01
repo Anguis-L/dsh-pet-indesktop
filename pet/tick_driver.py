@@ -33,6 +33,11 @@ QTimer、不 sleep 赌时序（AGENTS.md 时序测试纪律）。
 tick 仪表（归因"偶发卡顿"）与电源感知（AC 下 T1 满速）见 ``TickMetrics`` /
 ``TickGovernor.on_ac_power``：仪表默认开、``PET_TICK_METRICS=0`` 全关；
 电源感知只在 T1 的有效间隔上体现，T0/T2/T3 与降档滞回语义不变。
+
+隐藏降载（O3/O4）：档位判定的可见性从"窗口可见"扩到"有可见 sprite"——
+逐只藏光与整窗隐藏同义（``note_sprite_visibility_changed`` 立即重评，目标
+T3 走既有 occluded 分支）；锁屏/挂起由 ``set_suspended`` 强制 T3 并逐 sprite
+停播放节拍（只降档，不隐藏窗口），唤醒时同帧回全速并续播。
 """
 
 from __future__ import annotations
@@ -165,6 +170,8 @@ class TickDriver(QObject):
         # 空窗停表标记（M12c）：overlay 还在但聚合 sprite 数归零时停表，
         # 有 sprite 加入才恢复（区分「本来就没 start 过」与「被空窗停掉」）
         self._suspended_for_empty = False
+        # 锁屏/挂起（O4）：置位期间强制 T3（模拟挂起），恢复时同帧回全速
+        self._suspended = False
         # tick 仪表（PET_TICK_METRICS=0 时不建实例；门控在调用点）
         self._metrics = TickMetrics(clock=clock) if TICK_METRICS_ENABLED else None
         self._timer = QTimer(self)
@@ -255,6 +262,22 @@ class TickDriver(QObject):
         if self._timer.isActive():
             self._suspended_for_empty = True
             self.stop()
+
+    def note_sprite_visibility_changed(self) -> None:
+        """逐只显隐通知（``set_sprite_visible`` / 整窗显隐调；O3）。
+
+        与 ``note_sprite_count_changed`` 同款通知面：可见性变化必须让档位机
+        立刻重评，不必等下一个 tick 或一次心跳——
+
+        - 藏光最后一只可见 sprite（或整窗隐藏）⇒ 没有像素要上屏，目标档位
+          T3（沿用既有 occluded 分支，降档仍走 ``DOWNGRADE_HOLD_MS`` 滞回，
+          可见性瞬态抖动不降档）；
+        - 恢复可见 ⇒ 升档同步立即（``note_kinetic`` 同款），恢复显示的首个
+          tick 就是全速，不等 T3 心跳（最长 1s 的档位滞后）。
+        """
+        if self._visible_for_tier():
+            self._governor.notify_kinetic()
+        self._sync_tier()
 
     # ---------------------------------------------------------------- 时间基（V-6）
     @staticmethod
@@ -353,14 +376,43 @@ class TickDriver(QObject):
             sprites.extend(overlay.sprites)
         return sprites
 
+    @staticmethod
+    def _sprite_visible(sprite) -> bool:
+        """sprite 逐只可见性；无该字段的鸭式 sprite 按旧语义视为可见。"""
+        return bool(getattr(sprite, "visible", True))
+
+    def _visible_for_tier(self) -> bool:
+        """"有东西需要上屏吗"（档位判定的可见性输入，O3）。
+
+        口径 = 存在一个可见 overlay 且它上面有可见 sprite。逐只藏光与整窗
+        隐藏因此同义：没有任何像素需要上屏（隐藏 sprite 既不被绘制、也不进
+        命中与位置 fanout，推进段对它没有可交付的东西）。
+
+        两个兼容口：一只 sprite 都没有的 overlay（空窗，M12c 已停表）无从谈
+        "sprite 可见"，退回窗口可见性；无 ``visible`` 字段的鸭式 sprite
+        （灰假件/旧装配）沿用窗口可见性。
+        """
+        if not self._all_sprites():
+            return any(o.isVisible() for o in self._overlays)
+        return any(
+            o.isVisible() and any(self._sprite_visible(s) for s in o.sprites)
+            for o in self._overlays
+        )
+
     def _sync_tier(self) -> None:
         """评估目标档位并在变化时应用（升档在 evaluate 内即生效）。"""
+        if self._suspended:
+            # 锁屏/挂起（O4）：只降档——挂起期间任何活动信号（鼠标、位移、
+            # 帧到达）都不许把档位升回去（挂起态下这些都是旧状态的回声）
+            if self._applied_tier != TIER_OCCLUDED:
+                self._apply_tier(TIER_OCCLUDED, reason="suspended")
+            return
         animating = (
             self._last_frame_notify is not None
             and time.monotonic() - self._last_frame_notify < ANIMATING_WINDOW_S
         )
         any_motion = any(self._sprite_in_motion(s) for s in self._all_sprites())
-        visible = any(o.isVisible() for o in self._overlays)
+        visible = self._visible_for_tier()
         tier = self._governor.evaluate(
             any_motion=any_motion, animating=animating, visible=visible)
         if tier != self._applied_tier:
@@ -403,9 +455,68 @@ class TickDriver(QObject):
         self._governor.notify_kinetic()
         self._sync_tier()
 
+    def note_user_input(self) -> None:
+        """真实用户输入（按下/右键）的挂起自愈：输入到达即证明用户在屏幕前。
+
+        解锁/恢复消息丢失（或注册因原生窗口重建失效）时，挂起态会把档位钉在
+        T3 且逐 sprite 停播放节拍，直到下次显隐。用户点到桌宠就解除挂起——
+        优先走宿主注入的 ``on_user_resume``（壳侧同拍续预热），缺省直接
+        ``set_suspended(False)``。非挂起态无操作。"""
+        if not self._suspended:
+            return
+        resume = getattr(self, "on_user_resume", None)
+        if callable(resume):
+            resume()
+        else:
+            self.set_suspended(False)
+
     def note_frame(self) -> None:
         """"动画在播"活性输入（纯帧到达、无位移）：tick 末档位评估用。"""
         self._last_frame_notify = time.monotonic()
+
+    # ---------------------------------------------------------------- 锁屏/挂起（O4）
+    @property
+    def suspended(self) -> bool:
+        """是否处于锁屏/挂起（强制 T3）状态。"""
+        return self._suspended
+
+    def set_suspended(self, suspended: bool) -> None:
+        """锁屏/挂起（O4）：True 强制 T3 并逐 sprite 停播放节拍；False 恢复全速。
+
+        锁屏/挂起时 overlay 仍 ``isVisible()``（窗口没被藏，只是屏幕被锁屏
+        遮住），既有档位判定拿不到任何"不可见"信号——AC 供电下会一直停在
+        T1 满速、clip 按帧率解码跑整夜。故由会话/电源事件显式置位：
+
+        - True：直接 ``_apply_tier(T3)``（不走 ``DOWNGRADE_HOLD_MS`` 滞回——
+          这是用户主动离开的确定性信号，不是抖动）+ 逐 sprite ``pause_clip``
+          （只停播放节拍，显示位置原地保留）。
+        - False：逐 sprite ``resume_clip`` 续播（**不**回第 0 帧），再
+          ``note_kinetic`` 同帧回全速（升档同步立即，首 tick 即满速且不吃
+          挂起期流逝）。
+
+        **只降档**：不隐藏窗口、不动全屏/光标 watcher（唤醒后可见性/交互面
+        必须原样，否则桌宠会"醒来不回来"）。幂等。
+        """
+        suspended = bool(suspended)
+        if suspended == self._suspended:
+            return
+        self._suspended = suspended
+        if suspended:
+            for sprite in self._all_sprites():
+                pause = getattr(sprite, "pause_clip", None)
+                if callable(pause):
+                    pause()
+            self._apply_tier(TIER_OCCLUDED, reason="suspended")
+            return
+        # 恢复只对"真的能看见"的 sprite：窗口仍被藏（托盘隐藏中解锁）或那一只
+        # 被逐只藏起时，播放节拍维持暂停，等显示路径（set_pet_visible /
+        # set_sprite_visible）恢复——锁屏不该把隐藏期的暂停悄悄解除。
+        if self._visible_for_tier():
+            for sprite in self._all_sprites():
+                resume = getattr(sprite, "resume_clip", None)
+                if callable(resume) and self._sprite_visible(sprite):
+                    resume()
+        self.note_kinetic()  # 同帧回全速（并重算档位）
 
     # ---------------------------------------------------------------- 统一 tick
     def on_tick(self, dt: float | None = None) -> None:
