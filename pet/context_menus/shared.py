@@ -107,6 +107,47 @@ def defer_menu_callback(menu: QMenu, callback) -> bool:
     return True
 
 
+def release_menu_tree(menu: QMenu) -> None:
+    """释放整棵右键菜单树（``menu.exec()`` 返回后必须调用一次）。
+
+    菜单以**长命窗口**为 parent，只丢 Python 引用时 C++ 侧的整棵树（子菜单/动作/
+    动画图标解码池/图标 pixmap）会随每次右键永久累积——实测 offscreen 经 facade
+    构建 modern 全量菜单 10 轮：+153 QMenu / +780 QAction；走本函数后增量 0。
+    根因是 ``apply_modern_menu_style`` / ``install_modern_check_indicators`` 的
+    ``aboutToShow.connect(lambda menu=menu: ...)`` 自引用连接让 Python 侧也永不
+    释放（详见 ``tests/test_menu_tree_release.py``）。
+
+    流程与 window.py 原实现逐位一致：
+
+    1. 先 ``pool.clear()`` 掉各动画分类子菜单尚未启动的解码任务——否则
+       QThreadPool 析构时会在 GUI 线程等运行中的 worker；
+    2. 再有界轮询等 worker 收工（每 50ms 一次，总上限 3s，不阻塞事件循环；解码
+       worker 病态不结束时也强制释放，否则菜单树永久滞留），然后
+       ``menu.deleteLater()``。轮询定时器绑 menu 作 context：菜单先销毁时定时器
+       随之失效，不会对已删 C++ 对象再 ``deleteLater``。
+    """
+    pools = []
+    for submenu in menu.findChildren(QMenu):
+        pool = getattr(submenu, "_animation_icon_pool", None)
+        if pool is not None:
+            pool.clear()
+            pools.append(pool)
+
+    def delete_when_idle(_attempts: int = 0) -> None:
+        if _attempts >= 60:
+            menu.deleteLater()
+            return
+        if any(not pool.waitForDone(0) for pool in pools):
+            QTimer.singleShot(50, menu, lambda: delete_when_idle(_attempts + 1))
+            return
+        menu.deleteLater()
+
+    if pools:
+        delete_when_idle()
+    else:
+        menu.deleteLater()
+
+
 def connect_action(action, callback) -> None:
     def invoke(_checked=False, action=action, callback=callback) -> None:
         parent = action.parent()

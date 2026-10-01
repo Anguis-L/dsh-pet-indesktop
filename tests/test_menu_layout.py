@@ -2616,3 +2616,44 @@ def test_music_align_ready_and_callback_routing(monkeypatch):
     assert shared_mod._align_lyric(pet, "不存在的动作") is False
     ctrl.shutdown()
     app.processEvents()
+
+
+def _stylesheet_font_family(sheet: str) -> str:
+    for line in sheet.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("font-family:"):
+            return stripped[len("font-family:"):].rstrip(";").strip()
+    raise AssertionError("modern 菜单样式表里没有 font-family")
+
+
+def test_system_font_stack_matches_platform():
+    """右键菜单 font-family 必须是**单族**，且该族要覆盖菜单里的中文。
+
+    2026-09-28 真 Qt(Windows 6.11) 分步实测：`QFontDatabase` 的族枚举本身只要 ~16MB，
+    但只要拿一个「请求族覆盖不了待测文本」或「多族列表」的 QFont 去测量中文文本，
+    Qt 就会为缺失字形做回退搜索而枚举整个字体库，把 C:\\Windows\\Fonts 的 528 个字体
+    文件（~831MB）映射进进程——菜单弹出一次后 msyh.ttc 37.6MB、StaticCache.dat 19.2MB、
+    simhei/arial 等常驻，RSS +70~150MB 不回。旧 macOS 栈、新 Windows 三族栈、
+    单族但不存在（或覆盖不了中文）三种写法都会触发，所以这里只允许单族。
+    """
+    import sys
+    from pet.context_menus.menu_styles.common import SYSTEM_FONT_STACK
+    from pet.context_menus.menu_styles.modern import modern_menu_stylesheet
+
+    sheet = modern_menu_stylesheet({"theme": "light"})
+    assert SYSTEM_FONT_STACK in sheet
+    family = _stylesheet_font_family(sheet)
+    if sys.platform == "win32":
+        # 单族 + 覆盖中文，两个条件缺一都会触发枚举（实测）
+        assert "," not in family, f"多族 font-family 会触发全字体库枚举: {family}"
+        assert "Microsoft YaHei" in family
+    elif sys.platform == "darwin":
+        # macOS 未实机验证，多族栈按原样保留，这里只锁住「没被顺手改掉」
+        assert "SF Pro Text" in family
+
+    # 用户自选字体也必须收敛成单族，否则挑了自定义字体的人重新踩同一个坑
+    custom = _stylesheet_font_family(
+        modern_menu_stylesheet({"theme": "light", "ui_font": "Consolas"})
+    )
+    assert "," not in custom, f"自选字体被拼成多族: {custom}"
+    assert "Consolas" in custom

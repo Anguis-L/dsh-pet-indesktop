@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import weakref
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Callable
 from urllib.parse import unquote
 
@@ -983,6 +985,36 @@ def opencode_event_tool(event_type: str, data_raw: str) -> str:
     return str(part.get("tool", "") or "").strip()
 
 
+# 桥目录陈旧文件的清理口径（N1，2026-09-29）：
+# - 超龄线 24h：写者只要还在写，mtime 就会变新，超龄即"写者已不活跃"；
+# - 单拍最多体检/清理 8 个（从最旧端起步）：升级后首拍面对上百个历史死文件时
+#   不砸盘，也避免为全部历史文件每拍各做一次进程探活（一次判定 = 3 次系统调用）；
+#   目录 mtime 会因删除而变化 → 下一拍立刻重扫，几拍内自然清空；
+# - pid 从桥文件名 ``dsh-<pid>.jsonl``（integrations/dsh-pet-bridge/index.js
+#   的 INSTANCE_FILE）解析；旧版单实例 ``dsh.jsonl`` 无 pid 线索，一律保留。
+_BRIDGE_STALE_FILE_AGE_S = 24 * 3600.0
+_BRIDGE_STALE_CLEANUP_LIMIT = 8
+_BRIDGE_INSTANCE_FILE_RE = re.compile(r"^dsh-(\d+)\.jsonl$")
+
+
+def _bridge_writer_alive(pid: int) -> bool | None:
+    """桥文件写者（``dsh-<pid>.jsonl``）是否还活着。
+
+    True = 存活；False = 确定已死；**None = 判定失败**（平台探活不可用/异常），
+    调用方按保守处理——不清理、照常轮询。复用 ``slot_manager.pid_alive``
+    （Windows 走 OpenProcess + GetExitCodeProcess 的 STILL_ACTIVE 口径，其余
+    平台 ``kill(pid, 0)``），不另造一套探活。
+    """
+    if pid <= 0:
+        return None
+    try:
+        from .slot_manager import pid_alive
+        return bool(pid_alive(pid))
+    except Exception:
+        log.debug("桥文件写者探活失败 pid=%s", pid, exc_info=True)
+        return None
+
+
 class DirGlobTailer:
     """目录下按 glob 匹配多个 jsonl 文件的增量 tail（新文件发现 + 淘汰）。
 
@@ -1028,30 +1060,118 @@ class DirGlobTailer:
         self._tailers.clear()
 
     def _scan(self, now: float) -> None:
-        # 始终 glob 目录以可靠发现新文件。st_mtime_ns 在部分文件系统（尤其 CI）
-        # 上分辨率粗或有缓存，不能作为「文件增删」的唯一检测信号——用它做早退会
-        # 导致 create 后立即 read 漏掉新文件（test_discovers_new_files_during_scan
-        # _throttle_and_keeps_offsets 的稳定失败）。glob 便宜（dsh*.jsonl，
-        # max_files 封顶），无需节流。
+        # F-PERF P3：scan_interval 此前只存不用——每拍全量枚举（最多 64 文件，
+        # 每个都要 listdir+匹配）纯浪费。现在两级早退：
+        # 1) 距上次扫描不足 scan_interval **且目录 mtime_ns 未变** → 直接返回
+        #    缓存的前次结果（本轮不枚举、不新建/淘汰 tailer）；
+        # 2) 其余情况（间隔到点 / 目录变了 / mtime 读不到）全量枚举。
+        # 目录 mtime 是"文件增删"的即时信号：新文件写入当拍即可发现（既有
+        # 语义 test_discovers_new_files_during_scan_throttle_and_keeps_offsets
+        # 要求）；分辨粗/拿不到 mtime 的文件系统由上界 scan_interval 兜底，
+        # 发现延迟不超过 scan_interval（默认 5s，不擅自加大）。
+        if (now - self._last_scan) < self.scan_interval and not self._directory_changed():
+            return
         self._last_scan = now
         try:
             if not self.directory.is_dir():
+                self._last_directory_mtime_ns = None
                 return
-            files = sorted(self.directory.glob(self.pattern))
-            files = files[: self.max_files]
-            candidates = {str(f) for f in files}
-            for stale in [k for k in self._tailers if k not in candidates]:
-                del self._tailers[stale]
-            for fkey in candidates:
-                if fkey not in self._tailers:
-                    t = ByteOffsetTailer(fkey)
-                    t._initial_backfill_done = getattr(self, "_cached_backfill_value", False)
-                    self._tailers[fkey] = t
+            # 与下面的目录枚举同一次 try：目录存在即顺手记下 mtime，供下一拍早退比对
+            self._last_directory_mtime_ns = self.directory.stat().st_mtime_ns
+            chosen = self._scan_candidates()
         except Exception:
             log.debug("桥目录扫描异常", exc_info=True)
+            return
+        candidates = {str(f) for f in chosen}
+        for stale in [k for k in self._tailers if k not in candidates]:
+            del self._tailers[stale]
+        for fkey in candidates:
+            if fkey not in self._tailers:
+                t = ByteOffsetTailer(fkey)
+                t._initial_backfill_done = getattr(self, "_cached_backfill_value", False)
+                self._tailers[fkey] = t
+
+    def _scan_candidates(self) -> list[Path]:
+        """本轮该轮询的文件：按 **mtime 倒序** 取前 ``max_files``（活跃优先）。
+
+        旧实现按文件名字典序取前 max_files——实机（2026-09-29）桥目录里积了
+        172 个陈旧 ``dsh-*.jsonl``（6 个写者还活着，其中最新写入的文件写于 2.5
+        小时前），它排在名字序第 74 位，被 64 名的预算挤出扫描集合：那个会话
+        的状态事件桌宠一条都读不到（功能缺陷）。文件名的 pid 大小与"哪个会话
+        还活着"无关，只有 mtime 能表达活跃度。
+
+        顺手清掉「写者进程已死 **且** 超过 ``_BRIDGE_STALE_FILE_AGE_S`` 未写入」
+        的陈旧文件，清理失败的留在磁盘上（只是不再轮询）。
+
+        枚举用 ``os.scandir`` 而非 ``Path.glob``：Windows 上目录项自带 mtime，
+        排序所需的每个文件时间戳零额外系统调用（本机 stat 病态昂贵，见类注释）。
+        """
+        entries: list[tuple[int, str, str]] = []
+        with os.scandir(self.directory) as scan:
+            for entry in scan:
+                if not fnmatch.fnmatch(entry.name, self.pattern):
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                    mtime_ns = entry.stat().st_mtime_ns
+                except OSError:
+                    continue  # 枚举期被删/无权限：当拍忽略，下一拍再来
+                entries.append((mtime_ns, entry.name, entry.path))
+        entries.sort(key=lambda item: item[0])  # 升序：最旧在前（清理从最旧端起）
+        dead = self._cleanup_stale_dead_writers(entries)
+        live = [path for _mtime_ns, _name, path in entries if path not in dead]
+        live.reverse()                          # 翻回 mtime 倒序（活跃优先）
+        return [Path(path) for path in live[: self.max_files]]
+
+    def _cleanup_stale_dead_writers(self, entries: list[tuple[int, str, str]]) -> set[str]:
+        """清理「写者 pid 已死且超龄」的桥文件，返回判定为死的路径集合。
+
+        ``entries`` 按 mtime 升序（最旧在前）。单拍最多体检 ``_BRIDGE_STALE_CLEANUP_LIMIT``
+        个，两个理由：① 升级后首拍面对上百个历史死文件时不砸盘（目录 mtime 变化
+        会让下一拍立刻重扫，几拍内自然清空）；② 一次存活性判定是三次系统调用
+        （OpenProcess + GetExitCodeProcess + CloseHandle），不能对全部历史文件
+        每拍各来一次。从**最旧**端起步，被删的空位下一拍自然让位。
+
+        保守三连（任一不成立就保留）：未超过 ``_BRIDGE_STALE_FILE_AGE_S``（活着的
+        写者一写入 mtime 就变新，下一拍自动回到候选集）、文件名匹配不上
+        ``dsh-<pid>.jsonl``（旧版单实例 ``dsh.jsonl`` 等无 pid 线索）、存活判定
+        失败（``None``，见 :func:`_bridge_writer_alive`）——宁可多留一个死文件，
+        绝不误删活会话正在写的桥文件。
+        """
+        now = time.time()
+        dead: set[str] = set()
+        probes = 0
+        for mtime_ns, name, path in entries:
+            if probes >= _BRIDGE_STALE_CLEANUP_LIMIT:
+                break
+            if (now - mtime_ns / 1e9) < _BRIDGE_STALE_FILE_AGE_S:
+                break                    # 进入未超龄区间：更"新"的一律不必看
+            match = _BRIDGE_INSTANCE_FILE_RE.match(name)
+            if match is None:
+                continue                 # 无 pid 线索：不探活、不清理
+            probes += 1
+            if _bridge_writer_alive(int(match.group(1))) is not False:
+                continue                 # 活着 / 判定不了存活：一律保留
+            dead.add(path)
+            try:
+                os.remove(path)
+            except OSError:
+                pass                     # 被写者打开/无权限：留在磁盘上，只是不轮询
+        return dead
+
+    def _directory_changed(self) -> bool:
+        """目录 mtime_ns 是否变了（读不到 = 视为变了：宁可多扫一次不漏文件）。"""
+        try:
+            current = self.directory.stat().st_mtime_ns
+        except OSError:
+            return True
+        return current != self._last_directory_mtime_ns
 
     def read_new_lines(self) -> list[str]:
-        now = time.time()
+        # 扫描节流的时钟用 monotonic：它是纯间隔比较，墙上时钟被 NTP/手动改时
+        # 不能把「多久没扫描」算歪（后拨会让新一轮扫描迟迟不来）。
+        now = time.monotonic()
         self._scan(now)
         lines: list[str] = []
         for tailer in self._tailers.values():
@@ -1090,12 +1210,18 @@ class ByteOffsetTailer:
         """读取文件自上次 offset 以来的全部完整新增行。
 
         半行处理：若读取末尾不是换行符（行被 chunk 截断或写入方尚未写完），
-        未完成部分存入 _partial，下次读取时拼回——绝不把半行当整行解析。"""
-        if not self.file_path.is_file():
-            return []
+        未完成部分存入 _partial，下次读取时拼回——绝不把半行当整行解析。
 
+        F-PERF P3：``is_file()`` 与紧随的 ``stat()`` 合并成一次 ``stat()``
+        （``is_file`` 本身就是一次 stat + S_ISREG 判定）。这条轮询每拍对每个
+        tail 文件各做两次系统调用，实机 py-spy 在 GUI 侧抓到 15.6% 时间耗在
+        stat 上（本机 stat 病态昂贵）。语义不变：读不到 / 不是普通文件 → 按
+        「文件不存在」返回空，绝不抛。
+        """
         try:
             st = self.file_path.stat()
+            if not S_ISREG(st.st_mode):
+                return []
             size = st.st_size
             # 文件身份识别（应对 bridge rename 轮转出同路径新文件）：
             # Windows 用 (ino, ctime_ns)——ctime 是创建时间，追加不变、轮转变化；

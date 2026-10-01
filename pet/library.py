@@ -33,9 +33,52 @@ from PySide6.QtGui import QImage, QMovie
 from . import catalog
 from . import frameseq_provision
 from . import perfstats
+from . import webm_clip
 from .webm_clip import WebMClip, session_ending
 
 _LIVE_MOVIE_LIBRARIES: weakref.WeakSet = weakref.WeakSet()
+
+#: 兄弟库预热首帧前的有界等待上限（秒）：责任持有者 7 段交互核 ≈0.5s 解完，
+#: 给 2s 宽预算；等不到就照旧自己解（正确性不依赖等待成功）。
+PEER_FIRST_FRAME_WAIT_S = 2.0
+
+# 供给线程超出有界等待后的落脚点：QThread 带着活线程被销毁是 Qt 的 fatal
+# （"QThread: Destroyed while thread is still running" → abort），而库随窗口/进程
+# 销毁时就会命中——超时后把线程摘出库、由这里强引用持有，跑完再由
+# reap_orphan_provision_workers() 摘除。宁可留一个正在收尾的线程，绝不销毁活线程。
+_ORPHAN_PROVISION_WORKERS: set = set()
+_ORPHAN_PROVISION_LOCK = threading.Lock()
+
+
+def orphan_provision_workers() -> tuple[object, ...]:
+    """当前被登记为孤儿（超出有界等待仍未退出）的帧序列供给线程快照。"""
+    with _ORPHAN_PROVISION_LOCK:
+        return tuple(_ORPHAN_PROVISION_WORKERS)
+
+
+def reap_orphan_provision_workers() -> int:
+    """摘掉已退出的孤儿供给线程（返回摘掉数）；还在跑的继续持有。
+
+    ``deleteLater``（库给 worker 接的收尾）先到会让 Python 包装对象失效：
+    那同样等于"线程已经走完"，按已退出摘除（不重试、不告警）。
+    """
+    with _ORPHAN_PROVISION_LOCK:
+        workers = list(_ORPHAN_PROVISION_WORKERS)
+    done: list[object] = []
+    for worker in workers:
+        try:
+            finished = bool(worker.isFinished())
+        except RuntimeError:
+            finished = True   # C++ 侧已销毁（deleteLater 已投递）
+        except Exception:
+            finished = False
+        if finished:
+            done.append(worker)
+    if done:
+        with _ORPHAN_PROVISION_LOCK:
+            for worker in done:
+                _ORPHAN_PROVISION_WORKERS.discard(worker)
+    return len(done)
 
 
 # QMovie 播放速度补偿（%）：GIF 路线使用，校准 QMovie 偏慢问题
@@ -120,6 +163,104 @@ class GifClip(QObject):
         self.frameChanged.emit(n)
 
 
+# ------------------------------------------------------------ 同角色媒体共享
+# overlay 单进程多 sprite 下，每只与主宠同角色的子宠此前各建一份完整
+# MovieLibrary：各解析一遍 manifest/素材路径、各读一遍 no_mirror 与
+# move_strides.json、各为**每段素材**重算一次源哈希（帧序列世代身份）、各 new
+# 出 106 个 clip 对象、各把同一批素材预热一遍。其中"素材怎么读、有哪些段、
+# 帧序列世代是谁、分类怎么切"这部分**在同角色下逐位相同**，重复算三遍纯属浪费。
+#
+# 共享边界严格画在**只读媒体视图**上（SharedCharacterMedia）：clip 对象、
+# 播放位置、定时器、首帧私有缓存**一律不共享**——同角色两只宠同时播同名 clip
+# 时各自拿的是各自的 clip 实例，播放态天然隔离。
+_SHARED_MEDIA_LOCK = threading.Lock()
+_SHARED_MEDIA: "weakref.WeakValueDictionary[tuple[str, str], SharedCharacterMedia]" = (
+    weakref.WeakValueDictionary())
+
+
+def shared_media_key(character_id: str, asset_dir) -> tuple[str, str]:
+    """共享键：角色 id + 素材目录的绝对路径（同键 = 素材逐位相同）。"""
+    try:
+        resolved = str(Path(asset_dir).resolve())
+    except OSError:
+        resolved = str(asset_dir)
+    return (str(character_id), resolved)
+
+
+def lookup_shared_media(character_id: str, asset_dir):
+    """取同角色已有的只读媒体视图；没有活库持有时返回 None。"""
+    with _SHARED_MEDIA_LOCK:
+        return _SHARED_MEDIA.get(shared_media_key(character_id, asset_dir))
+
+
+class SharedCharacterMedia:
+    """一个角色的**只读**媒体视图：同角色多库共用一份（异角色/异目录不共享）。
+
+    生命期由在用库强引用持有（注册表是弱值表）：最后一个库被回收即整份失效，
+    之后新建的库按需重建——切角色重建、退出重进都不留常驻残影。
+
+    只读契约：这些表在库创建后无人写入（`rescan_frameseq` 是唯一例外，见其
+    "就地更新共享映射"说明）。**播放态绝不在此**。
+    """
+
+    __slots__ = (
+        'character_id', 'asset_dir', 'manifest', 'name_paths', 'folder_map',
+        'folder_files', 'media_type', 'no_mirror', 'move_strides', 'move_curves',
+        'paths', 'frameseq_dirs', 'priority', '_warm_owner', '__weakref__',
+    )
+
+    def __init__(self, *, character_id, asset_dir, manifest, name_paths,
+                 folder_map, folder_files, media_type, no_mirror, move_strides,
+                 move_curves, paths, frameseq_dirs, priority):
+        self.character_id = character_id
+        self.asset_dir = asset_dir
+        self.manifest = manifest
+        self.name_paths = name_paths
+        self.folder_map = folder_map
+        self.folder_files = folder_files
+        self.media_type = media_type
+        self.no_mirror = no_mirror
+        self.move_strides = move_strides
+        self.move_curves = move_curves
+        self.paths = paths
+        self.frameseq_dirs = frameseq_dirs
+        self.priority = priority
+        self._warm_owner = None
+
+    # -------------------------------------------------------------- 预热责任
+    def claim_warm_owner(self, lib) -> bool:
+        """认领本份素材的预热责任：首个活库得 True，兄弟库得 False。
+
+        低优先级随机动作池（99 段 clip 对象 + 逐段预热）只需跑一次：素材相同、
+        结果相同，兄弟库重复跑只是白建一整套 clip 对象再白预热一遍。责任持有者
+        退出时在 MovieLibrary.shutdown 里交给仍活着的兄弟库（_hand_off_shared_warm），
+        所以"主宠退出、子宠被提升"这类换手不会把预热责任丢掉。
+        """
+        with _SHARED_MEDIA_LOCK:
+            owner = self._warm_owner() if self._warm_owner is not None else None
+            if owner is None or owner is lib:
+                self._warm_owner = weakref.ref(lib)
+                return True
+            return False
+
+    def is_warm_owner(self, lib) -> bool:
+        with _SHARED_MEDIA_LOCK:
+            owner = self._warm_owner() if self._warm_owner is not None else None
+            return owner is lib
+
+    def release_warm_owner(self, lib) -> None:
+        with _SHARED_MEDIA_LOCK:
+            owner = self._warm_owner() if self._warm_owner is not None else None
+            if owner is lib:
+                self._warm_owner = None
+
+
+def publish_shared_media(shared: SharedCharacterMedia) -> None:
+    """把一份只读媒体视图登记进进程级注册表（供同角色兄弟库采用）。"""
+    with _SHARED_MEDIA_LOCK:
+        _SHARED_MEDIA[shared_media_key(shared.character_id, shared.asset_dir)] = shared
+
+
 class MovieLibrary(QObject):
     """素材库：加载指定形象的 webm 或 gif 动画。"""
 
@@ -152,6 +293,9 @@ class MovieLibrary(QObject):
         self.folder_files: dict[str, list[str]] = {}
         self._movies: dict[str, object] = {}
         self._paths: dict[str, Path] = {}
+        # 帧序列世代映射（rescan_frameseq 填充；同角色共享同一份 dict 对象，
+        # 见该方法"就地更新共享映射"说明）
+        self._frameseq_dirs: dict[str, Path] = {}
         # 随机动作池延迟预热：启动后 2s 再以 1 个 worker 慢慢补，避免多开时
         # ffmpeg 进程洪峰；只在高优先级（idle/turn/click/drag/move）就绪后触发。
         self._low_warm_timer = QTimer(self)
@@ -189,6 +333,9 @@ class MovieLibrary(QObject):
         # 首跑帧序列供给（B 档）：排期幂等标志 + library 拥有的供给线程句柄
         self._frameseq_provision_requested = False
         self._frameseq_worker = None
+        # 锁被占时的有界重试计数（见 _retry_frameseq_provision_after_lock）：三宠三库
+        # 抢同一把素材根锁，抢不到的那个若就此收手就再也不会供给。
+        self._frameseq_lock_retries = 0
         # 交互中让路重排期：50ms 短间隔重试（交互一结束立即补上，不把 2s
         # 延迟原样再等一遍）；pause_warm 会停掉它，避免遗留 singleShot 在
         # pause 后仍触发起批。
@@ -202,14 +349,67 @@ class MovieLibrary(QObject):
         self._idle_trim_timer.setInterval(IDLE_FRAME_TRIM_INTERVAL_MS)
         self._idle_trim_timer.timeout.connect(self._on_idle_trim)
         self.low_warm_batch_finished.connect(self._on_low_warm_batch_finished)
-        self.media_type: str = 'webm'
-        self.no_mirror: set[str] = self._load_no_mirror()
-        # move_strides.json 一次读取、一次遍历 → (步幅, 曲线) 两份结果：
-        # 此前两个加载器各读一遍文件、各遍历一遍 dict（重复 IO，且两套口径
-        # 有分叉风险）。加载器方法保留为公开接口（单测按口径直调）。
-        self.move_strides, self.move_curves = self._load_move_sidecar()
+        # 同角色媒体共享（见模块顶部"同角色媒体共享"）：先在进程级注册表里找
+        # 有没有同角色活库留下的只读视图——有就直接采用（不读盘、不重算源哈希、
+        # 不重建表），没有才自己读一份并发布出去。
+        self._shared: SharedCharacterMedia | None = None
+        # 是否为本份素材的**兄弟库**（预热责任不在本库）：由 schedule_*_warm /
+        # resume_warm 在认领预热责任时刷新，预热期据此跳过重复工作。
+        self._warm_peer = False
+        shared = lookup_shared_media(self.character_id, self._asset_dir)
+        if shared is not None:
+            self._adopt_shared_media(shared)
+        else:
+            self.media_type: str = 'webm'
+            self.no_mirror: set[str] = self._load_no_mirror()
+            # move_strides.json 一次读取、一次遍历 → (步幅, 曲线) 两份结果：
+            # 此前两个加载器各读一遍文件、各遍历一遍 dict（重复 IO，且两套口径
+            # 有分叉风险）。加载器方法保留为公开接口（单测按口径直调）。
+            self.move_strides, self.move_curves = self._load_move_sidecar()
 
-        self._load_all()
+            self._load_all()
+            self._publish_shared_media()
+            self._register_high_priority()
+
+    # ------------------------------------------------------------ 同角色媒体共享
+    def _adopt_shared_media(self, shared: SharedCharacterMedia) -> None:
+        """采用同角色已有库的只读媒体视图（兄弟库路径）。
+
+        不读 manifest/text_clips/move_strides、不解析素材路径、不重算帧序列世代
+        （每段一次源 sha256）——这些表逐位沿用首库算好的那份。clip 对象仍由本库
+        自己按需创建（播放态隔离）。
+        """
+        self._shared = shared
+        self.manifest = shared.manifest
+        self._manifest = shared.name_paths
+        self.folder_map = shared.folder_map
+        self.folder_files = shared.folder_files
+        self.media_type = shared.media_type
+        self.no_mirror = shared.no_mirror
+        self.move_strides = shared.move_strides
+        self.move_curves = shared.move_curves
+        self._paths = shared.paths
+        self._frameseq_dirs = shared.frameseq_dirs
+        self._register_high_priority()
+
+    def _publish_shared_media(self) -> None:
+        """把本库刚读出来的只读媒体视图登记进进程级注册表（首个库路径）。"""
+        self._shared = SharedCharacterMedia(
+            character_id=self.character_id,
+            asset_dir=self._asset_dir,
+            manifest=self.manifest,
+            name_paths=self._manifest,
+            folder_map=self.folder_map,
+            folder_files=self.folder_files,
+            media_type=self.media_type,
+            no_mirror=self.no_mirror,
+            move_strides=self.move_strides,
+            move_curves=self.move_curves,
+            paths=self._paths,
+            frameseq_dirs=self._frameseq_dirs,
+            priority=self._build_priority_names(),
+        )
+        publish_shared_media(self._shared)
 
     def _load_no_mirror(self) -> set[str]:
         '''加载 text_clips.json：内含文字的动画在朝向翻转时不镜像（防文字反显）。'''
@@ -351,17 +551,30 @@ class MovieLibrary(QObject):
 
         # 高优先级 clip 必须在主线程创建（QObject 线程亲和），再交给后台线程预热；
         # 低优先级由 QTimer 在主线程触发 _warm_low_priority_background 创建。
-        high, _ = self._priority_names()
-        for name in high:
-            clip = self.movie(name)
-            # 高频交互链首帧常驻：低优先级随机动作池（数量超首帧预算）
-            # 的预热浪涌不得把它们逐出——否则用户点击/拖拽时被迫 GUI
-            # 同步解码首帧，产生可感知的百毫秒级切换卡顿（实测定案）。
-            clip._ffr_pinned = True
+        # 创建动作在 _register_high_priority（本方法之后单独调用，见 __init__）：
+        # 同角色兄弟库采用共享视图时同样要走那一步，但不必重读素材。
 
         # 预热线程由应用层在 UI 就绪后统一调度（schedule_high_priority_warm /
         # schedule_low_priority_warm），避免库构造时在测试/非事件循环环境里
         # 凭空拉起 ffmpeg 预热线程。
+
+    def _register_high_priority(self) -> None:
+        """建高优先级（瞬时交互核）clip 并 pinned 其首帧。
+
+        高优先级 clip 必须在主线程创建（QObject 线程亲和）。pinned = 首帧
+        常驻：低优先级随机动作池（数量超首帧预算）的预热浪涌不得把它们逐出，
+        否则用户点击/拖拽时被迫 GUI 同步解码首帧，产生可感知的百毫秒级切换
+        卡顿（实测定案）。同素材在**跨库首帧共享表**里也 pin 一条（见
+        webm_clip.pin_shared_first_frame）：兄弟库晚几秒才 spawn 时，交互核首帧
+        不该因为期间播了别的动画就被逐掉，否则它又要重新 spawn 一个 ffmpeg。
+        """
+        high, _ = self._priority_names()
+        for name in high:
+            clip = self.movie(name)
+            clip._ffr_pinned = True
+            path = self._paths.get(name)
+            if path is not None:
+                webm_clip.pin_shared_first_frame(path)
 
     def _priority_names(self) -> tuple[list[str], list[str]]:
         """默认优先级：瞬时交互核立刻预热并常驻，其余动画按需/预测预热。
@@ -371,7 +584,19 @@ class MovieLibrary(QObject):
         低优先级 = idle / move / 随机动作池：idle-return 与 move 由批10-A1
         预测式预热覆盖（播放点前 ~350ms 后台预解码），且 idle 常播在 LRU 里
         永远热，不需要 pinned 常驻（批10-A3 瘦身，首帧预算随之 32→8MB）。
+
+        同角色共享：分类表随只读媒体视图共享，只算一次（3 库 × 每次预热批次
+        都要调一次 build_categories，此前每次都重算）。返回浅拷贝——调用方
+        （含测试）可以随便改，不会污染共享的那份。
         """
+        shared = getattr(self, '_shared', None)
+        if shared is not None:
+            high, low = shared.priority
+            return list(high), list(low)
+        return self._build_priority_names()
+
+    def _build_priority_names(self) -> tuple[list[str], list[str]]:
+        """按本库自己的 manifest/目录分类算出优先级（只在本库为首个库时跑）。"""
         names = list(self._manifest)
         cats = catalog.build_categories(
             names,
@@ -480,7 +705,49 @@ class MovieLibrary(QObject):
 
         # 预解码各动画首帧（QImage 线程安全），首次播放时零阻塞切换，
         # 避免点击 Q 弹瞬间同步 ffmpeg 解码造成卡顿与旧动画帧残留。
-        _run_phase(lambda c: getattr(c, 'warm_first_frame', lambda: None)())
+        #
+        # 同角色兄弟库跳过"重复代价可忽略"的那类 clip（clip 自己声明
+        # FIRST_FRAME_WARM_TRIVIAL，目前只有 FrameSeqClip）：帧 0 冷解码 ~1.2ms
+        # 且 start() 本就异步交付首帧，兄弟库再解一遍同一帧是纯重复。
+        #
+        # 声明白
+        # FIRST_FRAME_WARM_ADOPTABLE 的 clip（WebMClip）不跳过：它的首帧冷路径要
+        # spawn 一个 ffmpeg（60~166ms），点击时没有首帧会露出旧帧窗口。兄弟库改为
+        # **先等责任持有者解出**（有界），等到了就从跨库共享表取用（0 spawn）。
+        def _warm_frame(clip) -> None:
+            if self._warm_peer:
+                if getattr(clip, 'FIRST_FRAME_WARM_TRIVIAL', False):
+                    return
+                if getattr(clip, 'FIRST_FRAME_WARM_ADOPTABLE', False):
+                    self._await_peer_first_frame(clip)
+            warm = getattr(clip, 'warm_first_frame', None)
+            if callable(warm):
+                warm()
+
+        _run_phase(_warm_frame)
+
+    def _await_peer_first_frame(self, clip) -> None:
+        """兄弟库预热前：有界等责任持有者解出**同一素材**的首帧。
+
+        三只宠几乎同时启动（连续 spawn / 活跃清单复活）时，三份库的高优先级预热
+        是并发跑的：谁都还没解出，跨库共享表就是空的——不发这一等，各自 spawn 一个
+        ffmpeg 解同一段素材，并发窗口里的重复照旧（实测三库并发预热 12 次 spawn，
+        本该 4 次）。责任持有者 7 段交互核 3 个并发 worker ≈0.5s 解完，这里给 2s
+        宽预算轮询共享表。
+
+        等待**成功与否不影响正确性**：等到了 clip 侧预热直接从共享表取用（0 spawn）；
+        等不到（责任持有者被隐藏/挂起/已退出）就照旧自己解一遍。
+        """
+        path = getattr(clip, 'path', None)
+        if path is None:
+            return
+        deadline = time.monotonic() + PEER_FIRST_FRAME_WAIT_S
+        while time.monotonic() < deadline:
+            if webm_clip.shared_first_frame_ready(path):
+                return
+            if self._warm_paused or self._shutdown:
+                return  # 已隐藏/切角色/收尾：不再等，照旧自己解
+            time.sleep(0.02)
 
     def _await_interaction_clear(self, generation: int) -> bool:
         """低优先级预热让路：交互进行中阻塞等待，交互结束返回 True 继续。
@@ -542,24 +809,69 @@ class MovieLibrary(QObject):
             self._interaction_active.clear()
             self._interaction_cond.notify_all()
 
+    def cancel_frameseq_provision(self, *, timeout_ms: int = 2000) -> bool:
+        """取消在飞的首跑供给线程（会话结束/退出收口）：置取消谓词 + terminate
+        在飞 ffmpeg（reader 立即返回），有界等待；返回线程是否已退出。幂等。
+
+        这个界成立靠两件事：在飞 ffmpeg 被 terminate（``communicate`` 立即返回），
+        退役清扫也逐条目复查同一取消谓词
+        （``frameseq_provision._remove_generation_bounded``）——否则一个上千帧的
+        世代目录就足以让等待超时。
+
+        超时**不是记一行日志就完事**：此刻线程还活着，而它的 QThread 是本库的子
+        对象——库被销毁（窗口关闭、进程退出）时 Qt 会把活线程一起析构，那是 abort
+        而不是异常。所以超时路径把线程摘出库（``setParent(None)``，见
+        ``_orphan_frameseq_worker``）交给模块级登记处强引用持有，跑完再由
+        ``reap_orphan_provision_workers()`` 摘除。
+        """
+        worker, self._frameseq_worker = self._frameseq_worker, None
+        if worker is None:
+            return True
+        try:
+            worker.cancel()
+        except Exception:
+            logging.getLogger(__name__).debug('帧序列供给线程取消失败', exc_info=True)
+        try:
+            if worker.wait(int(timeout_ms)):
+                return True
+        except Exception:
+            logging.getLogger(__name__).debug('帧序列供给线程等待失败', exc_info=True)
+            return False
+        self._orphan_frameseq_worker(worker)
+        logging.getLogger(__name__).warning(
+            '帧序列供给线程 %dms 内未退出（取消未被及时响应）：已摘出库、'
+            '交孤儿登记处持有到跑完，不再随库销毁', int(timeout_ms))
+        return False
+
+    @staticmethod
+    def _orphan_frameseq_worker(worker: object) -> None:
+        """把超出有界等待的供给线程登记为孤儿（保住它不被随库销毁）。
+
+        ``setParent(None)`` 是保护的实质：QThread 还挂在库上时，库一被销毁就会连同
+        运行中的线程一起析构（Qt 对此的处理是 abort）。摘掉父子关系 + 模块级强引用
+        持有 → 线程自己跑完退出，对象由 ``reap_orphan_provision_workers`` 摘除。
+        """
+        try:
+            worker.setParent(None)
+        except Exception:
+            logging.getLogger(__name__).debug('供给线程脱离库失败', exc_info=True)
+        with _ORPHAN_PROVISION_LOCK:
+            _ORPHAN_PROVISION_WORKERS.add(worker)
+        reap_orphan_provision_workers()   # 顺手清掉此前已跑完的（廉价、幂等）
+
     def shutdown(self) -> None:
         """关闭素材库并收口所有已创建的 WebM reader。"""
         if self._shutdown:
             return
         self._shutdown = True
         self.pause_warm()
-        # 首跑供给线程：置取消谓词并 terminate 在飞 ffmpeg（reader 立即返回），
-        # 有界等待（≤2s）后退出——关机/切角色窗口里绝不留下不受控的重编码进程
-        # （issue #111 纪律）。
-        worker, self._frameseq_worker = self._frameseq_worker, None
-        if worker is not None:
-            try:
-                worker.cancel()
-                worker.wait(2000)
-            except Exception:
-                logging.getLogger(__name__).debug(
-                    '帧序列供给线程收尾失败', exc_info=True,
-                )
+        # 同角色媒体共享：本库若是预热责任持有者，退出前把责任交给仍活着的兄弟库
+        #（见 _hand_off_shared_warm）——否则"主宠退出、子宠被提升"之后整份素材
+        # 没有人再预热低优先级池。
+        self._hand_off_shared_warm()
+        # 首跑供给线程：取消 + 有界等待（口径与超时兜底见
+        # cancel_frameseq_provision——关机/切角色窗口里绝不留下不受控的重编码进程）。
+        self.cancel_frameseq_provision()
         for clip in tuple(self._movies.values()):
             try:
                 cleanup = getattr(clip, 'cleanup', None)
@@ -574,6 +886,25 @@ class MovieLibrary(QObject):
                     '素材库关闭时收口 clip 失败', exc_info=True,
                 )
 
+    def _hand_off_shared_warm(self) -> None:
+        """退出时把同角色媒体的低优先级预热责任交给仍活着的兄弟库。
+
+        预热责任只是"这批 99 段 clip 谁来建、谁来预热"的一枚令牌：持有者退出
+        （主宠退出 → 子宠被提升为主）时若直接丢令牌，同角色素材就再没人预热了。
+        这里显式交接给第一个活着的兄弟库（它下一拍照既有 2s 延迟补跑）。
+        """
+        shared = getattr(self, '_shared', None)
+        if shared is None or not shared.is_warm_owner(self):
+            return
+        shared.release_warm_owner(self)
+        for peer in list(_LIVE_MOVIE_LIBRARIES):
+            if peer is self or getattr(peer, '_shared', None) is not shared:
+                continue
+            if getattr(peer, '_shutdown', False):
+                continue
+            peer.schedule_low_priority_warm()
+            break
+
     @classmethod
     def _shutdown_live_for_tests(cls) -> None:
         """收口未由窗口持有的素材库，避免 reader 跨测试存活。"""
@@ -587,10 +918,18 @@ class MovieLibrary(QObject):
                 )
 
     def resume_warm(self) -> None:
-        """窗口恢复显示时补齐预热：低优先级池未建完或首帧未预热完则重新排期。"""
+        """窗口恢复显示时补齐预热：低优先级池未建完或首帧未预热完则重新排期。
+
+        同角色兄弟库（预热责任在别库）不补跑，且每次恢复都**重新认领一次**
+        责任：责任持有者退出后（_hand_off_shared_warm 交出的令牌）本库随下一次
+        隐藏/恢复即接手，不必额外轮询。
+        """
         if not self._prewarm_enabled:
             return  # Phase 2：动画预热关闭时，隐藏/恢复都不再自动拉起预热
         self._warm_paused = False
+        self._warm_peer = not self.claim_shared_warm()
+        if self._warm_peer:
+            return
         try:
             _, low = self._priority_names()
             with self._warm_state_lock:
@@ -602,6 +941,16 @@ class MovieLibrary(QObject):
                 self._low_warm_timer.start()
         except Exception:
             pass
+
+    def claim_shared_warm(self) -> bool:
+        """认领同角色媒体的预热责任：首个活库得 True，兄弟库得 False。
+
+        没有共享视图（单库/异角色）时恒为 True——单库行为与共享前逐位一致。
+        """
+        shared = self._shared
+        if shared is None:
+            return True
+        return shared.claim_warm_owner(self)
 
     def begin_interaction(self) -> int:
         """用户交互开始：低优先级预热让路（可重入，拖拽中再点击等叠加持有）。
@@ -694,10 +1043,15 @@ class MovieLibrary(QObject):
         批次去重：同一时间最多一个在飞批次（_low_warm_in_flight），
         timer 到点 / 50ms 重试 / resume 重排的并发触发只保留最早一批；
         已完整预热过则直接跳过（遗留 timer 触发不重复起批）。
+
+        同角色兄弟库：预热责任在同角色首个活库（_warm_peer），本批不起——
+        素材相同、结果相同，重复跑只是白建一整套 clip 对象再白预热一遍。
         """
         try:
             if self._warm_paused:
                 return  # 已暂停（隐藏/切角色）：不创建 clip、不启动线程
+            if self._warm_peer:
+                return  # 兄弟库：责任在预热责任持有者，本库不重复起批
             _, low = self._priority_names()
             if not low:
                 return
@@ -766,6 +1120,8 @@ class MovieLibrary(QObject):
         try:
             if self._warm_paused or not self._prewarm_enabled:
                 return
+            if self._warm_peer:
+                return  # 兄弟库：本批不由本库跑，没有"批次未完成"要补
             _, low = self._priority_names()
             with self._warm_state_lock:
                 incomplete = (
@@ -782,16 +1138,28 @@ class MovieLibrary(QObject):
 
         加入 0~0.05s 随机错峰，多开同时启动时避免 ffmpeg 进程洪峰。
         Phase 2：动画预热关闭时不启动。
+
+        同角色兄弟库照样跑本批（只有几段交互核，且首帧由跨库共享表供给，
+        等于不花 ffmpeg），但先认领一次预热责任：认领失败即标记兄弟库，
+        预热期据此跳过"重复代价可忽略"的帧 0 预热（见 _warm_objects）。
         """
         if not self._paths or not self._prewarm_enabled:
             return
+        self._warm_peer = not self.claim_shared_warm()
         threading.Thread(target=self._warm_all_meta_background, daemon=True).start()
 
     def schedule_low_priority_warm(self) -> None:
-        """应用层调用：UI 就绪后延迟补全随机动作池预热（2s 后 1 worker）。"""
+        """应用层调用：UI 就绪后延迟补全随机动作池预热（2s 后 1 worker）。
+
+        同角色兄弟库不排这一批（认领失败）：随机动作池 99 段 clip 对象 + 逐段
+        预热由预热责任持有者跑一次就够（素材相同、结果相同），兄弟库重复跑只是
+        白建一整套 clip 对象再白预热一遍。池级残留回收照旧开——它管的是内存。
+        """
         if not self._prewarm_enabled:
             return
-        self._low_warm_timer.start()
+        self._warm_peer = not self.claim_shared_warm()
+        if not self._warm_peer:
+            self._low_warm_timer.start()
         # 预热排期即代表进程进入"会反复切换动画"的常态：启动池级残留回收。
         if not self._idle_trim_timer.isActive():
             self._idle_trim_timer.start()
@@ -873,7 +1241,16 @@ class MovieLibrary(QObject):
 
         逐 clip 兜异常：半销毁（C++ 侧已删）或 stop() 抛错的 clip 不得阻断其余
         clip 的收口，本路径必须尽力而为。
+
+        首跑供给线程一并取消（``cancel_frameseq_provision``）：本方法是**两条拓扑
+        唯一的会话结束入口**（legacy 由 ``AppShell._on_session_end`` 逐窗调、overlay
+        由 ``OverlayShell._on_session_end`` 逐库调），只停 clip 不取消它，关机窗口里
+        那个线程照样能派生转换 ffmpeg——issue #111 要挡的正是这种派生。取消 = 置谓词
+        + terminate 在飞进程 + 有界等待：正常毫秒级返回（取消被响应时线程当场退出），
+        最坏受 2s 上界约束；真卡住的那个由 ``cancel_frameseq_provision`` 的孤儿兜底
+        接管，不再随库销毁（见那里的说明）。
         """
+        self.cancel_frameseq_provision()
         for clip in tuple(self._movies.values()):
             try:
                 stop = getattr(clip, 'stop', None)
@@ -930,34 +1307,84 @@ class MovieLibrary(QObject):
             pass
 
     def rescan_frameseq(self) -> None:
-        """重建热集帧序列映射：只认含 f_*.webp 的完成态 ``<stem>/`` 目录。
+        """重建帧序列映射（热集 + random/events）：只采纳**当前源身份**的世代目录。
 
-        帧序列化 B 档：assets/characters/<id>/frameseq/<folder>/<stem>/ 存在
-        即优先走 FrameSeqClip（无损 WebP 帧序列，与 webm 解码 bit-exact，
-        见 .scratch/frame-seq-feasibility/FEASIBILITY.md）；不存在 = 现 webm
-        路径逐行不变。按 _manifest 的相对路径同名定位，素材包不带 frameseq
-        目录时本映射为空、零行为变化。
+        帧序列化 B 档：assets/characters/<id>/frameseq/<folder>[...]/<stem>.g<戳12>/
+        （戳 = 源 webm 的 sha256 前 12 位，meta.json 同戳；见
+        ``frameseq_provision`` 模块契约）——目录名即身份，``events/balance/`` 这类
+        深层目录的世代目录同样在映射内（扫描递归到任意深度）。采纳前按当前源重算
+        sha256 比对（``current_generation``，与生产者共用同一谓词）：源换版 ⇒
+        旧世代立即不采纳，本库回退 webm 播放（不冻结、不播错素材），后台供给
+        随后转出新世代。档位也在同一谓词里核对：世代必须是**当前档**产物
+        （``ENCODER_DESC`` = Q70 + 白底反解），档位不符 = 不采纳（回退 webm 播放）
+        ——改档（W1/W2）后旧的「热集无损 / 冷集 Q80」世代全部走这条路径。
+
+        不采纳的形态：旧版无戳 ``<stem>/`` 与 meta 缺戳的产物（**没有身份凭证
+        的缓存绝不当当前源用**——真实部署包里的 153MB 帧集正是这个形态）、
+        ``<stem>.g<戳>.tmp/`` 半成品、meta 帧数与磁盘不符（半拷贝/丢帧）。
+        不采纳 = 现 webm 路径逐行不变；素材包不带 frameseq 时本映射为空、
+        零行为变化。
+
+        全程只读目录名 / meta / 帧数，**不读任何帧内容**（155MB 帧集不哈希）：
+        库创建路径上的开销 = 每段"已有世代目录"的 clip 一次源哈希（热集 11 段
+        5.45MB 实测 ≈12ms 页缓存热；含 random/events 的满配 ≈53MB），没有世代
+        目录的 clip 一个字节都不读（先按目录名筛）。身份**每次由内容重算、无 stat
+        记忆**，见
+        ``frameseq_provision.source_sha256``；没有世代目录的 clip 零开销）。
+        已采纳的世代目录登记
+        进进程级在用集合，供给线程清扫退役世代时据此跳过（活 clip 可能正在读）。
+        集合单调只增：源换版后旧世代只是不再采纳（本进程回退 WebM），它仍留在
+        在用集合里——已创建的 FrameSeqClip 还在读那份目录，删除闸门放行不了它。
 
         首跑自动供给（maybe_provision_frameseq）转换结束后在 GUI 线程调用本
         方法重建映射：此后**新请求**的 clip 走 FrameSeqClip，已创建的 clip
-        不动（进程内已有播放器不换实现）。供给侧的半成品 ``<stem>.tmp/`` 不在
-        _manifest 命名空间里，天然不会被捡到。
+        不动（进程内已有播放器不换实现）。供给轮确实转了新世代或清扫了退役世代时
+        才调用（见 ``_on_frameseq_provision_finished``）：本方法要重算源哈希，无事
+        可做的收尾里重扫纯属白做。
+
+        就地更新共享映射（同角色多库共用一个 dict 对象）：本方法**原地清空再填充**
+        ``self._frameseq_dirs``，绝不重新绑定——兄弟库持有的就是同一个 dict，首库
+        供给完成后的重扫因此对所有同角色库同时生效，兄弟库不必各自再哈希一遍源
+        （每段一次 sha256，满配 ≈53MB/库）。
         """
-        self._frameseq_dirs: dict[str, Path] = {}
+        dirs = self._frameseq_dirs
+        dirs.clear()
         frameseq_root = self._asset_dir.parent / 'frameseq'
-        if frameseq_root.is_dir():
-            for name, fname in self._manifest.items():
-                candidate = frameseq_root / Path(fname).with_suffix('')
-                if candidate.is_dir() and any(candidate.glob('f_*.webp')):
-                    self._frameseq_dirs[name] = candidate
+        generations = frameseq_provision.scan_generations(frameseq_root)
+        if not generations:
+            return
+        for name in self._manifest:
+            source = self._paths.get(name)
+            if source is None:
+                continue
+            # 廉价钱筛：该 clip 连世代目录都没有 → 不哈希源（零开销）
+            if frameseq_provision.clip_base_dir(
+                    source, self._asset_dir, frameseq_root) not in generations:
+                continue
+            generation = frameseq_provision.current_generation(
+                source, self._asset_dir, frameseq_root)
+            if generation is not None:
+                dirs[name] = generation
+        if dirs:
+            frameseq_provision.protect_generations(dirs.values())
 
     # ------------------------------------------------------------ 首跑帧序列供给
     def maybe_provision_frameseq(self) -> None:
-        """库创建后调用：延迟 5s 后台低优先级供给热集帧序列（幂等入口）。
+        """库创建后调用：延迟 5s 后台低优先级供给帧序列（热集 + random/events，幂等入口）。
 
         PET_FRAMESEQ=0（dev 逃生门）/ 会话结束（issue #111）时静默 no-op；
-        「热集已完整 / 拿不到实例锁 / 无 ffmpeg exe」在延迟回调与供给 worker
-        内静默 no-op。只排一个 QTimer.singleShot，绝不阻塞库创建。
+        「范围内都有可用世代 / 拿不到实例锁 / 无 ffmpeg exe」在供给 worker 内静默
+        no-op。只排一个 QTimer.singleShot，绝不阻塞库创建。
+
+        一轮 = 一次启动，代价有上限（``frameseq_provision.provision_once``）：升级
+        形态（旧版无戳帧集在场，播放不降级）**每个启动周期合计**只迁一个 clip——配额
+        记在进程内共享的台账上（键 = 素材根），三宠三库共用同一份，不是每库一份；
+        起手上限到点也不再起新的 clip（已起手的跑完，不硬杀 ffmpeg），余下留到下次
+        启动；失败的 clip 按指数退避；磁盘余量不足的 clip 不起手。所以升级后帧序列
+        不是一次补齐，未迁到的 clip 继续走现 WebM 路径（行为不变，只是帧序列来得
+        晚一点）。供给范围与档位见 ``frameseq_provision``（全部 clip 统一 Q70 +
+        白底反解；单 clip 转一段 = 无损抓帧 + 逐帧反解重编码，比旧的一趟 ffmpeg
+        慢，因此起手上限与预算口径更吃紧）。
         """
         if self._frameseq_provision_requested:
             return
@@ -968,13 +1395,21 @@ class MovieLibrary(QObject):
                           self._start_frameseq_provision)
 
     def _start_frameseq_provision(self) -> None:
-        """延迟回调（GUI 线程）：热集完整则静默 no-op，否则起 library 拥有的线程。"""
+        """延迟回调（GUI 线程）：只起 worker，**"有没有活干"的判定全留给 worker 线程**。
+
+        「待转」（``plan_clips``：给供给范围内每个 clip 算一次源哈希——热集 5.45MB
+        + random 45MB + events 3MB）、「待清扫」（``pending_retirements``）、
+        「回朝旧账」（``stale_current_markers``）这三项以前在**本回调（GUI 线程）**
+        里先判一次：满配素材下这是启动后一次可感的卡顿，而同一个结论 worker 还要再
+        算一遍。现在 GUI 线程只做两件廉价事（是否已收尾、是否已有在飞 worker），其余
+        交给 worker：无事可做时 worker 立刻结束并在 ``report.idle`` 留痕，收尾也不做
+        rescan（见 ``_on_frameseq_provision_finished``）。删除目录这类 I/O 依旧只在
+        worker 线程发生，GUI 线程不碰。
+        """
         try:
             if self._shutdown or self._frameseq_worker is not None:
                 return
             root = self._asset_dir.parent / 'frameseq'
-            if not frameseq_provision.plan_clips(self._asset_dir, root):
-                return  # 热集已完整：不拉线程、不碰 ffmpeg
             worker = frameseq_provision.FrameseqProvisionWorker(
                 self._asset_dir, root, parent=self)
         except Exception:
@@ -990,16 +1425,65 @@ class MovieLibrary(QObject):
             logging.getLogger(__name__).debug('帧序列供给线程启动失败', exc_info=True)
 
     def _on_frameseq_provision_finished(self) -> None:
-        """供给收尾（GUI 线程槽）：重建热集映射，此后新 clip 走 FrameSeqClip。"""
+        """供给收尾（GUI 线程槽）：**确有变化时**重建映射，此后新 clip 走 FrameSeqClip。
+
+        库已收尾（``shutdown()``）时丢弃这个迟到的信号：此刻 rescan 会重算源哈希、
+        重建映射、把世代目录登记进进程级「在用世代」集合——库都没了，这些登记既
+        无收益又会让已退役目录再也清扫不掉（"在用"与"活 clip 在读"从此无法区分）。
+        worker 的取消发生在 ``shutdown()``，而 queued ``finished_work`` 必须等 GUI
+        事件循环才投递，所以"库已收尾、槽才到"是常态而非异常。
+
+        rescan 只在 ``report.converted`` / ``report.retired`` 非零时做：它要按当前源
+        给每个已有世代目录的 clip 重算哈希（满配 ≈53MB）。无事可做的轮次
+        （``report.idle``）或只清退役标记的轮次，映射与重扫前逐条相同——重扫只是白烧
+        一次启动后的 I/O。
+        """
+        if self._shutdown:
+            self._frameseq_worker = None
+            return
         worker, self._frameseq_worker = self._frameseq_worker, None
-        self.rescan_frameseq()
         report = getattr(worker, 'report', None)
+        if report is not None and (report.converted
+                                   or getattr(report, 'retired', 0)):
+            self.rescan_frameseq()
         if report is not None:
             logging.getLogger(__name__).info(
-                '帧序列首跑供给收尾：新转 %s / 跳过 %s / 失败 %s，热集映射 %d 段',
+                '帧序列首跑供给收尾：新转 %s / 跳过 %s / 失败 %s / 清扫退役 %s / '
+                '预算搁置 %s / 退避搁置 %s / 磁盘搁置 %s / 迁移配额已用 %s%s，'
+                '帧序列映射 %d 段',
                 report.converted, report.skipped, report.failed,
+                getattr(report, 'retired', 0),
+                getattr(report, 'deferred_budget', 0),
+                getattr(report, 'deferred_backoff', 0),
+                getattr(report, 'deferred_disk', 0),
+                getattr(report, 'migrations', 0),
+                '（本轮无事可做）' if getattr(report, 'idle', False) else '',
                 len(self._frameseq_dirs),
             )
+        if report is not None and getattr(report, 'locked', False):
+            self._retry_frameseq_provision_after_lock()
+        else:
+            self._frameseq_lock_retries = 0
+
+    def _retry_frameseq_provision_after_lock(self) -> None:
+        """锁被占：本库这一轮一个 clip 都没动，别就此永久放弃（有界重试）。
+
+        QLockFile 是一把建在素材根上的锁：三宠三库（或另一实例）几乎同时排期时，只有
+        先拿到锁的那个跑得成，其余 ``report.locked = True`` 立即返回；而本库的首跑入口
+        ``maybe_provision_frameseq`` 每个进程只排一次 —— 没有这个重试，没抢到锁的那些
+        角色在这次启动里就再也不会供给（审计口径："锁失败永久放弃别的角色"）。
+
+        重试有界：``PROVISION_LOCK_RETRY_LIMIT`` 次、退让从
+        ``PROVISION_LOCK_RETRY_DELAY_MS`` 起逐次翻倍封顶 —— 只重排一个 QTimer（不等待
+        锁、不引常驻线程、不阻塞 GUI），每次尝试在 worker 里 tryLock 失败即返回。超出
+        上限的角色留到下次启动重新排期（仍不是永久放弃）。
+        """
+        if self._frameseq_lock_retries >= frameseq_provision.PROVISION_LOCK_RETRY_LIMIT:
+            return
+        self._frameseq_lock_retries += 1
+        QTimer.singleShot(
+            frameseq_provision.lock_retry_delay_ms(self._frameseq_lock_retries),
+            self, self._start_frameseq_provision)
 
     def movie(self, name: str):
         """按需创建并缓存 clip（懒加载）：启动时只创建实际用到/预热的动画。

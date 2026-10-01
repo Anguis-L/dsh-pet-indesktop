@@ -59,7 +59,7 @@ CSV_FIELDS = [
     'tm_current_mb', 'tm_peak_mb', 'py_blocks',
     'qimage_n', 'qimage_mb', 'qpixmap_n', 'qwidget_n', 'clip_n',
     'clip_queue_frames', 'clip_queue_mb', 'clip_first_mb', 'clip_curr_mb',
-    'live_readers',
+    'clip_listed_frames', 'live_readers',
 ]
 
 
@@ -216,6 +216,10 @@ def _gc_census() -> dict:
     - 首帧缓存 / 当前显示帧字节数
     - 是否还有存活 reader 线程
     这三项是"106 个播放器对象"到底驻留了多少原生/字节内存的直接证据。
+
+    另附 ``clip_listed_frames``：帧表**物化**的 Path 条目数（M1 帧表去物化后
+    FrameSeqClip 常态 0——路径按编号现推，只有 meta 缺失/非法时的 glob 兜底才真
+    持有列表）。这是"爬稳态 vs 泄漏"的判别量：健康进程里它不随运行时长增长。
     """
     data: dict = {}
     n_img = 0
@@ -228,6 +232,7 @@ def _gc_census() -> dict:
     current_bytes = 0
     live_readers = 0
     retired = 0
+    listed_frames = 0
     try:
         for obj in gc.get_objects():
             try:
@@ -289,6 +294,15 @@ def _gc_census() -> dict:
                     retired += len(getattr(obj, '_retired', ()) or ())
                 except Exception:
                     pass
+                try:
+                    # 帧表物化的 Path 数（None 安全）：FrameSeqClip 的 _frames 是
+                    # 现推路径的序列，只有 glob 兜底才真持有列表（属性 listed）；
+                    # 其它形态（旧列表）按其长度计。
+                    table = getattr(obj, '_frames', None)
+                    if table is not None:
+                        listed_frames += len(getattr(table, 'listed', table))
+                except Exception:
+                    pass
         data['class_hist'] = class_hist
         data['qwidget_n'] = class_hist.get('QWidget', 0)
     except Exception:
@@ -300,6 +314,7 @@ def _gc_census() -> dict:
     data['clip_queue_mb'] = round(queue_bytes / 1048576.0, 2)
     data['clip_first_frame_mb'] = round(first_bytes / 1048576.0, 2)
     data['clip_current_frame_mb'] = round(current_bytes / 1048576.0, 2)
+    data['clip_listed_frames'] = listed_frames
     data['clip_live_readers'] = live_readers
     data['clip_retired_readers'] = retired
     return data
@@ -503,6 +518,7 @@ def _sampler() -> None:
             row['clip_queue_mb'] = census.get('clip_queue_mb', '')
             row['clip_first_mb'] = census.get('clip_first_frame_mb', '')
             row['clip_curr_mb'] = census.get('clip_current_frame_mb', '')
+            row['clip_listed_frames'] = census.get('clip_listed_frames', '')
             row['live_readers'] = census.get('clip_live_readers', '')
             writer.writerow(row)
             handle.flush()
@@ -582,6 +598,7 @@ def _write_summary() -> None:
             'qimage_late_mb': rows[-1].get('qimage_mb'),
             'qpixmap_late_n': rows[-1].get('qpixmap_n'),
             'clip_late_n': rows[-1].get('clip_n'),
+            'clip_listed_frames_late': rows[-1].get('clip_listed_frames'),
         })
     SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps(summary, ensure_ascii=False, indent=2))
