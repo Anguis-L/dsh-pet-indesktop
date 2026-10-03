@@ -890,10 +890,10 @@ class MovieLibrary(QObject):
         self.cancel_frameseq_provision()
         for clip in tuple(self._movies.values()):
             try:
-                # close() 优先（FrameSeqClip：stop + worker.deleteLater）——它的
-                # 预取 worker 亲和于共享预取线程，只能由那个线程的 deleteLater
-                # 回收；漏掉这一步就退化成"Python GC 在 GUI 线程析构跨线程
-                # QObject"，与在飞 prefetch 竞态（同文件 :84-92 的 AV 前科）。
+                # close() 优先（FrameSeqClip：stop + worker 退役留引用）——它的
+                # 预取 worker 亲和于共享预取线程，绝不能在 GUI 线程被 GC 析构
+                # （跨线程销毁的 AV 前科见 frameseq_clip :84-92）；漏掉这一步
+                # 旧 clip 的 worker 就失去受控退役路径。
                 close = getattr(clip, 'close', None)
                 if callable(close):
                     close()

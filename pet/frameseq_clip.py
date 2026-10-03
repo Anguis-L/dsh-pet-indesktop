@@ -244,7 +244,7 @@ class FrameSeqClip(QObject):
         self._pending_interval: int | None = None
         # 异步预取（GUI 零解码）：pending = 已到货未上屏，wanted = 在途请求，
         # awaiting = 播放位置在等的帧号（到货即上屏）；线程进程级共享，
-        # clip 只挂 worker（销毁经 close()→deleteLater，无线程寿命问题）
+        # clip 只挂 worker（退役经 close()→断开信号+留引用，不跨线程销毁）
         self._pending: dict[int, QImage] = {}
         self._wanted = -1
         self._awaiting = -1
@@ -255,7 +255,7 @@ class FrameSeqClip(QObject):
         # 线程上——不能 deleteLater（没人处理），只能保留引用不跨线程销毁）
         self._retired_workers: list[_PrefetchWorker] = []
         self._worker = _PrefetchWorker(self._frames)
-        #: close() 幂等标志（worker 已被 deleteLater：二次调用会打到已删对象上）
+        #: close() 幂等标志（worker 退役只许一次：重复断信号/重复入列无意义）
         self._closed = False
         # 预热帧的提交走 clip 自身线程（QueuedConnection 队列投递）：后台预热
         # 线程只解码，不在 GUI 侧状态（_img/_img_frame/_pending）上并发写。
@@ -389,17 +389,26 @@ class FrameSeqClip(QObject):
             self._timer.start()
 
     def close(self) -> None:
-        """停止播放并回收预取 worker（MovieLibrary.shutdown/收尾调用）。
+        """停止播放并退役预取 worker（MovieLibrary.shutdown/收尾调用）。幂等。
 
-        线程是进程级共享的（不随 clip 生灭）；worker 挂 deleteLater 由
-        共享线程事件循环回收。幂等：重复调用（库收口与窗口收尾都可能调）
-        不得二次 deleteLater——对象已被共享线程删掉后再挂一次是
-        RuntimeError（半销毁场景）。"""
+        worker 退役 = 断开交付信号 + 留引用（``_retired_workers``），**绝不
+        deleteLater**：共享线程被看门狗重建/退出收口杀掉后，挂在死线程队列里
+        的 DeferredDelete 没有事件循环处理，QThread 销毁/重建时的处置竞态在
+        全套件上下文实测就是 access violation（2026-10-03 邻域连跑：deleteLater
+        版 3/17 崩、退役版 0/6；同文件 :84-92 的 AV 前科与 ``_revive_prefetch_worker``
+        的退役先例同因——跨线程销毁才是真风险）。进程退出时 worker 随共享线程
+        一起由 Qt 收口，退役累积量 = 每 clip 一个小 QObject，有界。
+        """
         if self._closed:
             return
         self._closed = True
         self.stop()
-        self._worker.deleteLater()
+        old = self._worker
+        try:
+            old.loaded.disconnect(self._on_loaded)
+        except (RuntimeError, TypeError):
+            pass  # 未连接过/对象已毁：忽略（与 _revive_prefetch_worker 同口径）
+        self._retired_workers.append(old)
 
     def jumpToFrame(self, frame_index: int) -> bool:
         if not self._frames:
@@ -689,9 +698,9 @@ class FrameSeqClip(QObject):
         except (RuntimeError, TypeError):
             pass
         self._retired_workers.append(old)
-        if len(self._retired_workers) > 4:
-            # 只保留最近几次：复活是异常路径，正常生命周期内一次都不会走到
-            del self._retired_workers[0]
+        # 不设上限裁剪（2026-10-03）：裁掉引用 = 让 Python GC 在某个随机线程
+        # 析构一个亲和于共享线程的 QObject——跨线程销毁正是这条路要防的 AV。
+        # worker 是无父小 QObject，退役累积量有界（每 clip 一个 + 复活几次）。
         self._worker = _PrefetchWorker(self._frames)
         self._prefetch_thread = _shared_prefetch_thread()
         self._worker.moveToThread(self._prefetch_thread)

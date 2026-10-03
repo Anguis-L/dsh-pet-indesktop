@@ -768,28 +768,15 @@ def test_play_path_never_lists_frames_when_meta_is_authoritative(
 
 
 # ---------------------------------------- 收口：worker 回收（O2，2026-10-03）
-def _wait_worker_destroyed(worker, timeout_s=5.0):
-    """等 worker 的延迟销毁真正落地（事件泵 + 宽预算，不赌固定 sleep）。
-
-    worker 的线程亲和性在进程级共享预取线程上：``deleteLater`` 投递的
-    DeferredDelete 由那个线程的事件循环处理，因此这里只能轮询对象有效性。
-    """
-    import shiboken6
-
-    deadline = time.monotonic() + timeout_s
-    while shiboken6.isValid(worker) and time.monotonic() < deadline:
-        QApplication.processEvents()
-        time.sleep(0.005)
-    return not shiboken6.isValid(worker)
-
-
-def test_library_shutdown_closes_frameseq_clip_and_recycles_worker(tmp_path):
-    """库收口必须走 clip.close()：FrameSeqClip 的 worker 由 deleteLater 回收。
+def test_library_shutdown_closes_frameseq_clip_and_retires_worker(tmp_path):
+    """库收口必须走 clip.close()：FrameSeqClip 的 worker 受控退役（不跨线程销毁）。
 
     改前 library.shutdown 的收口循环只试 cleanup（仅 WebMClip 有）否则 stop()，
-    FrameSeqClip 永远走 stop 分支、close() 零调用 → worker 从不 deleteLater，
-    只能靠 Python GC 在 GUI 线程析构一个亲和于共享预取线程的 QObject，与在飞
-    prefetch 竞态（该文件 :84-92 的同类 AV 前科）。
+    FrameSeqClip 永远走 stop 分支、close() 零调用 → worker 失去受控退役路径，
+    只能靠 Python GC 在某个随机线程析构一个亲和于共享预取线程的 QObject
+    （该文件 :84-92 的同类 AV 前科）。2026-10-03 起 close() 的退役口径是
+    「断信号 + 留引用」而非 deleteLater：挂在死线程队列里的 DeferredDelete
+    在共享线程被杀/重建时是实测的 access violation 源（邻域连跑 3/17 vs 0/6）。
     """
     import shiboken6
 
@@ -804,14 +791,16 @@ def test_library_shutdown_closes_frameseq_clip_and_recycles_worker(tmp_path):
 
         lib.shutdown()
 
-        assert _wait_worker_destroyed(worker), \
-            "库收口后 worker 必须已 deleteLater 并被共享线程回收"
+        assert clip._closed is True, "库收口必须调 close()"
+        assert clip._worker is worker and clip._retired_workers[-1] is worker,             "worker 必须退役留引用（不跨线程销毁）"
+        assert shiboken6.isValid(worker), "退役 ≠ 销毁：不许 deleteLater 上共享线程"
+        assert clip._timer.isActive() is False
     finally:
         lib.shutdown()
 
 
 def test_frameseq_close_is_idempotent(tmp_path):
-    """close() 幂等：重复调用不得二次 deleteLater（半销毁对象上会抛 RuntimeError）。"""
+    """close() 幂等：重复调用不重复退役（_retired_workers 只入列一次）。"""
     import shiboken6
 
     d = tmp_path / "clip"
@@ -819,11 +808,13 @@ def test_frameseq_close_is_idempotent(tmp_path):
     clip = FrameSeqClip(d)
     worker = clip._worker
     clip.close()
-    assert _wait_worker_destroyed(worker)
+    assert clip._closed is True
+    assert clip._retired_workers == [worker]
+    assert shiboken6.isValid(worker), "退役保留引用，worker 不得被销毁"
 
-    clip.close()  # 已销毁对象的二次 deleteLater：改前实测 RuntimeError
+    clip.close()  # 二次调用：幂等 no-op
     clip.close()
-    assert not shiboken6.isValid(worker)
+    assert clip._retired_workers == [worker]
 
 
 # ------------------------------ 后台预热提交（O3：显示槽只由 GUI 线程写）

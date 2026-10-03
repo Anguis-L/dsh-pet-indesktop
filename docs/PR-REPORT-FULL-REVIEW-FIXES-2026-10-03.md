@@ -97,3 +97,27 @@
 ## 六、本地 PR 说明草稿
 
 > 本 PR 追加提交 = 全量大审修复批次（21 条已验证缺陷 + 60 条新回归，两家独立审查 → 主代理逐条裁决 → ds 六批修复 → 逐批验收）。用户可见：拖拽/挂机冻结修复、锁屏降载真实生效、隐藏宠退出碰撞、碰撞分离到位、屏迁移不再冻帧/截位、退出收口不再被单步异常吞掉。逐条对账与红绿证据见 `.scratch/full-review-20261003/VERDICT.md` 与 docs 两份报告。已知边界：碰撞手感变化待实机验收；非 Windows 拓扑穿透缺口缓修（发布阻断级，另立项）。
+
+## 第二轮修正（2026-10-03 晚）：close() 的 deleteLater 是崩溃放大器
+
+**起因**：本批推送后 CI ubuntu/macOS 双双段错误（exit 139，~27% 处、栈含 concurrent.futures worker）；当日本地全量崩溃率亦偏高（4/9）。
+
+**定位实验**（崩溃邻域连跑：test_foreground_steal + test_frame_path_waste + test_frameseq_* 五族）：
+
+| 代码状态 | 崩溃率 |
+|---|---|
+| 修复版（DS-1 close() 挂 deleteLater） | 3/17（2/11 + 1/6） |
+| 仅回退预热信号改动 | 2/6（排除预热 emit 嫌疑） |
+| close() 去掉 deleteLater（只退役） | 0/6 |
+| 正式修复（退役制） | 0/6 |
+
+**结论**：DS-1 缺陷 2 的修复把「worker 挂 deleteLater 到共享预取线程」引入库收口路径；共享线程被看门狗重建/退出收口杀掉后，死线程队列里的 DeferredDelete 无人处理，线程销毁/重建竞态 = access violation。崩点在 frameseq 域内漂移（钉到三条不同用例）正符合「异步落地撞上死对象」的签名。
+
+**修法**（与文件内 `_revive_prefetch_worker` 的退役先例同制）：
+- `FrameSeqClip.close()`：worker 退役 = 断开 `loaded` 信号 + 留引用进 `_retired_workers`，**绝不 deleteLater**；幂等标志保留；
+- `_revive_prefetch_worker` 的退役列表**删掉 4 条上限裁剪**——裁掉引用 = 让 GC 在随机线程析构跨线程 QObject，同类风险；
+- 库收口注释与两条测试改写为新契约（退役 ≠ 销毁，断言 `isValid` 仍真）。
+
+**验证**：邻域 6 连跑全绿（对照 deleteLater 版 3/17 崩）；`test_frameseq_clip.py` 31 passed；ruff 净；最终全量见 final-fullsuite3.log。
+
+**边界**：早前隔离的 `test_retained_frame_is_not_reused_as_frame_zero` 肇事于本批之前（上周），与本放大器不同源，维持隔离+立项根修不变。
