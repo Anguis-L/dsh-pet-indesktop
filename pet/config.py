@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import logging
 import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -674,6 +676,65 @@ def _clean_collision_data(value: dict) -> dict:
     return result
 
 
+#: os.replace 的瞬时共享冲突判定用 WinError：ERROR_ACCESS_DENIED(5) 与
+#: ERROR_SHARING_VIOLATION(32)。Windows 上 MSVCRT ``_wopen`` 的共享模式是
+#: _SH_DENYNO（FILE_SHARE_READ|WRITE，**不含** FILE_SHARE_DELETE），所以
+#: read_text 的读句柄还开着时 ``os.replace`` 覆盖同一文件即 WinError 5；
+#: 杀软/索引服务扫描刚落盘的文件同样是 5/32。两者都会很快自行消失。
+_REPLACE_CONFLICT_WINERRORS = (5, 32)
+_REPLACE_RETRY_BASE_DELAY = 0.02   # 20ms 起步
+_REPLACE_RETRY_MAX_DELAY = 0.2     # 封顶 200ms
+
+
+def _is_replace_conflict(exc: OSError) -> bool:
+    """该 OSError 是否属"马上重试就能过"的瞬时共享冲突。"""
+    if isinstance(exc, PermissionError):
+        return True
+    return (getattr(exc, "winerror", None) in _REPLACE_CONFLICT_WINERRORS
+            or exc.errno in (errno.EACCES, errno.EPERM))
+
+
+def atomic_replace_with_retry(temp, target, attempts: int = 5) -> None:
+    """``os.replace(temp, target)``，遇瞬时共享冲突时有界退避重试。
+
+    实机背景（Windows，独立设置进程的「保存并退出」报"配置未能写入磁盘"）：
+    主进程 3s 轮询 / 目录 watcher 触发的瞬时 ``read_text()`` 与设置进程
+    ``os.replace(temp, config.json)`` 撞在同一配置文件上 → PermissionError
+    (WinError 5) → ``Config.save`` 返回 False → 用户"什么都没调也关不了设置"。
+
+    只重试共享冲突（PermissionError / WinError 5、32 / EACCES、EPERM）：这类
+    失败重试代价仅秒级且会自愈；其它 OSError（ENOENT、ENOSPC、跨设备……）是
+    真实错误，立即上抛交给调用方诚实上报，不做无谓等待。重试耗尽后最后一次
+    异常照常上抛（调用方的失败分支不变）。
+    """
+    delay = _REPLACE_RETRY_BASE_DELAY
+    limit = max(1, int(attempts))
+    for attempt in range(1, limit + 1):
+        try:
+            os.replace(temp, target)
+            return
+        except OSError as exc:
+            if attempt >= limit or not _is_replace_conflict(exc):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY)
+
+
+#: ``reload()`` 里**采纳盘上显式 null** 的键白名单（缺陷 15）。
+#:
+#: 背景：设置页「恢复默认」是靠写 ``null`` 表达"撤掉覆写"（modern_settings_dialog
+#: 保存菜单编排时，用户布局等于内置默认就写 None）。旧实现把显式 null 与"键缺失"
+#: 一视同仁（``raw[key] is not None``），主进程 reload 拿不到 None，之后任何一次
+#: ``save()``（整体写内存视图）又把旧覆写写回磁盘——"恢复默认"静默回滚。
+#:
+#: 只把**把 None 当合法取值（= 用内置默认）**的键放进来：``context_menu_layout``
+#: 的消费者是 ``_clean_menu_layout_override`` 与菜单渲染层，None 就是"没有覆写"。
+#: 白名单外的键维持旧口径（null 视为"未提供"，保留内存现值）——它们大多是数值/
+#: 字符串键，消费者直接 ``float()``/``int()``/``str()`` 强转或区间夹取，采纳 None
+#: 会在运行期抛异常（"修一个键顺手炸一片"）。新增键前先确认其全部消费者吃 None。
+_NULL_ACCEPTING_KEYS = frozenset({"context_menu_layout"})
+
+
 class Config:
     def __init__(self, base=None, instance_id: str | None = None):
         base = Path(base) if isinstance(base, str) else (base or _default_base())
@@ -739,7 +800,7 @@ class Config:
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
             "click_show_balance": False,  # 点击显示 DeepSeek 余额
             "click_show_self_talk": False,  # 点击随机显示自定义自言自语
-            "self_talk_speak_enabled": True,  # 点击自言自语同句朗读（复用语音报时音频通道）
+            "self_talk_speak_enabled": False,  # 点击自言自语同句朗读（复用语音报时音频通道，默认关）
             "self_talk_voice_precache_enabled": False,  # 台词/点击绑定本地语音预缓存（需本机 TTS 服务，默认关）
             "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
             "balance_tier_labels_mode": "default",  # 峰谷提示文案：default / liangwen / custom
@@ -826,12 +887,9 @@ class Config:
             # 退出杀进程、下一次 start() 自然 fresh spawn（把 47→64MB 的 ffmpeg
             # 内部累积周期性清零）。0 = 关闭回收（回退保险）；否则范围 [2, 120]。
             "ffmpeg_recycle_minutes": 10,
-            # 批5.2 spike（默认关）：开 = 「生小肥鱼」从 spawn 新进程改为进程内
-            # 创建第二个 PetInstance。关 = 行为与现状逐位一致（回退保险）。
-            "experimental_single_process_spawn": False,
-            # 批5.3：同角色共享解码链（进程内帧扇出）开关，默认开。仅当
-            # experimental_single_process_spawn（多窗）也为开时才真正激活——
-            # 单窗无共享可言，双门关任一即回每窗独立解码（批5.2 形态）。
+            # 批5.3：同角色共享解码链（进程内帧扇出）开关，默认开。多宠恒为
+            # 进程内多窗/多 sprite（`experimental_single_process_spawn` 键已随
+            # 4.4b 退役删除），关掉即回每窗独立解码。
             "experimental_shared_decode": True,
             # 设置页进程隔离：默认开 = 设置页拉到独立进程（--settings），关窗即
             # 进程退出，OS 连锅端走首开留下的字体/样式/模块高水位（无卸载 API）；
@@ -1072,12 +1130,17 @@ class Config:
             "first_frame_cache_max_mb",
             "predict_prewarm_lead_ms",
             "ffmpeg_recycle_minutes",
-            "experimental_single_process_spawn",
             "experimental_shared_decode",
             "settings_process_isolation",
         ):
-            if key in raw and raw[key] is not None:
-                self.data[key] = raw[key]
+            if key not in raw:
+                continue
+            value = raw[key]
+            if value is None and key not in _NULL_ACCEPTING_KEYS:
+                # 「键缺失」= 磁盘没提供（保留内存现值）；「显式 null」= 该键被撤成
+                # 默认（只对 _NULL_ACCEPTING_KEYS 生效，口径见该常量）。
+                continue
+            self.data[key] = value
         if "proactive_screen" in raw:
             self.data["proactive_screen"] = _merge_proactive_screen_data(raw["proactive_screen"])
         if "agent_link" in raw:
@@ -1275,7 +1338,7 @@ class Config:
         self.data["self_talk_image_chance"] = int(_float_or_default(self.data.get("self_talk_image_chance"), float(DEFAULT_SELF_TALK_IMAGE_CHANCE), 0.0, 100.0))
         self.data["bubble_text_scale"] = int(_float_or_default(self.data.get("bubble_text_scale"), 100.0, 50.0, 300.0))
         self.data["self_talk_enabled"] = bool(self.data.get("self_talk_enabled", False))
-        self.data["self_talk_speak_enabled"] = _bool_or_default(self.data.get("self_talk_speak_enabled"), True)
+        self.data["self_talk_speak_enabled"] = _bool_or_default(self.data.get("self_talk_speak_enabled"), False)
         self.data["self_talk_voice_precache_enabled"] = _bool_or_default(self.data.get("self_talk_voice_precache_enabled"), False)
         self.data["cursor_hidden_passthrough"] = _bool_or_default(self.data.get("cursor_hidden_passthrough"), True)
         self.data["spawn_inherit_size"] = _bool_or_default(self.data.get("spawn_inherit_size"), True)
@@ -1383,8 +1446,6 @@ class Config:
         # [2, 120]（默认 10）。
         _ffr = _float_or_default(self.data.get("ffmpeg_recycle_minutes"), 10, 0, 120)
         self.data["ffmpeg_recycle_minutes"] = 0 if _ffr <= 0 else int(max(2.0, _ffr))
-        # 批5.2 spike 开关：同其它布尔键规约，防字符串布尔误开。
-        self.data["experimental_single_process_spawn"] = _bool_or_default(self.data.get("experimental_single_process_spawn"), False)
         # 批5.3 共享解码链开关：同规防字符串布尔误开（默认开）。
         self.data["experimental_shared_decode"] = _bool_or_default(self.data.get("experimental_shared_decode"), True)
         # 设置页进程隔离：同规防字符串布尔误开；默认开（关掉 = 回退进程内设置页）。
@@ -1582,17 +1643,22 @@ class Config:
 
         写盘使用 _redacted_data() 的副本，self.data 本身不动，保证运行期
         key 在内存可见而不会明文落盘。
-        临时文件名加入 PID 后缀，避免错误并发写入撞名。
+        临时文件名加入 PID 后缀，避免错误并发写入撞名；替换走
+        ``atomic_replace_with_retry``（骑过 Windows 读句柄造成的瞬时共享
+        冲突），任何出口都必须把临时文件清掉（失败残留会污染配置目录）。
         """
         try:
             self._normalize_pet_settings()
             self.dir.mkdir(parents=True, exist_ok=True)
             temp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-            temp.write_text(
-                json.dumps(self._redacted_data(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(temp, self.path)
+            try:
+                temp.write_text(
+                    json.dumps(self._redacted_data(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                atomic_replace_with_retry(temp, self.path)
+            finally:
+                temp.unlink(missing_ok=True)
         except OSError as exc:
             logging.warning("保存配置失败: %s (%s)", self.path, exc)
             return False

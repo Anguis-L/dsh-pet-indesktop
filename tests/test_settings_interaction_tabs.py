@@ -173,6 +173,16 @@ def test_sections_keep_their_titles_inside_the_tabs(dialog):
     assert section_titles("self_talk") == ["自言自语"]
 
 
+def test_click_speak_toggle_starts_unchecked_like_the_config_default(dialog):
+    """点击台词朗读默认关闭：设置页控件初始未勾选，与 Config 默认值同口径。
+
+    「配置默认值 / 规范化默认值 / 运行时缺省」三处必须同一个口径，否则会出现
+    「配置说关、界面却显示开」这种自相矛盾的默认状态。
+    """
+    assert dialog.config.get("self_talk_speak_enabled") is False
+    assert dialog.click_self_talk_speak_check.isChecked() is False
+
+
 def test_every_setting_row_still_lives_in_a_domain_page(dialog):
     """全局不变量：没有孤儿行、没有掉进「待分类（开发期）」。"""
     from PySide6.QtWidgets import QLabel, QWidget

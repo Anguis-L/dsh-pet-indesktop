@@ -55,7 +55,7 @@ def _exec_settings(app, config, *, include_ai: bool = True, initial_page: str = 
 def _settings_instance_id(argv) -> str:
     """从 --settings 附加参数里取 instance_id（缺省空 = 主配置）。
 
-    进程内多窗（experimental_single_process_spawn）时第二窗的 config 是
+    进程内多窗时第二窗的 config 是
     config-slot-N.json，而进程级 DSH_PET_INSTANCE 仍是主窗的；主进程会显式
     追加 --instance slot-N 把子进程指到正确的那份配置。
     """

@@ -1005,10 +1005,10 @@ pet/
 ├── window.py                 # 桌宠主窗口（组合根；碰撞/平台层/动画链已拆出，受行数预算红线）
 ├── window_optional_services.py # 窗口可选服务懒装配 mixin（todo/file_eater 等）
 ├── collision.py              # 碰撞物理核心（纯 Python，无 Qt）
-├── collision_client.py       # 窗口侧碰撞客户端（预测/对账/上报节流/squash 冷却）
-├── collision_codec.py        # 碰撞 IPC 帧编解码 + 水位去重 + 协议 TypedDict（纯 Python）
-├── collision_ipc.py          # 碰撞协调者选举与成员协议（QLocalServer 控制面）
-├── collision_debug.py        # 碰撞调试日志
+├── sprite_collision.py       # 进程内 sprite 碰撞世界（多宠统一世界 + 岛静态成员）
+├── overlay_shell.py          # 单合成窗产品壳（overlay 拓扑入口：sprite 世界/托盘/指令通道）
+├── overlay_spawn_state.py    # 活跃宠清单 + 无锁 slot 身份分配 + 每身份几何持久化
+├── pet_sprite.py             # 合成窗内的宠物 sprite（帧签名缓存/拖拽轨迹/抛掷）
 ├── decode_fanout.py          # 同角色共享解码链（进程内帧扇出 DecodeFanoutHub，单向依赖约束）
 ├── frame_cache.py            # 通用字节预算 LRU（webm 元数据缓存等小缓存用）
 ├── perfstats.py              # 性能打点（PET_PERF_STATS=1 启用，atexit 落盘）
@@ -1022,8 +1022,7 @@ pet/
 ├── speech_bubble_text.py     # 气泡分页/定位纯函数
 ├── click_sound.py            # 点击音效（ClickSoundPool 单例封装）
 ├── desktop_notify.py         # 自绘右下角系统通知
-├── slot_manager.py           # 多开 slot 文件锁
-├── child_pet_cleanup.py      # 子肥鱼清理（关闭非当前 runtime 标记 + 删除 slot 数据）
+├── slot_manager.py           # slot 身份/配置落种/旧 spawn 迁移/runtime 标记（D7 避让通道）
 ├── file_eater.py             # 拖拽文件“吃”动画与统计（不真实删除/移动文件）
 ├── proactive.py              # 主动识屏陪伴（Watcher 编排）
 ├── proactive_limiter.py      # 主动识屏频控
@@ -1032,7 +1031,6 @@ pet/
 ├── multi_window_shared.py    # 进程级多窗共享子系统（agent_link/proactive/全屏 watcher）
 ├── vision.py                 # 视觉模型调用（看看屏幕/主动识屏；PIL 懒加载）
 ├── harness_launcher.py       # DeepSeek Harness 一键启动
-├── instance_launcher.py      # 「生小肥鱼」多开孵化
 ├── modern_settings_dialog.py # 新版设置主对话框（已拆分瘦身，保留 re-export；受行数预算红线）
 ├── settings_widgets.py       # 设置控件库（自绘开关/SettingRow/ModernSelect 等）
 ├── settings_menu_layout_editor.py # 右键菜单布局编辑器
