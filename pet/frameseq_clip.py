@@ -473,32 +473,13 @@ class FrameSeqClip(QObject):
         return
 
     def warm_first_frame(self) -> None:
-        """预热帧 0（幂等：显示槽已有帧即返回）。
-
-        解出的帧 0 同时寄存 ``_pending[0]``：``start()`` 起播时直接弹出来上屏
-        （``frameChanged(0)`` 同步发出），不再让 prefetch worker 又解一遍
-        （每段动画每次起播省一次帧解码 + 一次线程往返）。
-
-        本方法跑在**后台预热线程**（library._warm_objects 的 worker），因此
-        只做解码（QImage 加载，IO），提交回显示槽经 ``_warm_frame_ready`` 队列
-        投递到 clip 所属线程（``_commit_warm_first_frame``）：显示槽是播放状态
-        （``_img``/``_img_frame``/``_pending``），GUI 起播/跳帧/池级回收都在
-        并发写它，后台直写会把新提交的帧倒写成帧 0（图与帧号不一致），或把
-        ``release_idle_frames`` 刚清空的槽重新填回。同线程调用（GUI 侧预热）
-        保持原有的同步语义。
-        """
-        if self._img is not None or not self._frames:
-            return
-        img = QImage(str(self._frames[0]))
-        if img.isNull():
-            return
-        try:
-            if self.thread() is QThread.currentThread():
-                self._commit_warm_first_frame(img)
-                return
-            self._warm_frame_ready.emit(img)
-        except RuntimeError:
-            pass  # clip 半销毁（C++ 侧已删）：安静降级，等下一次起播同步解码
+        """TEMP-DIAG 回退：直写版（验证 mac 崩溃是否为预热信号投递）。
+        定位后由正式的暂存槽方案取代——直写版的显示槽竞态不接受。"""
+        if self._img is None and self._frames:
+            img = QImage(str(self._frames[0]))
+            if not img.isNull():
+                self._apply(img, 0)
+                self._pending[0] = img
 
     def _commit_warm_first_frame(self, img: QImage) -> None:
         """把后台预热解出的帧 0 提交进显示槽（只在 clip 所属线程执行）。
