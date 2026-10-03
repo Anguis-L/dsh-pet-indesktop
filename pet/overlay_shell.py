@@ -69,6 +69,7 @@ import logging
 import math
 import threading
 import time
+import weakref
 from collections import deque
 from pathlib import Path
 
@@ -872,6 +873,12 @@ class ShellOverlayWindow(OverlayWindow):
         release_menu_tree(menu)
 
 
+#: 活跃 OverlayShell 登记册（测试收口用，MovieLibrary._LIVE_MOVIE_LIBRARIES
+#: 同范式）：壳持 QTimer/监视器/加载线程/素材库，测试把它们留在共享
+#: QApplication 上漂到进程退出，就是全量套件/macOS CI 漂移段错误的累积源。
+_LIVE_OVERLAY_SHELLS: "weakref.WeakSet" = weakref.WeakSet()
+
+
 class OverlayShell(QObject):
     """overlay 拓扑产品壳：主屏 overlay + 主 sprite + 进程级三控制器。
 
@@ -896,6 +903,7 @@ class OverlayShell(QObject):
     def __init__(self, app, instance, *, screen=None, sprite_factory=None,
                  agent_link_manager=None, proactive_watcher=None) -> None:
         super().__init__()
+        _LIVE_OVERLAY_SHELLS.add(self)  # 测试收口登记（构造即登记，幂等弱引用）
         self.app = app
         self._instance = instance
         self._config = instance.config
@@ -1953,6 +1961,13 @@ class OverlayShell(QObject):
         self._self_talk_images_checked_at = time.monotonic()
         self._warm_self_talk_images()
 
+    def _cancel_self_talk_image_loads(self) -> None:
+        """作废在飞的配图加载批次（stop/退出收口）：换代戳推一格，加载线程
+        在下一张图前自查退出。线程是 ``threading.Thread`` 守护线程，不归 Qt
+        对象树管——壳停了它们还活着，进程退出时原生解码会撞上 Qt 拆除。"""
+        self._self_talk_image_warm_gen = \
+            getattr(self, "_self_talk_image_warm_gen", 0) + 1
+
     def _start_self_talk_image_load(self, cache, source, gen) -> None:
         """起一个守护线程把这批图片解码进缓存（空批次不起线程）。"""
         pending = [str(p) for p in source if str(p) not in cache]
@@ -2689,6 +2704,23 @@ class OverlayShell(QObject):
                 logging.debug("overlay: 停机时子宠气泡收尾失败", exc_info=True)
         self._bubble_followers = {}
 
+    # ---------------------------------------------------------------- 测试收口
+    @classmethod
+    def _shutdown_live_for_tests(cls) -> None:
+        """逐测试收口所有活跃壳（conftest 防线；MovieLibrary 同范式）。
+
+        壳把 tick 驱动器、自言自语计时、监视器、配图加载线程与素材库带进共享
+        QApplication；测试不收口就漂到后续用例与进程退出（全量套件/macOS CI
+        的漂移段错误累积源）。逐壳 ``stop()``（幂等、逐步隔离），未 start 的
+        壳靠外层顶层窗口清扫回收。
+        """
+        for shell in list(_LIVE_OVERLAY_SHELLS):
+            try:
+                shell.stop()
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "测试收口 OverlayShell 失败", exc_info=True)
+
     def stop(self) -> None:
         """幂等：重复 stop 是 no-op。
 
@@ -2706,6 +2738,10 @@ class OverlayShell(QObject):
         # B7b：子宠各自的计时同样停表
         self._run_exit_step('停止子宠自言自语计时', self._stop_all_self_talk_hosts)
         self._run_exit_step('摘设置命令监听', self._teardown_settings_command_watch)
+        # 配图加载守护线程不归 Qt 管（threading.Thread）：换代戳推一格，在飞
+        # 批次下一张图前自查作废——否则壳已停、线程还在往壳的缓存里写，进程
+        # 退出窗口里就是原生解码撞上对象拆除（macOS CI 三连崩的实锤形态之一）。
+        self._run_exit_step('作废在飞配图加载', self._cancel_self_talk_image_loads)
         self._run_exit_step('关闭歌词控制器', self.shutdown_music_lyric)
         self._run_exit_step('停音乐唱歌轮询', self._stop_music_sing_polling)
         bridge = getattr(self, "island_bridge", None)

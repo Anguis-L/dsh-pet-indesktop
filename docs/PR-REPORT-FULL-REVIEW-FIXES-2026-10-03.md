@@ -128,6 +128,6 @@
 
 **定位链**：单文件（visibility）绿 → 双文件三组合全绿 → 三文件（overlay_spawn + overlay_lifecycle_gaps + visibility）同进程必崩 = 跨文件累积态炸弹。Windows 本地复现的 dump 显示两个 `overlay_shell._load`（自言自语配图加载）守护线程跨测试存活，崩在主线程测试体的原生调用里。预热信号与 close() 的 deleteLater 均已分别经对照实验排除（后者是 ubuntu/windows 家族的放大器，已修）。
 
-**处置**（webm 生命周期族先例）：macOS 主套件摘除这三文件，三文件各自独立进程照跑（独立进程实测全绿；断言真失败照样红）；win/ubuntu 保留主套件内全覆盖。同步改动 `build-macos.yml`。
+**处置演变**：先按 webm 族先例把三文件在 macOS 拆独立进程止血（dd3e632，全绿）；随后按 conftest 登记册既有范式（`_shutdown_live_for_tests`）做了**根修层止血**——OverlayShell 接入活跃登记册，逐测试 stop() 收口其 tick 驱动器/计时/监视器/配图加载线程/素材库，并把配图加载线程纳入壳生命周期（stop 时换代作废）+ `list_self_talk_images("")` 空配置扫 CWD 的缺口堵上。收口后：Windows 本地 spawn 单文件 12/12、三文件组合 10/10 全绿（修复前 2/12 与 1/8 崩），workflow 拆进程临时拆分已全部还原（恢复主套件全平台同口径）。
 
-**未结案**：跨测试累积态的原生崩溃根因（疑似测试壳的自言自语配图加载线程 × 事件泵 × Qt 对象销毁时序）归 frameseq/生命周期专项。本轮为 CI 门禁止血，非根修。
+**未结案**：登记册收口是测试侧防线；退出窗口里守护线程与 Qt 拆除的深层竞态（生产侧"退出瞬间偶发闪退"量级）仍归 frameseq/生命周期专项。配图加载线程现已具备作废机制，专项里再补进程退出时的 join。

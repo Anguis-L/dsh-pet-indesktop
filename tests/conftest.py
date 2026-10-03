@@ -210,6 +210,15 @@ def _close_qt_top_level_widgets():
         MovieLibrary._shutdown_live_for_tests()
     except Exception:
         pass
+    # OverlayShell：壳的 tick 驱动器/自言自语计时/监视器/配图加载线程/素材库
+    # 全部要逐测试收口——否则它们漂过整个套件活到进程退出，撞上 Qt 对象树
+    # 拆除就是原生段错误（macOS CI 3/3 同点复现 + Windows 本地 2/12 退出崩；
+    # 崩点随套件进度漂移，与本防线的既有记录同族）。
+    try:
+        from pet.overlay_shell import OverlayShell
+        OverlayShell._shutdown_live_for_tests()
+    except Exception:
+        pass
     # dsh_state：QTimer 只停了不算完——在途在线探测线程（daemon + 阻塞 socket）
     # 回来后仍会跨线程 emit；先 stop() 换代作废其结果，再销毁顶层窗口，
     # 否则 deleteLater + processEvents 收尾时 worker 向已销毁 QObject emit
