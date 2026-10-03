@@ -356,12 +356,78 @@ def test_rebind_while_paused_stays_paused(tmp_path):
         clip.close()
 
 
+def test_unbind_while_paused_does_not_poison_clip_for_next_bind(tmp_path):
+    """暂停期被换绑掉的 clip 不得把暂停标记滞留到下一次绑定（实机冻结根因）。
+
+    实机链：隐藏/挂起 → ``pause_clip``（当前 clip 暂停）→ 隐藏期行为链换绑
+    （``bind_clip`` 只 stop 旧 clip，它的 ``_paused`` 滞留库缓存）→ 恢复可见
+    只续当前 clip → 旧 clip 下次 ``start()`` 看到滞留 ``_paused`` 不起定时器
+    = 画面永久冻在首帧（拖拽悬空/走路动画变静态图、挂机回来三只全冻但还在
+    移动，全是这一条链）。
+    """
+    from tests.test_frameseq_clip import _make_frames
+
+    from pet.frameseq_clip import FrameSeqClip
+
+    sprite, clip_a = _real_frameseq_sprite(tmp_path, name="idle1")
+    frames_b = tmp_path / "idle2"
+    _make_frames(frames_b, count=12)
+    clip_b = FrameSeqClip(frames_b)
+    sprite.library._clips["idle2"] = clip_b
+    try:
+        assert sprite.bind_clip("idle1") is True
+        sprite.pause_clip()                    # 隐藏/挂起：当前 clip 暂停
+        sprite.bind_clip("idle2")              # 隐藏期换绑 → idle1 的 _paused 滞留
+        sprite.resume_clip()                   # 恢复可见：只续当前 clip（idle2）
+        assert clip_b._timer.isActive() is True
+
+        assert sprite.bind_clip("idle1") is True   # 日后轮转回 idle1
+        assert clip_a._timer.isActive() is True, (
+            "被换绑时滞留暂停的 clip 再绑定必须正常起播（否则画面冻在首帧）")
+    finally:
+        clip_a.close()
+        clip_b.close()
+
+
+def test_restart_clip_clears_stale_pause_so_timer_revives(tmp_path):
+    """restart_clip 与 bind_clip 同款对称收口：滞留的 ``_paused`` 必须清掉。
+
+    毒化链：``pause()`` 置 ``_paused`` 并停表 → ``stop()`` 只停表、**不清**
+    ``_paused``（FrameSeqClip 两个入口的语义差）→ ``restart_clip`` 的 ``start()``
+    看到滞留标记不起定时器 = 圈末续播之后画面冻在首帧。sprite 未暂停 = 暂停
+    契约不成立，重启路径同样要清掉（未暂停的 clip 上 ``resume()`` 是 no-op）。
+    """
+    from tests.test_frameseq_clip import _pump_until
+
+    sprite, clip = _real_frameseq_sprite(tmp_path)
+    try:
+        assert sprite.bind_clip("idle1") is True
+        _pump_until(lambda: clip.currentImage() is not None)
+        assert clip._timer.isActive() is True
+
+        clip.pause()                           # 毒化：暂停标记滞留
+        clip.stop()                            # stop 不清 _paused（半暂停态）
+        assert clip._paused is True
+        assert clip._timer.isActive() is False
+
+        assert sprite.restart_clip() is True
+
+        assert clip._timer.isActive() is True, "滞留暂停必须清掉，播放节拍要复活"
+    finally:
+        clip.close()
+
+
 def test_shell_set_sprite_visible_pauses_and_resumes_that_sprite_clip(tmp_path):
-    """壳层逐只显隐：隐藏 → 该只 pause_clip；恢复 → resume_clip（只影响这一只）。"""
+    """壳层逐只显隐：隐藏 → 该只 pause_clip；恢复 → resume_clip（只影响这一只）。
+
+    "恢复"以**窗口真的可见**为前提（恢复路径的有效可播闸门）：本测试先 show，
+    否则它验的是"整窗没显示也在解码"这条反例。
+    """
     shell, _lib = _make_shell(tmp_path)
     try:
         other = PausableStubSprite()
         shell.overlay.add_sprite(other)
+        shell.overlay.show()
 
         shell.set_sprite_visible(other, False)
 
@@ -424,6 +490,80 @@ def test_window_show_does_not_resume_individually_hidden_sprite(tmp_path):
         assert shown.resume_calls == 1
         assert hidden.resume_calls == 0, "隐藏那只不因整窗显示而恢复"
         assert shell._sprite_visible(hidden) is False
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- 恢复路径的暂停所有权
+def test_sprite_show_while_window_hidden_keeps_real_clip_paused(tmp_path):
+    """整窗隐藏中「显示这只」不得放行：另一个暂停所有者（整窗）还没放手。
+
+    真 FrameSeqClip 观测点：定时器在不可见期重新跑起来 = 按帧率白烧 CPU
+    （O3 契约破坏）。
+    """
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        sprite, clip = _real_frameseq_sprite(tmp_path)
+        shell.overlay.add_sprite(sprite)
+        assert sprite.bind_clip("idle1") is True
+        shell.overlay.show()
+
+        shell.set_sprite_visible(sprite, False)     # 托盘先逐只藏起
+        shell.set_pet_visible(False)                # 再整窗隐藏
+        assert clip._timer.isActive() is False
+
+        shell.set_sprite_visible(sprite, True)      # 托盘勾回「显示这只」
+        assert sprite.visible is True, "逻辑上仍是可见宠物（只有窗口不可见）"
+        assert clip._timer.isActive() is False, "整窗隐藏中不许放行播放节拍"
+
+        shell.set_pet_visible(True)                 # 整窗恢复：照旧放行
+        assert clip._timer.isActive() is True
+    finally:
+        clip.close()
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_all_clips_resume_denied_while_suspended(tmp_path):
+    """挂起中整窗恢复路径不得放行：锁屏未解除时 clip 不许重新解码。"""
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        sprite = PausableStubSprite()
+        shell.overlay.add_sprite(sprite)
+        shell.overlay.show()
+
+        shell._on_suspend_changed(True, "session_lock")
+        assert shell.driver.suspended is True
+
+        shell._set_all_clips_paused(False)          # 全屏避让解除 / 整窗显示路径
+        assert sprite.resume_calls == 0, "挂起未解除：不许放行播放节拍"
+
+        shell._on_suspend_changed(False, "session_unlock")
+        assert sprite.resume_calls == 1, "正常解锁照旧放行"
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_fullscreen_release_while_suspended_keeps_clips_paused(tmp_path):
+    """锁屏中全屏避让解除（overlay.show() 照走）同样不得放行。"""
+    shell, _lib = _make_shell(tmp_path)
+    try:
+        sprite = PausableStubSprite()
+        shell.overlay.add_sprite(sprite)
+        shell.overlay.show()
+
+        shell._on_fullscreen_changed(True)          # 全屏避让：隐藏 + 停节拍
+        assert sprite.pause_calls == 1
+        shell._on_suspend_changed(True, "session_lock")
+
+        shell._on_fullscreen_changed(False)         # 全屏退出：窗口已 show
+        assert shell.overlay.isVisible() is True
+        assert sprite.resume_calls == 0, "锁屏未解除：全屏避让解除不得放行"
+
+        shell._on_suspend_changed(False, "session_unlock")
+        assert sprite.resume_calls == 1
     finally:
         shell.overlay.close()
         shell._delete_runtime_marker()

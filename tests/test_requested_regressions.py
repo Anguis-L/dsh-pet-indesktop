@@ -1203,3 +1203,87 @@ def test_macos_dock_menu_keeps_settings_reachable_when_pet_is_mouse_through(monk
     controller.instance.open_modern_settings.assert_called_once_with()
     menu.close()
     app.processEvents()
+
+
+# --- 评审回归：碰撞分离累计写回 / 隐藏宠退出碰撞世界（2026-10-03）---
+
+
+def _make_pet_sprite(pos, scale=0.5):
+    """真 PetSprite（offscreen）：假 clip 无 ffmpeg 依赖，几何 = 640x360 画布 × scale。"""
+    from PySide6.QtCore import QPointF
+
+    from pet.pet_sprite import PetSprite
+    from tests.test_sprite_collision_id import FakeLibrary
+
+    return PetSprite(FakeLibrary(), pos=QPointF(*pos), scale=scale)
+
+
+def _world_members(world, sprites):
+    return [world._member_from_sprite(s) for s in sprites]
+
+
+def test_real_pets_separate_by_solver_cumulative_in_one_tick():
+    """真 PetSprite 静止重叠：一轮 tick 的终位 = 求解器累计分离量（D9 回归）。
+
+    旧口径按 ImpulseResult 的**末轮** dx 逐 pair 写回：本场景 40px 重叠四轮迭代
+    累计每只 18.51px，实际只写回 1.86px——90% 的分离量留到下一 tick，与连续
+    重叠记账 / 去抖互相打架。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import collision
+    from pet.sprite_collision import SpriteCollisionWorld
+
+    app = QApplication.instance() or QApplication([])
+    a = _make_pet_sprite((600, 300))
+    b = _make_pet_sprite((880, 300))          # 320 宽 → 重叠 40px
+    id_a, id_b = a.collision_id, b.collision_id
+    world = SpriteCollisionWorld()
+    members = _world_members(world, (a, b))
+    impulses, combined, _history = collision.solve_multi_body_collision(
+        members, tick=1)
+
+    assert abs(combined[id_a][2]) > 5 * abs(impulses[0].dx_a), \
+        "前提：累计分离量远大于末轮增量（旧写回口径）"
+
+    world.tick([a, b], 0.016)
+
+    assert a.pos.x() == pytest.approx(600.0 + combined[id_a][2], abs=1e-6)
+    assert b.pos.x() == pytest.approx(880.0 + combined[id_b][2], abs=1e-6)
+    # 一轮之后只剩求解器自己的迭代残差，而不是 90% 的重叠留待下一 tick
+    residual = collision.check_collision_members(
+        *_world_members(world, (a, b)))[3]
+    assert residual <= 0.1 * 40.0
+    app.processEvents()
+
+
+def test_real_hidden_pet_is_not_an_invisible_obstacle():
+    """逐只隐藏的真 PetSprite 退出碰撞世界：不推可见宠、不触发碰撞反馈（D10）。"""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtWidgets import QApplication
+
+    from pet.sprite_collision import (
+        INTERACTION_NORMAL,
+        INTERACTION_THROWN,
+        SpriteCollisionWorld,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    world = SpriteCollisionWorld()
+    victim = _make_pet_sprite((600, 300))
+    ghost = _make_pet_sprite((880, 300))
+    ghost.set_velocity(QPointF(-800, 0))      # 高速撞向可见宠
+    ghost.set_visible(False)
+
+    assert world.tick([victim, ghost], 0.016) == []
+    assert victim.pos.x() == 600.0 and victim.pos.y() == 300.0
+    assert victim.velocity.x() == 0.0
+    assert victim.interaction_state == INTERACTION_NORMAL
+
+    ghost.set_visible(True)                   # 恢复可见：碰撞干净回归
+    results = world.tick([victim, ghost], 0.016)
+    assert [r.pair for r in results] == [
+        "|".join(sorted((victim.collision_id, ghost.collision_id)))]
+    assert victim.velocity.x() < 0.0          # 被撞飞
+    assert victim.interaction_state == INTERACTION_THROWN
+    app.processEvents()

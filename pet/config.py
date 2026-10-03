@@ -720,6 +720,21 @@ def atomic_replace_with_retry(temp, target, attempts: int = 5) -> None:
             delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY)
 
 
+#: ``reload()`` 里**采纳盘上显式 null** 的键白名单（缺陷 15）。
+#:
+#: 背景：设置页「恢复默认」是靠写 ``null`` 表达"撤掉覆写"（modern_settings_dialog
+#: 保存菜单编排时，用户布局等于内置默认就写 None）。旧实现把显式 null 与"键缺失"
+#: 一视同仁（``raw[key] is not None``），主进程 reload 拿不到 None，之后任何一次
+#: ``save()``（整体写内存视图）又把旧覆写写回磁盘——"恢复默认"静默回滚。
+#:
+#: 只把**把 None 当合法取值（= 用内置默认）**的键放进来：``context_menu_layout``
+#: 的消费者是 ``_clean_menu_layout_override`` 与菜单渲染层，None 就是"没有覆写"。
+#: 白名单外的键维持旧口径（null 视为"未提供"，保留内存现值）——它们大多是数值/
+#: 字符串键，消费者直接 ``float()``/``int()``/``str()`` 强转或区间夹取，采纳 None
+#: 会在运行期抛异常（"修一个键顺手炸一片"）。新增键前先确认其全部消费者吃 None。
+_NULL_ACCEPTING_KEYS = frozenset({"context_menu_layout"})
+
+
 class Config:
     def __init__(self, base=None, instance_id: str | None = None):
         base = Path(base) if isinstance(base, str) else (base or _default_base())
@@ -1118,8 +1133,14 @@ class Config:
             "experimental_shared_decode",
             "settings_process_isolation",
         ):
-            if key in raw and raw[key] is not None:
-                self.data[key] = raw[key]
+            if key not in raw:
+                continue
+            value = raw[key]
+            if value is None and key not in _NULL_ACCEPTING_KEYS:
+                # 「键缺失」= 磁盘没提供（保留内存现值）；「显式 null」= 该键被撤成
+                # 默认（只对 _NULL_ACCEPTING_KEYS 生效，口径见该常量）。
+                continue
+            self.data[key] = value
         if "proactive_screen" in raw:
             self.data["proactive_screen"] = _merge_proactive_screen_data(raw["proactive_screen"])
         if "agent_link" in raw:

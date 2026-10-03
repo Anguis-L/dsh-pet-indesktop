@@ -2590,6 +2590,10 @@ class OverlayShell(QObject):
         self._warm_sound_effects_once()  # 首次可见前预热（避免首次发声卡事件循环）
         self.overlay.show()
         self.overlay.start()
+        # 构造期复活/生成的 sprite 在窗口可见前被压成暂停（见 _spawn_slot 的
+        # 有效可播判定）：显示后必须补放行，否则子宠永久冻在首帧。逐只被藏起
+        # 的仍在恢复侧被跳过（与整窗显隐同一条判据）。
+        self._set_all_clips_paused(False)
         self._sync_runtime_marker()  # D7：设置进程避让
         self.app.installEventFilter(self)  # Esc 全局兜底（弹弓取消）
         if self.tray is not None:
@@ -2627,86 +2631,140 @@ class OverlayShell(QObject):
             return True
         return False
 
-    def stop(self) -> None:
-        """幂等：重复 stop 是 no-op。"""
-        if not self._started:
+    def _run_exit_step(self, label: str, step) -> None:
+        """退出收口的一步一隔离（缺陷 13）：单步异常只记日志，不中断后续步骤。
+
+        ``stop()`` / ``_on_about_to_quit()`` 原是一条裸调用链——靠前的可抛步骤
+        （``shutdown_music_lyric`` 内部是无守卫的 ``timer.stop()`` / ``bridge.close()``
+        / ``overlay.stop()``）一旦抛错，位置持久化与在飞供给取消就被整体跳过：
+        配置不落盘、在飞帧序列线程无人取消（库随壳析构活线程 = Qt fatal）。
+        """
+        try:
+            step()
+        except Exception:
+            logging.exception("overlay: 退出收口步骤失败（%s）", label)
+
+    def _shutdown_library(self, lib, label) -> None:
+        """显式关闭一个素材库（缺陷 14：主库与子宠库同一收口）。
+
+        ``MovieLibrary.shutdown`` 自带幂等与内部收口（``pause_warm`` + 预热责任
+        交接 + 在飞供给取消 + 逐个 clip 的 ``close``/``stop``）；库没有
+        ``shutdown`` 面时退回只停预热（旧行为）。单库失败不阻断其余收口。
+        """
+        if lib is None:
             return
-        self._started = False
-        self.app.removeEventFilter(self)
-        timer = getattr(self, "_self_talk_timer", None)
-        if timer is not None:
-            timer.stop()  # M9：stop 后不再自我重排（引用环也让壳可被回收）
-        self._stop_all_self_talk_hosts()   # B7b：子宠各自的计时同样停表
-        self._teardown_settings_command_watch()
-        self.shutdown_music_lyric()
-        self._stop_music_sing_polling()
-        bridge = getattr(self, "island_bridge", None)
-        if bridge is not None:
-            bridge.close()
-            self.island_bridge = None
-        self._watcher.stop()
-        self._delete_runtime_marker()
-        self._close_quick_chat()
-        if getattr(self, "_bubble_follower", None) is not None:
-            self._bubble_follower.close()
+        shutdown = getattr(lib, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+                return
+            except Exception:
+                logging.exception("overlay: 退出时素材库收尾失败 (label=%r)", label)
+        pause = getattr(lib, "pause_warm", None)
+        if callable(pause):
+            try:
+                pause()
+            except Exception:
+                logging.exception("overlay: 退出时暂停预热失败 (label=%r)", label)
+
+    def _shutdown_libraries(self) -> None:
+        """关闭主库与全部子宠库（两处退出路径同一口径，缺陷 14）。"""
+        self._shutdown_library(getattr(self, "lib", None), "主肥鱼")
+        for sprite, lib in list(getattr(self, "_spawned_libs", {}).items()):
+            self._shutdown_library(lib, sprite)
+
+    def _close_bubble_followers(self) -> None:
+        """收掉气泡跟随器（主气泡 + 逐 sprite 的子气泡）。
+
+        单只跟随器收尾失败不阻断其余（逐对象容错口径同
+        ``_cancel_frameseq_provisions``）。
+        """
+        follower = getattr(self, "_bubble_follower", None)
+        if follower is not None:
+            follower.close()
         for follower in list(self._bubble_followers.values()):
             try:
                 follower.close()
             except Exception:
                 logging.debug("overlay: 停机时子宠气泡收尾失败", exc_info=True)
         self._bubble_followers = {}
-        self.overlay.stop()
-        self.overlay.close()
-        if self.tray is not None:
-            self.tray.hide()
-        # F3：子宠库与在飞帧序列供给线程的收口（口径同 _on_about_to_quit /
-        # _on_session_end）。缺这两步时子宠库不 shutdown，而库里活着的供给
-        # QThread 是库的子对象——库随壳销毁会把活线程一起析构（Qt fatal，
-        # 见 _on_about_to_quit 的说明）。
-        self._cancel_frameseq_provisions()
-        for sprite, lib in list(getattr(self, "_spawned_libs", {}).items()):
-            shutdown = getattr(lib, "shutdown", None)
-            if not callable(shutdown):
-                continue
-            try:
-                shutdown()
-            except Exception:
-                logging.exception("overlay: 停机时子肥鱼素材库收尾失败 (sprite=%r)", sprite)
 
-    def _on_about_to_quit(self) -> None:
-        """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。"""
-        self._watcher.stop()
-        unregister = getattr(getattr(self, "_session_watcher", None),
-                             "unregister_session_notifications", None)
-        if callable(unregister):
-            try:
-                unregister()          # 锁屏通知注册与窗口句柄同生共死（O4）
-            except Exception:
-                logging.debug("overlay: 反注册锁屏通知失败", exc_info=True)
-        self._teardown_settings_command_watch()
-        self._delete_runtime_marker()
-        self._close_quick_chat()
-        self.shutdown_music_lyric()
-        self._stop_music_sing_polling()
+    def stop(self) -> None:
+        """幂等：重复 stop 是 no-op。
+
+        退出收口逐步隔离（缺陷 13）：每一步独立 try/except，单步抛错只记日志。
+        """
+        if not self._started:
+            return
+        self._started = False
+        self._run_exit_step('移除应用级事件过滤器',
+                            lambda: self.app.removeEventFilter(self))
+        timer = getattr(self, "_self_talk_timer", None)
+        if timer is not None:
+            # M9：stop 后不再自我重排（引用环也让壳可被回收）
+            self._run_exit_step('停自我重排定时器', timer.stop)
+        # B7b：子宠各自的计时同样停表
+        self._run_exit_step('停止子宠自言自语计时', self._stop_all_self_talk_hosts)
+        self._run_exit_step('摘设置命令监听', self._teardown_settings_command_watch)
+        self._run_exit_step('关闭歌词控制器', self.shutdown_music_lyric)
+        self._run_exit_step('停音乐唱歌轮询', self._stop_music_sing_polling)
         bridge = getattr(self, "island_bridge", None)
         if bridge is not None:
-            bridge.close()
+            self._run_exit_step('关闭灵动岛桥', bridge.close)
             self.island_bridge = None
-        self.save_position()  # 4.2a：退出持久化（rx/ry/facing/scale）
-        self.save_spawned_positions()  # 4.2b：子肥鱼逐只按 slot 身份持久化
+        self._run_exit_step('停止可见性监视器', self._watcher.stop)
+        self._run_exit_step('删除运行标记', self._delete_runtime_marker)
+        self._run_exit_step('关闭快速对话', self._close_quick_chat)
+        self._run_exit_step('收掉气泡跟随器', self._close_bubble_followers)
+        self._run_exit_step('停 overlay 驱动', self.overlay.stop)
+        self._run_exit_step('关闭 overlay 窗口', self.overlay.close)
+        if self.tray is not None:
+            self._run_exit_step('隐藏托盘图标', self.tray.hide)
+        # F3 + 缺陷 14：在飞帧序列供给线程与素材库（主库 + 子宠库）的收口（口径
+        # 同 _on_about_to_quit / _on_session_end）。缺这两步时库不 shutdown，而
+        # 库里活着的供给 QThread 是库的子对象——库随壳销毁会把活线程一起析构
+        # （Qt fatal，见 _on_about_to_quit 的说明）。
+        self._run_exit_step('取消在飞帧序列供给', self._cancel_frameseq_provisions)
+        self._shutdown_libraries()
+
+    def _on_about_to_quit(self) -> None:
+        """退出收口：停 tick + 暂停预热 + 监视器与避让标记清理（4.1b）。
+
+        逐步隔离（缺陷 13）：每一步独立 try/except，前置步骤抛错不得让**必做项**
+        （窗口位置落盘 / 子宠位置落盘 / 在飞供给取消）被整体跳过。
+        """
+        self._run_exit_step('停止可见性监视器', self._watcher.stop)
+        watcher = getattr(self, "_session_watcher", None)
+        unregister = getattr(watcher, "unregister_session_notifications", None)
+        if callable(unregister):
+            # 锁屏通知注册与窗口句柄同生共死（O4）
+            self._run_exit_step('反注册锁屏通知', unregister)
+        # Qt 的过滤器表只存裸指针：退出时必须摘掉，绝不给它留一个即将析构的对象
+        uninstall = getattr(watcher, "uninstall", None)
+        if callable(uninstall):
+            self._run_exit_step('摘除会话结束原生过滤器', uninstall)
+        self._run_exit_step('摘设置命令监听', self._teardown_settings_command_watch)
+        self._run_exit_step('删除运行标记', self._delete_runtime_marker)
+        self._run_exit_step('关闭快速对话', self._close_quick_chat)
+        self._run_exit_step('关闭歌词控制器', self.shutdown_music_lyric)
+        self._run_exit_step('停音乐唱歌轮询', self._stop_music_sing_polling)
+        bridge = getattr(self, "island_bridge", None)
+        if bridge is not None:
+            self._run_exit_step('关闭灵动岛桥', bridge.close)
+            self.island_bridge = None
+        # 4.2a：退出持久化（rx/ry/facing/scale）+ 4.2b：子肥鱼逐只按 slot 身份持久化
+        self._run_exit_step('持久化窗口位置', self.save_position)
+        self._run_exit_step('持久化子宠位置', self.save_spawned_positions)
         if self.overlay is not None:
-            self.overlay.stop()
-        pause = getattr(self.lib, "pause_warm", None)
-        if callable(pause):
-            try:
-                pause()
-            except Exception:
-                logging.exception("overlay: 退出时暂停预热失败")
+            self._run_exit_step('停 overlay 驱动', self.overlay.stop)
+        # 主库显式 shutdown（缺陷 14）：shutdown 内部已含 pause_warm 与在飞供给
+        # 取消；无 shutdown 面的库退回只停预热（旧行为）。
+        self._shutdown_library(getattr(self, "lib", None), "主肥鱼")
         # 首跑供给线程不是预热线程：``pause_warm`` 管不到它，而它自己派生转换
         # ffmpeg（issue #111 的关机/退出窗口里最不该有的派生），库随本壳销毁时
         # 活线程还会被一起析构（Qt fatal）。逐库显式取消（口径同 _on_session_end
         # 的逐库 stop_all_clips）。
-        self._cancel_frameseq_provisions()
+        self._run_exit_step('取消在飞帧序列供给', self._cancel_frameseq_provisions)
 
     def _cancel_frameseq_provisions(self) -> None:
         """取消本路径各库的在飞帧序列供给线程（退出/会话结束收口，issue #111）。
@@ -3463,6 +3521,12 @@ class OverlayShell(QObject):
         if facing in ("left", "right"):
             sprite.facing = facing
         self.overlay.add_sprite(sprite)
+        # O3：新 sprite 的播放节拍按**当前有效可播性**初始化——PetSprite 默认
+        # 未暂停，隐藏/挂起期生成的子宠若不在这里压住，行为链一起播就按帧率
+        # 解码，而窗口根本没有像素要上屏。``visible`` 不动（它逻辑上仍是可见
+        # 宠物），窗口真正显示时由整窗显示路径（含 ``start()``）补放行。
+        if not self._clips_playable():
+            self._set_sprite_clip_paused(sprite, True)
         self._spawned.append(sprite)
         self._spawned_libs[sprite] = lib
         self._spawned_slots[sprite] = slot
@@ -3955,6 +4019,13 @@ class OverlayShell(QObject):
         O3：显隐同时切换该 sprite 的播放节拍（隐藏 → ``pause_clip``，显示 →
         ``resume_clip``），并把"可见 sprite 数变化"通知驱动器——藏光最后一只
         可见 sprite 时目标档位是 T3（没有像素要上屏），恢复可见则同步回全速。
+
+        恢复侧先过**有效可播**闸门（``_clips_playable``）：暂停有两个独立所有者
+        （本壳的整窗显隐 + 驱动器的锁屏挂起），"这次是谁解除的"不足以判定该放行
+        ——整窗隐藏中托盘勾「显示这只」、锁屏挂起中全屏避让解除，都会让 clip 在
+        不可见/挂起期重新按帧率解码。sprite 的 ``visible`` 照改（它逻辑上仍是
+        可见宠物，只是窗口/屏幕不显示），被压住的播放节拍等窗口真正可见时由
+        整窗显示路径补放行。
         """
         if sprite is None:
             return
@@ -3966,7 +4037,10 @@ class OverlayShell(QObject):
         # O3：隐藏的那一只停播放节拍（clip 定时器），显示则从暂停处续播——
         # 隐藏 sprite 既不绘制也不进 fanout，继续按帧率解码纯属白烧 CPU；
         # 恢复**不**重启动画（不回第 0 帧、无首帧冷启动）。
-        self._set_sprite_clip_paused(sprite, not visible)
+        # 恢复放行 = 这一只被标为可见 **且** 窗口真的能上屏（有效可播闸门）；
+        # 闸门关着时按暂停方向走（幂等，不打断既有的整窗暂停）。
+        self._set_sprite_clip_paused(
+            sprite, not (visible and self._clips_playable()))
         if not visible:
             self._hide_bubble_for_sprite(sprite)
             if sprite is getattr(self, "sprite", None):
@@ -3983,6 +4057,25 @@ class OverlayShell(QObject):
         if callable(call):
             call()
 
+    def _clips_playable(self) -> bool:
+        """有效可播（O3 恢复路径的统一闸门）：窗口真的可见 **且** 驱动器未挂起。
+
+        暂停有两个独立所有者——本壳（整窗显隐/全屏避让）与驱动器（锁屏挂起）。
+        恢复路径只看"这次是谁解除的"就会替另一个所有者擅自放行：整窗隐藏中
+        托盘勾「显示这只」、锁屏中全屏避让解除，都会让 clip 在不可见/挂起期
+        重新按帧率解码（O3 契约破坏）。
+        """
+        overlay = getattr(self, "overlay", None)
+        if overlay is None:
+            return False
+        try:
+            if not overlay.isVisible():
+                return False
+        except RuntimeError:
+            return False  # 原生窗口已销毁：没东西可上屏
+        driver = getattr(self, "driver", None)
+        return not bool(getattr(driver, "suspended", False))
+
     def _set_all_clips_paused(self, paused: bool) -> None:
         """整窗隐藏/显示：逐 sprite 停/续播放节拍（O3）。
 
@@ -3990,7 +4083,13 @@ class OverlayShell(QObject):
         这一只该醒——否则"托盘藏起子肥鱼 → 隐藏整窗 → 显示整窗"会让那只又开始
         按帧率解码（隐藏 sprite 的播放节拍暂停被窗口显隐悄悄解除）。逐只恢复
         仍归 ``set_sprite_visible(True)``。
+
+        恢复侧还要过有效可播闸门：本方法的调用点里，全屏避让解除发生在锁屏
+        挂起期间（``overlay.show()`` 已走完、可见性判据不再拦得住），挂起未解除
+        时整批不许放行。
         """
+        if not paused and not self._clips_playable():
+            return
         for sprite in list(getattr(self.overlay, "sprites", ())):
             if not paused and not self._sprite_visible(sprite):
                 continue
@@ -4345,8 +4444,10 @@ class OverlayShell(QObject):
 
         主 sprite 与全部子肥鱼用**同一份** old/new bounds 迁移（G2：只迁主宠会让
         子肥鱼留在旧绝对坐标上，随后被新边界钳到同一条边，相对布局丢失）；
-        迁移必须逐只在 ``_apply_bounds`` **之前**做——先套新边界时
-        ``PetSprite.set_bounds`` 会就地钳一次，旧位置比例当场被抹掉。
+        ``_apply_bounds`` 只能整体排在循环**之后**——它一次把**全部** sprite 的
+        钳制域换成新边界，还没轮到的那几只会被就地钳一次、旧位置比例当场抹掉。
+        每只自己的换域与落点顺序在 ``_migrate_sprite_position`` 内（比例取旧边界，
+        落点钳新边界）。
         overlay 全局原点变化（屏位置变）另同步气泡跟随器原点（不重建跟随器
         与气泡：重建会丢正在显示的气泡）。
         """
@@ -4407,7 +4508,20 @@ class OverlayShell(QObject):
     def _migrate_sprite_position(self, old_bounds: QRect, new_bounds: QRect,
                                  sprite=None) -> None:
         """rx/ry 语义迁移：sprite 中心相对可用区的比例在几何变化前后不变
-        （口径同 window_placement.save_position 的持久化比例）。"""
+        （口径同 window_placement.save_position 的持久化比例）。
+
+        两步各按自己那一侧的边界口径算，顺序不能合并：
+
+        - **取比例必须在换边界之前**——``PetSprite.set_bounds`` 会就地钳一次，
+          先换边界就把旧位置的比例钳没了（G2 已锁死的语义）；
+        - **写落点必须在换边界之后**——``set_pos`` 受当前边界钳制，落点在旧边界
+          下先被截断、随后 ``_apply_bounds`` 扩边界也不回位：小屏/低分迁到大屏/
+          高分时靠右/靠下的宠物整只卡在旧边缘（实测宽 1000→1600：比例落点
+          x≈1230 被旧边界钳成 744）。
+
+        只换本只的钳制域（本只以外的 sprite 各自的边界在轮到自己时才换，
+        比例取自它们各自的旧位置），``_apply_bounds`` 随后统一写一遍是同值幂等。
+        """
         sprite = self.sprite if sprite is None else sprite
         if sprite is None:
             return
@@ -4418,18 +4532,30 @@ class OverlayShell(QObject):
         ry = (rect.y() + rect.height() / 2.0 - old_bounds.y()) / old_bounds.height()
         ncx = new_bounds.x() + rx * new_bounds.width()
         ncy = new_bounds.y() + ry * new_bounds.height()
+        sprite.set_bounds(QRect(new_bounds))
         sprite.set_pos(QPointF(ncx - rect.width() / 2.0, ncy - rect.height() / 2.0))
 
     def _migrate_to_screen(self, new_screen) -> None:
-        """overlay 重建到新屏（屏热插拔/主屏切换）：sprite 按比例迁移坐标。"""
+        """overlay 重建到新屏（屏热插拔/主屏切换）：sprite 按比例迁移坐标。
+
+        重建出的新 overlay 是**未显示**的新窗口：是否 show 回桌面、是否补放行
+        播放节拍、是否重挂气泡，全部按迁移前的有效可见性快照决定（见下
+        ``was_visible``）——隐藏中的窗口不因一次屏事件自己冒出来。
+        """
         if new_screen is None or new_screen is self._screen:
             return
         old_bounds = QRect(self._bounds)
         old_overlay = self.overlay
+        # 迁移前快照"有效可见性"（= 整窗可见 **且** 不在全屏避让隐藏态）。迁移
+        # 后是否 show / 补放行播放节拍只认它：隐藏中的窗口（托盘
+        # ``set_pet_visible(False)`` / 全屏避让 ``_auto_hidden``）不得因为一次屏
+        # 事件被重建路径无条件 show 回桌面。全屏避让按 watcher 口径——迁移本身
+        # 不重评全屏探测，故沿用当下的 ``_auto_hidden``（切走前它已把窗口 hide，
+        # 只是钉住"别顺手显示"这一方向；真解除仍由 watcher 的翻转回调走显示路径）。
+        was_visible = self.overlay.isVisible() and not self._auto_hidden
         # 迁移前抓一份"正在显示的非粘滞气泡"文案：下面 ``_bind_bubble`` 会
         # ``follower.close()`` 关掉旧气泡窗（旧版气泡是独立 Tool 窗，跨屏只跟随
         # 不销毁），不抓就整条气泡在拔屏瞬间消失。
-        bubble_was_up = self.overlay.isVisible()
         transient_bubble = self._snapshot_transient_bubble()
         self._end_drag()
         self._disconnect_screen(self._screen)
@@ -4482,20 +4608,26 @@ class OverlayShell(QObject):
             # 屏迁移：岛墙局部坐标按新 overlay 原点重算（气泡跟随器同款）
             bridge.set_origin(self.overlay.geometry().topLeft())
         if was_started:
+            # 新 overlay 是新 HWND：锁屏通知注册改挂到它上面（旧句柄随关闭失效）。
+            # 注册按 HWND 走、与可见性无关，故不并进下面的可见分支：隐藏中迁移
+            # 不回这里重挂的话，锁屏消息仍发往已关闭的旧句柄（休眠/唤醒收不到）。
+            self._register_session_notifications()
+        if was_started and was_visible:
             self.overlay.show()
             self.overlay.start()
-            # 新 overlay 是新 HWND：锁屏通知注册改挂到它上面（旧句柄随关闭失效）
-            self._register_session_notifications()
+            # 迁移前可见 = 该显示就显示：迁移重建不该把播放节拍留在暂停
+            # （隐藏期压住的暂停归真正的显示路径解除，可见态下必须补放行，
+            # 否则窗口可见而宠冻在首帧——与挂机冻结同貌）。
+            self._set_all_clips_paused(False)
             # 迁移不丢气泡：新建的跟随器自带一只**空**气泡窗（未 show），
             # 把原内容按同一口径重新挂上——粘滞提醒（含队列来源，pump_alerts
             # 与 legacy sticky 都写 ``_sticky_*``）优先；非粘滞的限时气泡用
-            # 迁移前抓下的文案补一次。迁移前桌宠是被用户隐藏的（overlay 不可见）
-            # 则不挂：不可见壳不冒泡（与 set_pet_visible(False) 同纪律）。
-            if bubble_was_up:
-                self._restore_sticky_bubble()
-                if transient_bubble is not None:
-                    text, subtitle, duration_ms = transient_bubble
-                    self._show_bubble_text(text, duration_ms, subtitle=subtitle)
+            # 迁移前抓下的文案补一次（不可见壳不冒泡，故本分支只在迁移前
+            # 可见时进入，与 set_pet_visible(False) 同纪律）。
+            self._restore_sticky_bubble()
+            if transient_bubble is not None:
+                text, subtitle, duration_ms = transient_bubble
+                self._show_bubble_text(text, duration_ms, subtitle=subtitle)
         old_overlay.close()
 
     def _rebuild_all_bubbles(self) -> None:

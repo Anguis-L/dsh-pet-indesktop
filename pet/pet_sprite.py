@@ -725,6 +725,15 @@ class PetSprite(QObject):
             pause = getattr(clip, "pause", None)
             if callable(pause):
                 pause()
+        else:
+            # 暂停契约归 sprite 持有，clip 的 _paused 不得跨绑定滞留：暂停期
+            # 被换绑掉的 clip 在库缓存里一直揣着 _paused（恢复路径只续当前
+            # clip），下次 start() 看到滞留标记不起定时器 = 画面永久冻在首帧
+            # （拖拽悬空/走路动画变静态图的根因）。sprite 未暂停 = 契约不
+            # 成立，必须清掉滞留；未暂停的 clip 上 resume() 是 no-op。
+            resume = getattr(clip, "resume", None)
+            if callable(resume):
+                resume()
         return accepted
 
     def restart_clip(self) -> bool:
@@ -763,6 +772,14 @@ class PetSprite(QObject):
             pause = getattr(clip, "pause", None)
             if callable(pause):
                 pause()
+        else:
+            # 与 bind_clip 的 else 分支对称：本 clip 被 pause 过、又被 stop
+            # 过（半暂停态：stop 只停表，不清 _paused）时，restart 的 start()
+            # 看到滞留标记不起定时器 = 续圈之后画面冻在首帧。sprite 未暂停
+            # = 暂停契约不成立，清掉滞留（未暂停时 resume() 是 no-op）。
+            resume = getattr(clip, "resume", None)
+            if callable(resume):
+                resume()
         return accepted
 
     def _on_clip_finished(self) -> None:
@@ -862,6 +879,20 @@ class PetSprite(QObject):
         no_mirror = getattr(self.library, "no_mirror", frozenset())
         return self._clip_name not in no_mirror
 
+    def _mirror_image(self, img: QImage) -> QImage:
+        """左右镜像一帧（缺陷 16：``QImage.flipped`` 是 Qt 6.9+ API）。
+
+        requirements 允许 ``PySide6>=6.5``，6.5-6.8 上没有 ``flipped``——直接调用
+        会 AttributeError 把镜像帧绘制路径打炸（朝右的宠一帧都画不出来）。按
+        可用性探测并回退 ``mirrored(True, False)``（6.5 起即可用，轴向等价：都是
+        左右镜像，逐像素一致）。探测放在每次重建里（一个 ``getattr``，相对本条链
+        上的 ``scaled``/``convertToFormat`` 可忽略），这样"运行期掉了 API"也走得通。
+        """
+        flipped = getattr(img, "flipped", None)
+        if callable(flipped):
+            return flipped(Qt.Orientation.Horizontal)
+        return img.mirrored(True, False)   # 仅 Qt < 6.9 可达（6.9+ 优先走上面的 flipped）
+
     def _rebuild_pixmap(self) -> bool:
         """按签名缓存重建当前帧：返回是否真正重建（False = 快路径复用）。
 
@@ -869,8 +900,8 @@ class PetSprite(QObject):
         取帧→镜像→预乘→Smooth 缩放 整条链（每步先判恒等，见下）。转换顺序与
         window.py 一致：先转 ARGB32_Premultiplied 再缩放，避免直通 alpha 缩放
         产生暗边；缩放后的预乘图同时充任命中测试的 alpha 源（预乘不动 alpha
-        字节）。镜像用 Qt6 的 ``flipped(Horizontal)``（``mirrored(True, False)``
-        已废弃，轴向相同：左右镜像）。
+        字节）。镜像见 :meth:`_mirror_image`（Qt 6.9+ 用 ``flipped(Horizontal)``，
+        更早的版本回退 ``mirrored(True, False)``，轴向相同：左右镜像）。
         D2：缩放目标是物理像素（CANVAS*scale*dpr），pixmap 携带
         setDevicePixelRatio(dpr)，Qt 按逻辑大小绘制，HiDPI 下不糊。
 
@@ -896,7 +927,7 @@ class PetSprite(QObject):
             # 首帧未就绪/素材损坏：保留上一帧（若有），跳过本次重建
             return False
         if self._mirror_frame():
-            img = img.flipped(Qt.Orientation.Horizontal)
+            img = self._mirror_image(img)
         w, h = self._scaled_size()
         if img.format() != QImage.Format.Format_ARGB32_Premultiplied:
             img = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)

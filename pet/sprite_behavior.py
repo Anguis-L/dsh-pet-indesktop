@@ -442,7 +442,7 @@ class BehaviorController:
         st.state = STATE_CLICK
         st.anim = name
         st.elapsed = 0.0
-        st.duration = self._clip_duration(sprite.library, name)
+        st.duration = self._plan_duration(sprite, name)
         st.pending_move = None
         self._cancel_gap(st)  # 点击打断 gap（window.py:2532 点击动画结束取消 gap）
         self._clear_move_plan(st)
@@ -483,7 +483,7 @@ class BehaviorController:
         sprite.set_velocity(QPointF(0, 0))
         st.elapsed = 0.0
         st.anim = name
-        st.duration = self._clip_duration(sprite.library, name)
+        st.duration = self._plan_duration(sprite, name)
         sprite.bind_clip(name)
         return True
 
@@ -1103,7 +1103,9 @@ class BehaviorController:
         落地的切换目标是 idle 池（``_enter_idle``），而预测式预热覆盖不到这里
         ——弹射是事件触发（拖拽打断早已作废预测代次），且交互让路闸门在飞行期
         会挡住 ``warm_predicted``；故直接调 clip 级 ``warm_first_frame``（幂等、
-        可被取消，见 webm_clip 文档），绕过闸门。
+        可被取消，见 webm_clip 文档），绕过的是**交互让路**闸门——库级总开关 /
+        隐藏暂停闸门照旧要过（见 ``_warm_allowed``），否则设置页"关闭后停止
+        后台动画预热"的承诺会被这条路径打破。
 
         **后台执行**：预热内部要拉起 ffmpeg（~50ms/条），旧机曾在 GUI 线程同步
         预热，碰撞风暴下每次撞飞同步拉起一次（~100ms/只），多鱼互撞时连续
@@ -1121,6 +1123,11 @@ class BehaviorController:
         推后几百毫秒。开关是 ``st.warm_landing_submitted``：起飞置位，落地 /
         被拖拽打断（``_unpin_landing_idles``）复位，故下一次飞行照旧预热。
         """
+        if not self._warm_allowed(getattr(sprite, "library", None)):
+            # 库级闸门关闭（设置页关预热 / 隐藏挂起）：本段整体不占位——pin 与
+            # 去重标记都不置，开闸后的下一次起飞照旧整批提交（不会被一次空跑
+            # 吃掉标记，与"无 idle 素材"分支同款纪律）。
+            return
         if st.warm_landing_submitted:
             return  # 本次飞行已提交过：pin 仍在位（清单没被摘），无需重打
         clips = self._landing_idle_clips(sprite, cats)
@@ -1180,6 +1187,24 @@ class BehaviorController:
         st.landing_pinned = []
         st.warm_landing_submitted = False
 
+    @staticmethod
+    def _warm_allowed(lib) -> bool:
+        """库级预热闸门（总开关 + 隐藏暂停）：鸭式库无 ``warm_allowed()`` 按放行。
+
+        行为层有两条**直提** ``_WARM_EXECUTOR`` 的路径（预测预热、起飞落地预热），
+        它们不经过库的 ``warm_predicted`` / ``_warm_objects``，也就绕过了那里
+        的闸门；判据统一问库（``MovieLibrary.warm_allowed``）。库不暴露该接口
+        （测试假库 / 轻量替身）、或判定本身抛错时按放行——预热失败从来不致命
+        （最坏退化成播放时按需同步解码），绝不能因为一次判定失败改变既有行为。
+        """
+        allowed = getattr(lib, "warm_allowed", None)
+        if not callable(allowed):
+            return True
+        try:
+            return bool(allowed())
+        except Exception:
+            return True
+
     # ---------------------------------------------------------------- 唱歌续播（N1）
     def _continue_sing(self, sprite, st: _SpriteState) -> bool:
         """唱歌素材播完且音乐仍在放 → 原地续播（window.py:2595-2601 语义）。
@@ -1222,6 +1247,8 @@ class BehaviorController:
             return _pp_roll_next(pools, exclude, rng=self.rng)
 
         def _warm(name):
+            if not self._warm_allowed(getattr(sprite, "library", None)):
+                return  # 库级闸门关闭（设置页关预热 / 隐藏挂起）：连提交都不做
             try:
                 clip = sprite.library.movie(name)
                 warm = getattr(clip, "warm_first_frame", None)
@@ -1395,7 +1422,7 @@ class BehaviorController:
         name = forced_name if forced_name is not None else self._pick(cats["idles"], exclude=st.anim)
         st.elapsed = 0.0
         st.anim = name
-        st.duration = self._clip_duration(sprite.library, name) if name else 0.0
+        st.duration = self._plan_duration(sprite, name) if name else 0.0
         if name is not None:
             self._bind_with_gen(sprite, st, name)
 
@@ -1429,7 +1456,7 @@ class BehaviorController:
         self._clear_move_plan(st)
         st.elapsed = 0.0
         st.anim = name
-        st.duration = self._clip_duration(sprite.library, name) if name else 0.0
+        st.duration = self._plan_duration(sprite, name) if name else 0.0
         if name is not None:
             self._bind_with_gen(sprite, st, name)
 
@@ -1455,7 +1482,7 @@ class BehaviorController:
         self._clear_move_plan(st)
         st.elapsed = 0.0
         st.anim = name
-        st.duration = self._clip_duration(sprite.library, name) if name else 0.0
+        st.duration = self._plan_duration(sprite, name) if name else 0.0
         if name is not None:
             # 起播被拒也静默：飞行段的位置积分不能因动画失败而中断
             self._bind_with_gen(sprite, st, name)
@@ -1484,7 +1511,7 @@ class BehaviorController:
         sprite.set_velocity(QPointF(0, 0))
         st.elapsed = 0.0
         st.anim = name
-        st.duration = self._clip_duration(sprite.library, name)
+        st.duration = self._plan_duration(sprite, name)
         self._bind_with_gen(sprite, st, name)
 
     def _enter_turn(self, sprite, st: _SpriteState, cats: dict,
@@ -1497,7 +1524,7 @@ class BehaviorController:
         st.state = STATE_TURN
         st.anim = name
         st.elapsed = 0.0
-        st.duration = self._clip_duration(sprite.library, name)
+        st.duration = self._plan_duration(sprite, name)
         st.pending_move = pending_move
         self._clear_move_plan(st)
         sprite.set_velocity(QPointF(0, 0))
@@ -1538,7 +1565,7 @@ class BehaviorController:
             return False
         lib = sprite.library
         stride = ((getattr(lib, "move_strides", None) or {}).get(name, catalog.MOVE_STRIDE_DEFAULT_PX)) * float(getattr(sprite, "scale", 1.0))
-        loop_duration = self._clip_duration(lib, name)
+        loop_duration = self._plan_duration(sprite, name)
         if loop_duration <= 0:
             return False
         # 步幅整圈量化：位移锁到步态整圈，velocity=位移/时长 ⇒ 平均速度
@@ -1715,6 +1742,42 @@ class BehaviorController:
     def _clip_duration(lib, name: str) -> float:
         dur = getattr(lib, "duration", None)
         return float(dur(name)) if callable(dur) else 0.0
+
+    @staticmethod
+    def _plan_duration(sprite, name: str) -> float:
+        """按 **sprite 的播放速率** 读素材时长（一切计划/状态时长的唯一读取口）。
+
+        ``clip.duration()`` 除以的是 **clip 当前** 的 ``playback_speed``，而那个
+        字段只在 ``PetSprite.bind_clip`` 里才被同步成 ``sprite.playback_speed``
+        ——计划读取点全部发生在 bind **之前**，缓存 clip 里残留的是上一次绑定
+        的速率（飞行倍率也会留在那里，见 ``reset_playback_speed`` 的注释）。
+        直接读库口径会让状态机按错误时长推进：慢动作被提前切走、快动作播完
+        长停末帧，移动计划的位移与墙钟失配（脚滑）。这里换算回"按 sprite 速率
+        播放"的真实时长：
+
+            clip.duration() × clip.playback_speed ÷ sprite.playback_speed
+
+        速率取不到（鸭式库 / 无该字段的 clip / 非正数）或库自身读不出时长时
+        按现状返回库口径——绝不因为一次换算失败改变既有行为。
+        """
+        lib = getattr(sprite, "library", None)
+        duration = BehaviorController._clip_duration(lib, name)
+        if duration <= 0.0:
+            return duration
+        try:
+            sprite_speed = float(getattr(sprite, "playback_speed", 1.0))
+        except (TypeError, ValueError):
+            return duration
+        movie = getattr(lib, "movie", None)
+        if not callable(movie):
+            return duration
+        try:
+            clip_speed = float(getattr(movie(name), "playback_speed", None))
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+            return duration
+        if sprite_speed <= 0.0 or clip_speed <= 0.0:
+            return duration
+        return duration * clip_speed / sprite_speed
 
     def _pick(self, pool, exclude: str | None = None):
         entries = [n for n in pool if n != exclude] or list(pool)

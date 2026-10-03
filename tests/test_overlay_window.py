@@ -16,7 +16,15 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap, QRegion
+from PySide6.QtGui import (
+    QColor,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPixmap,
+    QRegion,
+    QTransform,
+)
 from PySide6.QtWidgets import QApplication
 
 from pet.overlay_window import ALPHA_HIT_THRESHOLD, OverlayWindow
@@ -611,3 +619,90 @@ def test_overlay_render_of_frameseq_sprite_builds_no_per_frame_pixmap(
     finally:
         _settle_frameseq_clip(clip)
         overlay.close()
+
+
+# ---------------------------------------------------------------- 旋转命中（D11）
+def _paint_transform(rect, angle_deg) -> QTransform:
+    """与 QPainter 同口径的正向旋转（以 rect 中心为轴，begin_rotation 同式）。"""
+    transform = QTransform()
+    center = rect.center()
+    transform.translate(center.x(), center.y())
+    transform.rotate(angle_deg)
+    transform.translate(-center.x(), -center.y())
+    return transform
+
+
+def _rotated_hit_sprite(*, pos=(100, 400)) -> tuple[OverlayWindow, PetSprite]:
+    """真 PetSprite：640x360 画布左上角一块 40x40 不透明块，scale=0.5 → 逻辑 0..19。"""
+    clip = FakeClip()
+    painter = QPainter(clip.image)
+    painter.fillRect(QRect(0, 0, 40, 40), Qt.GlobalColor.red)
+    painter.end()
+    sprite = PetSprite(FakeLibrary(clip), pos=QPointF(*pos), scale=0.5)
+    sprite.bind_clip("idle")
+    sprite._rebuild_pixmap()
+    overlay = OverlayWindow()
+    overlay.add_sprite(sprite)
+    return overlay, sprite
+
+
+def test_rotated_visible_pixel_outside_rect_is_hit():
+    """45° 探头姿态：画在 rect 之外的可见像素必须点得中（粗筛用绘制外接矩形）。
+
+    粗筛若仍用未旋转的 ``rect()``，旋转溢出的像素在 alpha 细判之前就被排除——
+    贴边探头 / 黄金回旋式的抛掷旋转全部"画在哪点不到哪"。
+    """
+    overlay, sprite = _rotated_hit_sprite()
+    rect = sprite.rect()
+
+    # 无旋转：paint_bounds() 与 rect() 同义（零差异路径），命中行为照旧
+    assert sprite.paint_bounds() == rect
+    inside = QPoint(rect.x() + 10, rect.y() + 10)          # 不透明块内
+    assert overlay.sprite_at(inside) is sprite
+    assert overlay.sprite_at(QPoint(rect.x() + 200, rect.y() + 120)) is None
+
+    sprite.set_probe_pose(45.0, 0.55)
+    bounds = sprite.paint_bounds()
+    assert bounds.contains(rect) and bounds != rect
+
+    # 不透明块那颗像素绕帧中心转 45° 之后落在哪：在 rect 外、在 paint_bounds 内
+    rotated = _paint_transform(rect, 45.0).map(QPointF(inside))
+    hit = QPoint(int(rotated.x()), int(rotated.y()))
+    assert not rect.contains(hit), "前提：旋转后的可见像素已溢出未旋转矩形"
+    assert bounds.contains(hit), "前提：它仍在绘制外接矩形内"
+
+    assert sprite.alpha_at(QPoint(hit.x() - rect.x(), hit.y() - rect.y())) \
+        >= ALPHA_HIT_THRESHOLD                            # 细判本身能认出该像素
+    assert overlay.sprite_at(hit) is sprite               # 粗筛不再提前排除
+
+
+def test_throw_rotation_overflow_pixel_is_hit():
+    """抛掷旋转（彩蛋）溢出像素同理：粗筛跟随 paint_bounds 的合成投影。"""
+    overlay, sprite = _rotated_hit_sprite()
+    rect = sprite.rect()
+    inside = QPoint(rect.x() + 10, rect.y() + 10)
+
+    sprite.set_throw_rotation(45.0)
+    bounds = sprite.paint_bounds()
+    assert bounds.contains(rect)
+
+    rotated = _paint_transform(rect, 45.0).map(QPointF(inside))
+    hit = QPoint(int(rotated.x()), int(rotated.y()))
+    assert not rect.contains(hit), "前提：旋转后的可见像素已溢出未旋转矩形"
+    assert bounds.contains(hit)
+    assert overlay.sprite_at(hit) is sprite
+
+
+def test_rotated_sprite_at_misses_off_pixel_inside_bounds():
+    """负例：paint_bounds 内但旋转后为透明的点不得命中（粗筛放宽≠命中放宽）。"""
+    overlay, sprite = _rotated_hit_sprite()
+    sprite.set_probe_pose(45.0, 0.55)
+    rect = sprite.rect()
+    bounds = sprite.paint_bounds()
+
+    # 不透明块旋转后在 rect 之外的对称位置：原块对角处的透明像素
+    clear = _paint_transform(rect, 45.0).map(
+        QPointF(rect.x() + 300, rect.y() + 170))
+    probe = QPoint(int(clear.x()), int(clear.y()))
+    assert bounds.contains(probe)
+    assert overlay.sprite_at(probe) is None

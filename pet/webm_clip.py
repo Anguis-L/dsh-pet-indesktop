@@ -62,8 +62,9 @@ WebM-backed clip library（webm 主路线）。
   _sweep_unconfirmed_procs 在 owner 释放 _ff_proc_lock 后确认/补杀。
   两条兜底链对「poll 异常 / terminate+kill 后仍存活」都不静默丢句柄：
   确认失败保留追踪并累计有界重试，达到上限（_CONFIRM_KILL_MAX /
-  _UNCONFIRMED_KILL_MAX）告警并标注 abandoned（保留追踪不再重试）——
-  绝不漏杀、不无限静默重试、也不静默丢句柄。sweep 的补杀（poll/terminate）
+  _UNCONFIRMED_KILL_MAX）告警；首帧条目标注 abandoned 后在其后的 sweep 做
+  终局处置（记审计日志后清出追踪，不再钉住 clip）——绝不漏杀、不无限静默
+  重试、不刷屏，也不静默丢句柄。sweep 的补杀（poll/terminate）
   在注册表锁外执行（锁内只取快照，写回再进锁），单个 clip 的串行补杀不阻塞
   其他 clip 的 register/unregister。
 """
@@ -151,12 +152,12 @@ _END_MARKER_PUT_TIMEOUT = 5.0
 # 明显变长（用户可感知的响应延迟红线）。
 _PROC_LOCK_ACQUIRE_TIMEOUT = 0.2
 # 首帧进程「取消后未确认退出」的有界补杀重试上限（批 6-8b 收尾；R3 语义）：
-# cancel_first_frame_warm 的 try-acquire 超时跳过的进程登记进
-# _unconfirmed_procs，孤儿注册表 sweep 周期补杀；owner（解码线程）持续
-# 持锁不释放（g.close() 病态卡死）或补杀后进程仍存活（poll 异常 / kill
-# 失败）时，达到此上限记录告警并**标注 abandoned**（条目保留在追踪中、
-# 后续 sweep 不再重试）——不无限静默重试，也绝不静默丢句柄（与
-# _LEAK_ATTEMPTS 的「不无限静默重试」同一原则）。
+# cancel_first_frame_warm 的 try-acquire 超时跳过、或 terminate 未能确认退出
+# 的进程登记进 _unconfirmed_procs，孤儿注册表 sweep 周期补杀；owner（解码
+# 线程）持续持锁不释放（g.close() 病态卡死）或补杀后进程仍存活（poll 异常 /
+# kill 失败）时，达到此上限记录告警并**标注 abandoned**，其后一轮 sweep 终局
+# 处置（记审计日志后清出追踪，不再钉住 clip）——不无限静默重试、不刷屏，也
+# 不静默丢句柄（与 _LEAK_ATTEMPTS 的「不无限静默重试」同一原则）。
 _UNCONFIRMED_KILL_MAX = 6
 # 退役 reader 兜底确认（_confirm_retired_proc）失败后的有界重试上限
 # （批 6-8b R3）：线程退出后 poll 异常 / terminate+kill 后仍存活时保留
@@ -311,7 +312,8 @@ class _OrphanClipRegistry:
     - register：强引用持有 clip（防 GC 与 reader 收尾竞态），并启动 timer；
     - reap：快照后对注册的 clip 做有界回收与首帧补杀，退役池清空且无
       未确认首帧进程者移出注册表；仍存活者累计回收次数，达到
-      _LEAK_ATTEMPTS 阈值记录泄漏告警（不无限静默重试）并继续持有追踪；
+      _LEAK_ATTEMPTS 阈值首次记录泄漏告警（只打一条，不无限静默重试也不刷屏）
+      并继续持有追踪；
     - unregister：移除追踪（退役池已清空时调用）。
     """
 
@@ -439,7 +441,12 @@ class _OrphanClipRegistry:
                 if self._clips:
                     for clip in self._clips:
                         clip._orphan_reap_count = getattr(clip, '_orphan_reap_count', 0) + 1
-                        if clip._orphan_reap_count >= self._LEAK_ATTEMPTS:
+                        # 缺陷 21：告警只在首次越阈打一条。此前用 `>=` 判定，
+                        # 越阈后每一轮 sweep（间隔 500ms）都重复同一条 warning，
+                        # 日志被自己的回声淹没、真信号被稀释。
+                        if (clip._orphan_reap_count >= self._LEAK_ATTEMPTS
+                                and not getattr(clip, '_leak_warned', False)):
+                            clip._leak_warned = True
                             logger.warning(
                                 'webm 退役 reader 多次回收仍存活（疑似泄漏，进程已 terminate）: %s',
                                 clip.path,
@@ -1226,14 +1233,16 @@ class WebMClip(QObject):
         # terminate，隐藏/切角色后不再有不受控的后台 ffmpeg 存活。
         self._first_frame_gen = 0
         self._first_frame_procs: set = set()
-        # 取消时 try-acquire 超时跳过、尚未确认退出的首帧进程（批 6-8b 收尾；
-        # R3 条目格式 [proc, attempts, abandoned]）：_reader_lock 保护。
+        # 取消时 try-acquire 超时跳过、或 terminate 未能确认退出的首帧进程
+        # （批 6-8b 收尾；R3 条目格式 [proc, attempts, abandoned, tracked_at]）：
+        # _reader_lock 保护。
         # cancel_first_frame_warm 的超时跳过依赖解码线程 finally 的 g.close()
         # 杀进程——该保证是条件性的（g.close 异常被吞等病态路径会漏），登记后
         # 由孤儿注册表 sweep（_sweep_unconfirmed_procs）在 owner 释放
         # _ff_proc_lock 后确认/补杀；确认失败保留条目并累计有界重试，达到上限
-        # 告警并标注 abandoned（保留追踪不再重试）——闭合「取消绝不留存活
-        # ffmpeg」的最终保障，绝不静默丢句柄。
+        # 告警并标注 abandoned，其后一轮 sweep 终局处置（记审计日志 + 清出追踪，
+        # 不再钉住 clip）——闭合「取消绝不留存活 ffmpeg」的最终保障，绝不静默
+        # 丢句柄。
         self._unconfirmed_procs: list = []
         self._frame_index = 0
         # 显示帧索引 = 素材源时间线上的 0-based 帧号（reader 打标，丢帧后
@@ -1840,7 +1849,6 @@ class WebMClip(QObject):
         # 圈边界会被残留 gate 直通而跳过驻留（软停自此永久失效、churn 照旧）。
         self._loop_gate.clear()
         self._loop_ack.clear()
-        self._running = True
         self._generation += 1
         gen_id = self._generation
 
@@ -1860,9 +1868,28 @@ class WebMClip(QObject):
                 f'{os.path.basename(str(self.path))}#{gen_id}',
                 self._queue, thread, self._w * self._h * self._bpp,
             )
-        thread.start()
-        if not self._paused:
-            self._timer.start()
+        # 缺陷 19：_running 只在 reader 与播放节拍都真的起来之后才置位。修前它
+        # 早于 thread.start()/_timer.start()，任一步抛错都留下「_running=True 却
+        # 没有 reader/定时器」的 clip，此后每次 start() 都在开头假成功（冻在旧帧）。
+        try:
+            thread.start()
+        except BaseException:
+            # 线程根本没起来（资源不足等）：撤回登记，绝不留「有 _thread 却无 reader」
+            with self._reader_lock:
+                if self._thread is thread:
+                    self._thread = None
+            raise
+        try:
+            if not self._paused:
+                self._timer.start()
+        except BaseException:
+            # 定时器起不来（C++ 侧半销毁）时 reader 已经活着，且真实路径里它
+            # 还会拉起 ffmpeg——绝不能让线程与进程无人消费地留着。走既有硬停
+            # 收口（置停止信号 + 解除阻塞 + terminate + 退役登记 + 孤儿追踪），
+            # _running 保持假，异常照抛给调用方（下次 start() 仍可重试）。
+            self._hard_stop()
+            raise
+        self._running = True
         return True
 
     def pause(self) -> None:
@@ -1873,8 +1900,11 @@ class WebMClip(QObject):
         **不**重启 reader、**不**回第 0 帧（``stop()``/``jumpToFrame(0)`` 都会
         换代并重新拉起 ffmpeg，冷启动 60-166ms，绝不能拿来当暂停用）。
 
-        reader 侧不主动杀进程：消费端停摆后帧队列写满即背压（详见
-        ``_fill_queue`` 的节流语义），恢复无需重新起进程 = 无首帧冷启动。
+        reader 侧走**背压**：``_paused`` 让取帧路径转成阻塞入队（见
+        ``_stamp_source_indices``/``_reader_feed`` 的节流分支），队列写满即
+        reader 停步 → ffmpeg 管道写满自然停解码。改前只有消费端停摆、reader
+        仍走丢帧路径（队列满即丢、源帧号照推）：暂停 = 持续解码 + 持续丢帧，
+        暂停位置丢穿、隐藏期 CPU 白烧。恢复无需重新起进程 = 无首帧冷启动。
         """
         if self._paused:
             return
@@ -2272,25 +2302,33 @@ class WebMClip(QObject):
             # finally 的 g.close()（同锁）互斥，杜绝 GUI 与解码线程并发操作
             # 同一 Popen。有界等待：超时说明解码线程正在收尾，其 g.close() 内部
             # 会 kill 存活进程（imageio finally：poll 判活 → 关管道 → kill），
-            # 且结果已因换代作废。超时跳过不是无条件安全（g.close 异常被吞的
-            # 病态路径会漏）——登记到 _unconfirmed_procs，由孤儿注册表 sweep
-            # 在 owner 释放锁后确认/补杀（_sweep_unconfirmed_procs）。
+            # 且结果已因换代作废。两条「没确认退出」的路径都不是无条件安全
+            # （g.close 异常被吞 / kill 后仍存活）——统一登记到 _unconfirmed_procs，
+            # 由孤儿注册表 sweep 在 owner 释放锁后确认/补杀
+            # （_sweep_unconfirmed_procs）。
             if self._ff_proc_lock.acquire(timeout=_PROC_LOCK_ACQUIRE_TIMEOUT):
                 try:
-                    self._terminate_proc(p)
+                    confirmed = self._terminate_proc(p)
                 finally:
                     self._ff_proc_lock.release()
+                if not confirmed:
+                    # 缺陷 20：拿到锁 != 确认退出。_terminate_proc 返回 False
+                    # （poll/terminate 异常或 kill 后仍存活）时句柄同样必须进
+                    # 未确认追踪（与 try-acquire 超时分支同一落脚点）——绝不因
+                    # "锁拿到了"就把没确认退出的进程当已收口。
+                    self._track_unconfirmed_proc(p)
             else:
                 self._track_unconfirmed_proc(p)
 
     def _track_unconfirmed_proc(self, proc: subprocess.Popen) -> None:
-        """把 try-acquire 超时跳过、未确认退出的首帧进程登记进重试机制
-        （批 6-8b 收尾；R3 条目格式 [proc, attempts, abandoned]）：挂到
-        _unconfirmed_procs 并确保 clip 进入孤儿注册表，sweep 会在 owner
-        释放 _ff_proc_lock 后确认/补杀。确认失败保留条目并累计重试，达到
-        上限告警标注 abandoned（保留追踪不再重试）——绝不静默丢弃句柄。"""
+        """把未确认退出的首帧进程登记进重试机制（批 6-8b 收尾；R3 条目格式
+        [proc, attempts, abandoned, tracked_at]）：挂到 _unconfirmed_procs 并
+        确保 clip 进入孤儿注册表，sweep 会在 owner 释放 _ff_proc_lock 后确认/
+        补杀。确认失败保留条目并累计重试，达到上限告警标注 abandoned，下一轮
+        sweep 终局处置（记审计日志后清出追踪，缺陷 21）——绝不静默丢弃句柄，
+        也不永久钉住 clip。"""
         with self._reader_lock:
-            self._unconfirmed_procs.append([proc, 0, False])
+            self._unconfirmed_procs.append([proc, 0, False, time.monotonic()])
         _register_orphan(self)
 
     def _has_unconfirmed_procs(self) -> bool:
@@ -2308,8 +2346,11 @@ class WebMClip(QObject):
 
         R3（R2 复审 P1 闭合）：确认失败（poll 异常 / terminate+kill 后仍
         存活 / 锁竞争超时）**保留条目**并累计 attempts，绝不一次即丢；达到
-        _UNCONFIRMED_KILL_MAX 记录告警并标注 abandoned（条目保留在追踪中、
-        后续 sweep 不再重试）——不无限静默重试，也不静默丢句柄。
+        _UNCONFIRMED_KILL_MAX 记录告警并标注 abandoned。缺陷 21：abandoned
+        条目在其后的 sweep 做**终局处置**（记审计日志后清出追踪）——进程已
+        terminate/kill 过、确认是"杀不掉"的残留，再留着只会让
+        ``_has_unconfirmed_procs()`` 恒真、clip 永不被 discard（显示槽帧被
+        注册表强引用钉住），且不再产生任何保护。
         """
         with self._reader_lock:
             if not self._unconfirmed_procs:
@@ -2318,37 +2359,56 @@ class WebMClip(QObject):
             self._unconfirmed_procs.clear()
         still: list = []
         for entry in pending:
-            proc, attempts, abandoned = entry
+            proc = entry[0]
+            attempts = entry[1]
+            abandoned = entry[2]
+            since = float(entry[3]) if len(entry) > 3 else 0.0
             if abandoned:
-                still.append(entry)  # 已标注放弃：保留追踪，不再重试
+                self._dispose_abandoned_proc(proc, since)
                 continue
             if not self._ff_proc_lock.acquire(timeout=_PROC_LOCK_ACQUIRE_TIMEOUT):
-                self._bump_unconfirmed(proc, attempts, still)
+                self._bump_unconfirmed(proc, attempts, still, since)
                 continue
             try:
                 confirmed = WebMClip._terminate_proc(proc)
             finally:
                 self._ff_proc_lock.release()
             if not confirmed:
-                self._bump_unconfirmed(proc, attempts, still)
+                self._bump_unconfirmed(proc, attempts, still, since)
         if still:
             with self._reader_lock:
                 self._unconfirmed_procs.extend(still)
 
+    def _dispose_abandoned_proc(self, proc: subprocess.Popen, since: float) -> None:
+        """abandoned 条目的终局处置（缺陷 21）：清出追踪 + 一条审计日志。
+
+        条目走完 _UNCONFIRMED_KILL_MAX 轮补杀仍未确认退出（进程已被
+        terminate+kill 过），属"杀不掉"的残留。审计日志记下 clip 路径与句柄
+        追踪时长，供售后按残留 pid 回查；之后放手——句柄已无任何可操作的
+        收口手段，留在追踪里只会永久钉住 clip。``since`` 为 0（测试/历史形态
+        的三元素条目）时时长按 0 记。
+        """
+        tracked_s = max(0.0, time.monotonic() - since) if since > 0 else 0.0
+        logger.warning(
+            '首帧进程终局处置（确认杀不掉，清出追踪、不再钉住 clip）: '
+            'clip=%s pid=%s 追踪时长=%.1fs',
+            self.path, getattr(proc, 'pid', '?'), tracked_s,
+        )
+
     def _bump_unconfirmed(self, proc: subprocess.Popen, attempts: int,
-                          still: list) -> None:
+                          still: list, since: float = 0.0) -> None:
         """未确认退出的一次重试记账（R3）：递增 attempts；达到上限告警并
-        标注 abandoned（条目保留在追踪中、不再重试），否则保留待下次 sweep
+        标注 abandoned（下一轮 sweep 终局处置），否则保留待下次 sweep
         重试——绝不静默丢弃句柄。"""
         attempts += 1
         if attempts >= _UNCONFIRMED_KILL_MAX:
             logger.warning(
-                '首帧进程取消后未确认退出，标注放弃（保留追踪不再重试）: pid=%s',
+                '首帧进程取消后未确认退出，标注放弃（下一轮 sweep 终局处置）: pid=%s',
                 getattr(proc, 'pid', '?'),
             )
-            still.append([proc, attempts, True])
+            still.append([proc, attempts, True, since])
         else:
-            still.append([proc, attempts, False])
+            still.append([proc, attempts, False, since])
 
     # ------------------------------------------------------------ reader
     def _reader(self, stop_evt: threading.Event, generation: int,
@@ -2358,10 +2418,11 @@ class WebMClip(QObject):
         - ``_feed_source`` 为 None（默认/灰度关）：逐位走 ``_reader_local``，
           与历史行为零差异；
         - ``_feed_source`` 已置（消费端，facade 在 start() 前设置）：经
-          FanoutFeed 立即就绪（ready 恒 True），从订阅环取帧入队（沿用本地
-          同款有界 put/丢帧契约）；断流/超时/中止 → **同一 reader 线程内**回退
-          本地 ffmpeg 解码（帧 0 起播，重入 _reader_local 的拉起序列——
-          capture/登记/兜底全复用，绝不复刻一个绕过追踪的新拉起，P1-1）。
+          FanoutFeed 立即就绪（ready 恒 True），从订阅环取帧入队（本地同款
+          有界 put/丢帧契约，节流/暂停期转阻塞背压）；断流/超时/中止 →
+          **同一 reader 线程内**回退本地 ffmpeg 解码（帧 0 起播，重入
+          _reader_local 的拉起序列——capture/登记/兜底全复用，绝不复刻一个
+          绕过追踪的新拉起，P1-1）。
         """
         # 批 6-8b：线程启动前已被 stop/换代的 reader 零成本退出——绝不拉起
         # 任何 ffmpeg 进程（省掉「拉起→_register 发现 stale→自终止」的浪费
@@ -2512,7 +2573,11 @@ class WebMClip(QObject):
                 gen,
                 q,
                 lambda: stop_evt.is_set() or self._generation != generation,
-                throttled=lambda: self._decode_throttle_divisor > 1,
+                # 节流（闲置降帧）或**暂停**（隐藏/挂起）：暂停期消费端不取帧，
+                # 队列写满必须转成背压阻塞而不是丢帧——否则暂停 = 队列持续满 =
+                # reader 持续解码持续丢帧，暂停位置丢失、隐藏期 CPU 白烧
+                # （见 pause() 的承诺与 _stamp_source_indices 的 throttled 语义）。
+                throttled=lambda: self._decode_throttle_divisor > 1 or self._paused,
                 # 共享解码：发布镜像（发布端播放时置 _publish_sink）。
                 # reader 只做每帧回调（逐帧读当前 sink——续圈后 facade 重建
                 # 会话换 sink，不换 reader/进程仍发布到新会话）；节拍/收尾由
@@ -2593,8 +2658,9 @@ class WebMClip(QObject):
         本地解码（feed 就绪前超时/断流/中止——测试桩驱动该等待路径）。
 
         只在该 WebMClip 以消费端身份、facade 在 start() 前设置了
-        ``_feed_source`` 时进入。feed 等待/读取期间不持有任何锁；有界 put
-        沿用本地同款丢帧契约（队列满丢帧、源帧号照常推进）。
+        ``_feed_source`` 时进入。feed 等待/读取期间不持有任何锁；入队沿用本地
+        同款契约——队列满即丢帧、源帧号照常推进，**节流/暂停期例外**（转阻塞
+        背压，见下方分支：暂停期丢帧会把暂停位置丢穿）。
         """
         # 1) feed-pending：有界等待 feed 就绪（reader 线程内，≤SUBSCRIBE_BUDGET_MS）
         budget_ms = getattr(feed, 'budget_ms', None) or _SUBSCRIBE_BUDGET_MS
@@ -2632,12 +2698,32 @@ class WebMClip(QObject):
                 # 'stop_all'|'watchdog'）；兼容外部 feed 会话（测试桩）只返回 3 元组。
                 reason = result[3] if len(result) > 3 else None
                 if kind == 'frame':
-                    try:
-                        q.put((data, src), timeout=0.2)
-                    except queue.Full:
-                        if perfstats.ENABLED:
-                            perfstats.note('webm.queue_drop')
-                        pass  # 队列满丢帧：源帧号照常推进（本地同款契约）
+                    if self._decode_throttle_divisor > 1 or self._paused:
+                        # 节流/暂停：阻塞入队（背压），不丢帧、不虚推进——与
+                        # _stamp_source_indices 的节流分支同款语义（暂停期消费端
+                        # 不取帧，丢帧路径会把暂停位置丢穿）。停止/换代判定夹在
+                        # 每次重试之间，阻塞中的 reader 照样能及时退出。
+                        while not (stop_evt.is_set()
+                                   or self._generation != generation):
+                            try:
+                                q.put((data, src), timeout=0.2)
+                                break
+                            except queue.Full:
+                                continue
+                        # 阻塞期间不调 poll，看门狗（无帧无 end 超预算即 abort）
+                        # 会把"暂停"误判成源断流：放行后一到 poll 就落回本地
+                        # ffmpeg 帧 0 起播（暂停语义被破坏）。这里按"消费端仍
+                        # 在、只是被背压按住"重置一次计时（与 poll 每帧重置同源）。
+                        reset_stall = getattr(feed_session, 'reset_stall', None)
+                        if callable(reset_stall):
+                            reset_stall()
+                    else:
+                        try:
+                            q.put((data, src), timeout=0.2)
+                        except queue.Full:
+                            if perfstats.ENABLED:
+                                perfstats.note('webm.queue_drop')
+                            pass  # 队列满丢帧：源帧号照常推进（本地同款契约）
                 elif kind == 'end':
                     # 源帧号回绕合成 end：结束标记 → finished
                     self._put_end_marker(q, stop_evt, generation)
@@ -2833,13 +2919,14 @@ class WebMClip(QObject):
         （消费计数在丢帧后不再等于源帧号，绝不能用作降帧相位/末帧判断）。
 
         throttled（批11）：可调用对象，每次入队前求值；返回 True 表示当前
-        解码节流生效（闲置降帧激活）。节流路径 reader **绝不超时丢帧**，
-        而是按目标呈现节奏阻塞：q.put 有界重试同一帧直到成功或收到停止
-        信号——队列写满即 reader 停步、ffmpeg 的 stdout 管道写满、解码进程
-        阻塞在 write()，解码速率随消费端联动下降到目标节奏（≈原始帧率/
-        ratio）。停止检查夹在每次重试之间（有界，_reader 的 finally 仍保证
-        杀进程与 gen.close()，绝不让 reader 永久空转）。节流时源帧号只在
-        入队成功后推进——被阻塞重试的帧绝不丢失、绝不虚占时间线槽位。
+        解码节流生效（闲置降帧激活，或播放已被 pause 暂停）。节流路径 reader
+        **绝不超时丢帧**，而是按目标呈现节奏阻塞：q.put 有界重试同一帧直到成功
+        或收到停止信号——队列写满即 reader 停步、ffmpeg 的 stdout 管道写满、
+        解码进程阻塞在 write()，解码速率随消费端联动下降到目标节奏（≈原始帧率/
+        ratio；暂停期消费端完全不取帧，解码随之完全停步）。停止检查夹在每次
+        重试之间（有界，_reader 的 finally 仍保证杀进程与 gen.close()，绝不让
+        reader 永久空转）。节流时源帧号只在入队成功后推进——被阻塞重试的帧
+        绝不丢失、绝不虚占时间线槽位。
         throttled=None（默认）＝永不节流：与历史行为逐位一致（超时丢帧）。
 
         on_frame（共享解码）：可选回调 on_frame(frame_bytes, src_idx)，

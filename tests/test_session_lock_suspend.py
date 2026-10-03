@@ -356,3 +356,167 @@ def test_shell_suspend_callback_swallows_errors(tmp_path):
         shell.driver = None
         shell.overlay.close()
         shell._delete_runtime_marker()
+
+
+# ---------------------------------------------------------------- 缺陷 12：安装契约
+def _real_app():
+    """真实 QApplication：安装契约必须走真 Qt 类型检查，替身测不出 TypeError。"""
+    from PySide6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])
+
+
+def test_watcher_satisfies_qt_native_filter_contract():
+    """SessionWatcher 必须是 QAbstractNativeEventFilter，而不是普通 QObject。
+
+    缺陷 12：类只继承 QObject 时 ``installNativeEventFilter(self)`` 直接
+    TypeError（本机探针：'called with wrong argument types ... Supported
+    signatures: installNativeEventFilter(filterObj: QAbstractNativeEventFilter)'），
+    异常被 install() 的宽 except 吞掉后仍置 ``_installed=True`` 报成功——WTS
+    注册成功也收不到 ``WM_WTSSESSION_CHANGE``，锁屏/挂起降载在生产从未生效。
+    """
+    from PySide6.QtCore import QAbstractNativeEventFilter
+
+    watcher = sw_mod.SessionWatcher(app=None, on_session_end=lambda: None,
+                                    install_native_filter=False)
+    assert isinstance(watcher, QAbstractNativeEventFilter), \
+        "Qt 只接受 QAbstractNativeEventFilter（普通 QObject 会被拒）"
+    assert watcher._installed is False, "未安装（app=None）时不得谎报已安装"
+
+
+def test_install_really_hands_the_filter_to_qapplication():
+    """install() 必须真把 self 交给 QApplication——不是吞掉异常后的假成功。"""
+    from PySide6.QtWidgets import QApplication
+
+    application = _real_app()
+    seen: list = []
+    real = QApplication.installNativeEventFilter
+    QApplication.installNativeEventFilter = (
+        lambda self, obj: (seen.append(obj), real(self, obj))[1])
+    watcher = sw_mod.SessionWatcher(app=application, on_session_end=lambda: None)
+    try:
+        assert watcher.install() is True
+        assert seen == [watcher], "安装调用必须真的落到 QApplication 上"
+        assert watcher._installed is True
+        assert watcher.install() is True          # 幂等
+        assert len(seen) == 1
+    finally:
+        del QApplication.installNativeEventFilter
+        application.removeNativeEventFilter(watcher)
+
+
+def test_uninstall_detaches_filter_and_is_idempotent():
+    """收口时必须能摘掉原生过滤器（Qt 只存裸指针，不给它留悬垂对象）。"""
+    from PySide6.QtWidgets import QApplication
+
+    application = _real_app()
+    watcher = sw_mod.SessionWatcher(app=application, on_session_end=lambda: None)
+    assert watcher.install() is True
+
+    assert watcher.uninstall() is True
+    assert watcher._installed is False
+    assert watcher.uninstall() is False       # 幂等
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="原生过滤器只在 Windows 上安装（install() 的平台闸门）")
+def test_install_failure_is_loud_and_never_reports_success(caplog):
+    """装了但没装上：warning 留痕 + ``_installed`` 保持 False（绝不谎报成功）。"""
+    class _RejectingApp(_FakeApp):
+        def installNativeEventFilter(self, watcher):
+            raise RuntimeError("Qt 拒绝该过滤器")
+
+    fake_app = _RejectingApp()
+    watcher = sw_mod.SessionWatcher(app=fake_app, on_session_end=lambda: None)
+    try:
+        with caplog.at_level(logging.WARNING, logger="pet.session_watcher"):
+            assert watcher.install() is False
+        assert watcher._installed is False, "装失败不得置成功位（否则再没人重试/排查）"
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), \
+            "失败必须 warning 级留痕（线上日志从无锁屏降载记录，正是静默 debug 的代价）"
+        assert watcher._signals_connected is True, "降级路径仍须保留 Qt 会话信号兜底"
+    finally:
+        fake_app.deleteLater()
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="原生过滤器只在 Windows 上安装（install() 的平台闸门）")
+def test_install_degrades_on_app_without_native_filter_api(caplog):
+    """替身 app 没有 installNativeEventFilter：降级、留痕、不报成功（桩路径不红）。"""
+    fake_app = _FakeApp()
+    watcher = sw_mod.SessionWatcher(app=fake_app, on_session_end=lambda: None)
+    try:
+        with caplog.at_level(logging.WARNING, logger="pet.session_watcher"):
+            assert watcher.install() is False
+        assert watcher._installed is False
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert watcher._signals_connected is True
+    finally:
+        fake_app.deleteLater()
+
+
+def test_native_filter_accepts_shiboken_voidptr_message():
+    """真实传参形态：PySide6 6.x 给的是 ``shiboken6.VoidPtr``，不是 int。
+
+    只认 int 的实现在真机上一条消息都解不出来（本机探针：``windows_generic_MSG``
+    路径的 message 是 ``VoidPtr(0x...)``）——锁屏消息收得到也判不出来，锁屏
+    降载同样不生效。VoidPtr 与 int 地址必须一视同仁。
+    """
+    import shiboken6
+
+    fake_app = _FakeApp()
+    events: list = []
+    watcher = sw_mod.SessionWatcher(app=fake_app, on_session_end=lambda: None,
+                                    install_native_filter=False,
+                                    on_suspend_change=(
+                                        lambda active, reason:
+                                        events.append((active, reason))))
+    try:
+        addr, keepalive = _msg_pointer(sw_mod.WM_WTSSESSION_CHANGE,
+                                       sw_mod.WTS_SESSION_LOCK)
+        assert watcher.nativeEventFilter(0, shiboken6.VoidPtr(addr)) == (False, 0)
+        addr2, keepalive2 = _msg_pointer(sw_mod.WM_QUERYENDSESSION)
+        watcher.nativeEventFilter(0, shiboken6.VoidPtr(addr2))
+        assert events == [(True, "session_lock")]
+        assert watcher.armed is True, "VoidPtr 形态的关机消息同样必须置位"
+    finally:
+        fake_app.deleteLater()
+        assert keepalive is not None and keepalive2 is not None
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="PostThreadMessageW 与原生事件过滤器都是 Windows 专有")
+def test_real_native_lock_message_reaches_the_callback():
+    """真投递一条 ``WM_WTSSESSION_CHANGE``：完整原生链必须把锁屏回调打出来。
+
+    上一条用例只锁"装得上/类型对"，这条证明**收得到**——真
+    ``PostThreadMessageW`` + 真事件循环走完 Qt 的 ``QAbstractEventDispatcher``
+    → 原生过滤器 → MSG 解析 → 回调的整条链（含 PySide6 的真实传参形态
+    VoidPtr）。投递到线程消息队列而不是某个 HWND，因此不依赖 QPA 平台：
+    offscreen 下同样成立（offscreen 仍用 ``QEventDispatcherWin32``，实测同一条
+    消息只会派发一次）。
+    """
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance() or QApplication([])
+    events: list = []
+    watcher = sw_mod.SessionWatcher(app=application, on_session_end=lambda: None,
+                                    on_suspend_change=(
+                                        lambda active, reason:
+                                        events.append((active, reason))))
+    try:
+        assert watcher.install() is True
+        posted = ctypes.windll.user32.PostThreadMessageW(
+            ctypes.windll.kernel32.GetCurrentThreadId(),
+            sw_mod.WM_WTSSESSION_CHANGE, sw_mod.WTS_SESSION_LOCK, 0)
+        assert posted != 0, "前提：消息确实投进了本线程的队列"
+        # 事件同步：泵消息直到回调到达，宽预算兜住慢 runner（不猜时序）
+        deadline = time.monotonic() + 10.0
+        while not events and time.monotonic() < deadline:
+            application.processEvents()
+            time.sleep(0.01)
+        assert events == [(True, "session_lock")]
+    finally:
+        watcher.uninstall()

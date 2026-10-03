@@ -492,3 +492,147 @@ def test_pet_collision_disabled_keeps_static_member_contact():
     # 口径同 test_static_member_bounces_with_trampoline_restitution：1.3 加速弹开
     assert a.velocity.x() == -650.0
     assert [event.pair for event in events] == ["a|island"]
+
+
+# ---------------------------------------------------------------- 累计分离写回（D9）
+def _overlap_between(world, first, second) -> float:
+    """两 sprite 当前成员快照的实际重叠深度（真值取自世界自己的取数口径）。"""
+    hit, _nx, _ny, overlap, _cx, _cy = collision.check_collision_members(
+        world._member_from_sprite(first), world._member_from_sprite(second))
+    return overlap if hit else 0.0
+
+
+def test_tick_writes_back_solver_cumulative_separation():
+    """一轮 tick 的位移 = 求解器**累计**分离量，不是末轮迭代增量。
+
+    旧口径逐 pair 按 ImpulseResult.dx_a/dx_b 写回，而那两个字段只记最后一轮
+    的分配：20px 静止重叠四轮迭代每只该移 9.626px，实际只写回 0.5px，97% 的
+    分离量被丢到下一 tick（与连续重叠记账/去抖互相打架）。
+    """
+    world = SpriteCollisionWorld()
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(80, 0, collision_id="b")      # 静止重叠 20px，vn=0 → j=0
+    members = [world._member_from_sprite(s) for s in (a, b)]
+    impulses, combined, _history = collision.solve_multi_body_collision(
+        members, tick=1)
+
+    assert impulses[0].dx_a > -1.0               # 前提：末轮只有 -0.5（旧写回量）
+    assert combined["a"][2] < -5.0               # 前提：累计量是它的十几倍
+
+    world.tick([a, b], 0.016)
+
+    assert abs(a.pos.x() - (0.0 + combined["a"][2])) < 1e-9
+    assert abs(b.pos.x() - (80.0 + combined["b"][2])) < 1e-9
+
+
+def test_multi_iteration_separation_is_not_deferred_to_next_tick():
+    """小重叠一轮解完：tick 后只剩求解器自己的 slop，下一 tick 无事可做。
+
+    关掉去抖只看分离推进：3px 重叠两轮迭代累计 2.5px（每只 1.25px）一轮到位，
+    残余 0.5px = 求解器 slop；旧口径只写回末轮 0.5px，残余 2.5px 留给下一 tick
+    继续推（跨 tick 接力）。
+    """
+    world = SpriteCollisionWorld(separation_debounce_secs=0.0)
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(97, 0, collision_id="b")      # 静止重叠 3px
+
+    world.tick([a, b], 0.016)
+    ax1 = a.pos.x()
+    assert _overlap_between(world, a, b) <= 0.5  # 只剩 slop 量级的残差
+
+    world.tick([a, b], 0.016)                    # 残量在 slop 内：不再分离
+    assert a.pos.x() == ax1
+
+
+def test_writeback_aggregates_every_pair_once_per_sprite():
+    """三体同帧：每只 sprite 只写回一次，位移 = 它在所有 pair 上的累计之和。"""
+    world = SpriteCollisionWorld()
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(70, 0, collision_id="b")
+    c = FakeSprite(140, 0, collision_id="c")     # a|b、b|c 各重叠 30px
+    members = [world._member_from_sprite(s) for s in (a, b, c)]
+    _impulses, combined, _history = collision.solve_multi_body_collision(
+        members, tick=1)
+
+    assert combined["a"][2] < -5.0               # 前提：累计量远大于末轮（3.675）
+
+    world.tick([a, b, c], 0.016)
+
+    assert abs(a.pos.x() - (0.0 + combined["a"][2])) < 1e-9
+    assert abs(b.pos.x() - (70.0 + combined["b"][2])) < 1e-9
+    assert abs(c.pos.x() - (140.0 + combined["c"][2])) < 1e-9
+
+
+def test_debounced_pair_does_not_ride_another_pairs_writeback():
+    """去抖抑制按 pair 生效：被抑制的 pair 不许搭别的 pair 的写回一起落地。
+
+    a|b 静止贴贴已进窗口（去抖抑制它的位移），同帧 d 撞上 a（有冲量 + 位移）：
+    a 的位移必须只等于 a|d 那一对的累计。按 combined 整块写回会把 a|b 的 0.5px
+    也带出来，窗口形同虚设。
+    """
+    clock = FakeClock()
+    world = SpriteCollisionWorld(clock=clock)
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(80, 0, collision_id="b")
+    world.tick([a, b], 0.016)                    # 首次分离 + 记入去抖表
+    assert "a|b" in world._position_only_at
+    ax1, ay1 = a.pos.x(), a.pos.y()
+
+    d = FakeSprite(0, -60, vy=300.0, collision_id="d")   # 压向 a（b 够不着）
+    members = [world._member_from_sprite(s) for s in (a, b, d)]
+    impulses, combined, _history = collision.solve_multi_body_collision(
+        members, tick=2, overlap_history=world._overlap_history)
+    pair_deltas = {r.pair: r for r in impulses}
+    suppressed = pair_deltas["a|b"]
+    assert suppressed.sep_dx_a != 0.0            # 前提：被抑制的 pair 确实带位移
+    assert pair_deltas["a|d"].sep_dx_a != 0.0
+
+    world.tick([a, b, d], 0.016)
+
+    kept_dx = combined["a"][2] - suppressed.sep_dx_a
+    kept_dy = combined["a"][3] - suppressed.sep_dy_a
+    assert abs(kept_dx - combined["a"][2]) > 0.1  # 前提：抑制量非零且可分辨
+    assert abs(a.pos.x() - (ax1 + kept_dx)) < 1e-9
+    assert abs(a.pos.y() - (ay1 + kept_dy)) < 1e-9
+
+
+# ---------------------------------------------------------------- 逐只隐藏（D10）
+def test_hidden_sprite_is_not_a_collider():
+    """隐藏的 sprite 退出碰撞世界：不产生结果、不推动可见成员。
+
+    旧行为：隐藏宠仍是可见碰撞体——隐形障碍墙推开/撞飞可见宠、触发碰撞反馈。
+    """
+    world = SpriteCollisionWorld()
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(80, 0, vx=-500.0, collision_id="b")
+    b.visible = False                     # 鸭子类型判据同 overlay_window.sprite_at
+
+    assert world.tick([a, b], 0.016) == []
+    assert a.pos.x() == 0.0 and a.pos.y() == 0.0
+    assert a.velocity.x() == 0.0          # 不给速度
+    assert a.interaction_state == INTERACTION_NORMAL   # 也不触发真撞击抛掷
+
+    b.visible = True                      # 恢复可见：碰撞干净回归
+    results = world.tick([a, b], 0.016)
+    assert [r.pair for r in results] == ["a|b"]
+    assert a.velocity.x() < 0.0           # 被撞飞
+
+
+def test_debounce_entry_dropped_when_member_leaves_collision_world():
+    """成员离场即清掉它的去抖条目：重新可见后第一次分离不被旧窗口抑制。"""
+    clock = FakeClock()
+    world = SpriteCollisionWorld(clock=clock)
+    a = FakeSprite(0, 0, collision_id="a")
+    b = FakeSprite(80, 0, collision_id="b")
+    world.tick([a, b], 0.016)
+    assert "a|b" in world._position_only_at        # 已记入去抖表（窗口内不再推）
+
+    b.visible = False
+    world.tick([a, b], 0.016)
+    assert "a|b" not in world._position_only_at    # 离场不留号
+
+    b.visible = True
+    a.set_pos(FakePoint(0, 0))                     # 重叠复原 = 另起一段接触
+    b.set_pos(FakePoint(80, 0))
+    world.tick([a, b], 0.016)
+    assert a.pos.x() < -1.0                        # 分离立即生效（没被旧条目抑制）

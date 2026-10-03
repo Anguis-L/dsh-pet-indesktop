@@ -3888,6 +3888,39 @@ class TestSessionNameTruthfulness:
         mgr._show_model_access_alert("session-abcdef12", 1)
         assert "sessionName" not in captured, "模型访问失败提醒无会话元数据时不得注入 sessionName"
 
+    def test_session_meta_cache_is_bounded(self, tmp_path):
+        """缺陷 23：会话元数据缓存必须有界（FIFO 淘汰最老条目）。
+
+        key 是外部会话 ID，常驻数周按会话数单调增长（此前没有任何删除路径）；
+        同项目其它缓存都有界（webm_clip 首帧共享表 20000 / sound_winmm 池 8）。
+        """
+        mgr = self._make(tmp_path)
+        limit = type(mgr)._SESSION_CACHE_MAX
+        for i in range(limit + 8):
+            mgr._on_session_meta(
+                "dsh", {"sessionId": f"s-{i:04d}", "sessionName": f"会话{i}"})
+
+        cache = mgr._session_meta_cache
+        assert len(cache) == limit, "元数据缓存必须封顶"
+        assert "s-0000" not in cache and "s-0007" not in cache, "最老条目必须被淘汰"
+        newest = f"s-{limit + 7:04d}"
+        assert newest in cache, "近期条目必须保留"
+        # 读路径行为不变：命中的元数据照常解析
+        assert mgr.get_session_display_name(newest) == f"会话{limit + 7}"
+        assert mgr._session_name_or_empty(newest) == f"会话{limit + 7}"
+
+    def test_exploration_names_cache_is_bounded(self, tmp_path):
+        """缺陷 23：探索会话显示名缓存同一 FIFO 口径（同样只增不减）。"""
+        mgr = self._make(tmp_path)
+        limit = type(mgr)._SESSION_CACHE_MAX
+        for i in range(limit + 8):
+            mgr._exploration_name({}, f"k-{i:04d}")
+
+        names = mgr._exploration_names
+        assert len(names) == limit, "探索显示名缓存必须封顶"
+        assert "k-0000" not in names, "最老条目必须被淘汰"
+        assert names[f"k-{limit + 7:04d}"] == "DSH", "近期条目必须保留且值不变"
+
 
 class TestInstallFinishedGuard:
     """安装后台线程完成回调不得越过 manager 生命周期：窗口关闭/角色切换

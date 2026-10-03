@@ -419,3 +419,80 @@ def test_main_exit_without_spawned_pets_quits_app(tmp_path):
     assert quits == [1]                                   # 最后一窗 → 全部退出
     assert ovs.load_active_slots(tmp_path / APP_DIR_NAME) == []
 
+
+# ---------------------------------------------------------------- 新 sprite 的播放节拍初始化
+def test_spawn_while_window_hidden_starts_paused(tmp_path):
+    """隐藏期生成子宠：新 sprite 的播放节拍必须立刻压住。
+
+    ``PetSprite.__init__`` 默认未暂停，spawn 后随行为链一起起播就按帧率解码
+    ——而窗口根本没有像素要上屏（O3 契约）。``visible`` 照旧为真：它逻辑上
+    仍是可见宠物，只是窗口不可见。
+    """
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        assert shell.overlay.isVisible() is False
+        shell.spawn_pet()
+
+        spawned = shell._spawned[0]
+        assert spawned.visible is True
+        assert spawned.clip_paused is True
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_spawn_while_window_shown_keeps_playback_pace(tmp_path):
+    """显示期生成子宠不受影响：新 sprite 照常按播放节拍走（防过度收紧）。"""
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        shell.overlay.show()
+        shell.spawn_pet()
+
+        assert shell._spawned[0].clip_paused is False
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_hidden_spawned_pet_resumes_when_window_shows(tmp_path):
+    """隐藏期压住的播放节拍在窗口恢复显示时补放行（否则那只宠永久冻在首帧）。"""
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        shell.spawn_pet()
+        spawned = shell._spawned[0]
+        assert spawned.clip_paused is True
+
+        shell.set_pet_visible(True)                       # 产品显示路径
+
+        assert spawned.clip_paused is False
+    finally:
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+
+
+def test_revived_pets_resume_playback_pace_when_shell_starts(tmp_path):
+    """启动复活（窗口尚未 show）→ start() 显示后必须补放行。
+
+    复活发生在构造期，那时窗口还没显示，新 sprite 一律被压成暂停；没有
+    ``start()`` 的对称收口，启动复活的子宠会永久冻在首帧。
+    """
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    ovs.save_active_slots(config_dir, [1])
+    (config_dir / "config-slot-1.json").write_text(
+        json.dumps({"version": 4, "rx": 0.3, "ry": 0.3, "scale": 0.5}),
+        encoding="utf-8")
+
+    shell, _ = _make_persistent_shell(tmp_path)
+    try:
+        revived = shell._spawned[0]
+        assert revived.clip_paused is True, "窗口未显示：复活即压住播放节拍"
+
+        shell.start()                                     # 显示（产品启动路径）
+
+        assert shell.overlay.isVisible() is True
+        assert revived.clip_paused is False
+    finally:
+        shell.stop()
+        shell.overlay.close()
+        shell._delete_runtime_marker()
+

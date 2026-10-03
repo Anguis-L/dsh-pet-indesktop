@@ -607,18 +607,29 @@ class OverlayWindow(QWidget):
             cb(self.mouse_through)
 
     def sprite_at(self, local_pos: QPoint | QPointF):
-        """逐像素联合命中：z-order 顶层往下，矩形粗筛 + alpha 细判。
+        """逐像素联合命中：z-order 顶层往下，绘制外接矩形粗筛 + alpha 细判。
 
         参数为 overlay 局部坐标（Phase 1a 单屏：= 屏幕物理坐标 - overlay
         原点）。Windows 穿透轮询与鼠标路由共用此判据。
+
+        粗筛用 ``paint_bounds()`` 而非 ``rect()``：45° 探头 / 黄金回旋式的
+        抛掷旋转会把可见像素画到帧绘制矩形之外，只用 ``rect()`` 粗筛会在细判
+        之前把它们排除（"画在哪点不到哪"）。无旋转时 paint_bounds() 恒等于
+        rect()（pet_sprite.paint_bounds），该路径无额外计算。
         """
         x, y = int(local_pos.x()), int(local_pos.y())
         for sprite in reversed(self.sprites):
             if not getattr(sprite, "visible", True):
                 continue  # M14：隐藏 sprite 不参与逐像素命中（穿透判据同源）
-            rect = sprite.rect()
-            if not rect.contains(x, y):
+            # 鸭式 sprite（测试假对象）没有 paint_bounds：回退 rect()（无旋转时
+            # 两者等值，见 pet_sprite.paint_bounds）
+            bounds = (sprite.paint_bounds() if hasattr(sprite, "paint_bounds")
+                      else sprite.rect())
+            if not bounds.contains(x, y):
                 continue
+            # 细判仍在帧绘制矩形原点坐标系：alpha_at 的逆旋转以帧绘制矩形
+            # （与 paint_bounds 同心）为轴、命中图也按它采样，故换算原点不变。
+            rect = sprite.rect()
             if sprite.alpha_at(QPoint(x - rect.x(), y - rect.y())) >= ALPHA_HIT_THRESHOLD:
                 return sprite
         return None

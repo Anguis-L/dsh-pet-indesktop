@@ -619,6 +619,60 @@ def test_set_suspended_is_idempotent():
     assert sprite.resume_calls == 1
 
 
+class ExplodingClipSprite(PausableSprite):
+    """播放节拍接口抛错的 sprite（半销毁 clip：``timer.stop()`` 打到已删对象）。
+
+    ``explode_on`` = "pause"/"resume"：只有那一侧抛错，另一侧照常计数。
+    """
+
+    def __init__(self, explode_on="pause", **kwargs):
+        super().__init__(**kwargs)
+        self._explode_on = explode_on
+
+    def pause_clip(self):
+        if self._explode_on == "pause":
+            raise RuntimeError("clip 已半销毁")
+        super().pause_clip()
+
+    def resume_clip(self):
+        if self._explode_on == "resume":
+            raise RuntimeError("clip 已半销毁")
+        super().resume_clip()
+
+
+def test_set_suspended_pauses_every_sprite_despite_one_error():
+    """逐只容错：一只 ``pause_clip`` 抛错不得中断整轮。
+
+    幂等守卫（``_suspended`` 已置真）意味着这一轮是**唯一**机会：中断后剩下的
+    sprite 会带着在跑的定时器过完整个锁屏（挂起期整夜按帧率解码），而再次
+    ``set_suspended(True)`` 直接早退，永远不会补做。
+    """
+    clock = FakeClock()
+    first, broken, last = PausableSprite(), ExplodingClipSprite("pause"), PausableSprite()
+    driver, _overlay = _pause_driver_with(clock, [first, broken, last])
+
+    driver.set_suspended(True)
+
+    assert first.pause_calls == 1
+    assert last.pause_calls == 1, "后面那只必须照常停表"
+    assert driver.suspended is True
+    assert driver.applied_tier == TIER_OCCLUDED
+
+
+def test_set_suspended_resumes_every_sprite_despite_one_error():
+    """恢复侧同款容错：一只 ``resume_clip`` 抛错不得让其余 sprite 永久停摆。"""
+    clock = FakeClock()
+    first, broken, last = PausableSprite(), ExplodingClipSprite("resume"), PausableSprite()
+    driver, _overlay = _pause_driver_with(clock, [first, broken, last])
+
+    driver.set_suspended(True)
+    driver.set_suspended(False)
+
+    assert first.resume_calls == 1
+    assert last.resume_calls == 1, "后面那只必须照常续播"
+    assert driver.suspended is False
+
+
 def test_user_input_self_heals_stuck_suspend():
     """解锁消息丢失：用户点到桌宠即解除挂起（否则会钉在 T3 + 停播到下次显隐）。"""
     clock = FakeClock()

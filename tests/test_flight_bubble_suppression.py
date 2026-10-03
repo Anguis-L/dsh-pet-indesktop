@@ -421,3 +421,49 @@ def test_flight_warm_skipped_when_no_idle_clips(tmp_path, monkeypatch):
 
     assert executor.batches == []
     assert controller._states[sprite].warm_landing_submitted is False
+
+
+class _GatedLibrary:
+    """带库级预热闸门的假库：``warm_allowed()`` 可切，其余面直通 inner。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.allowed = True
+
+    def warm_allowed(self):
+        return self.allowed
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+
+def test_flight_warm_respects_library_gate(tmp_path, monkeypatch):
+    """起飞落地预热必须过库级闸门（设置页关预热 / 隐藏暂停）：零提交，且不占位。
+
+    这条路径直提 ``_WARM_EXECUTOR``，不经过库的 ``warm_predicted``——不查闸门
+    就等于"关闭后台动画预热"的设置对该路径无效。占位（pin + 去重标记）同样要
+    留在闸门之后：被一次空跑吃掉标记，开闸后的下一次起飞照样不预热。
+    """
+    executor = _RecordingExecutor()
+    monkeypatch.setattr(sprite_behavior_mod, "_WARM_EXECUTOR", executor)
+    lib = _GatedLibrary(_warm_library())
+    sprite = beh._make_sprite(lib)
+    controller = BehaviorController(beh.BOUNDS, rng=beh.ScriptedRng(rolls=(0.99,)))
+    controller.predict_enabled = False
+
+    controller.tick([sprite], DT)                 # 先接管进待机
+    lib.allowed = False
+    sprite.interaction_state = INTERACTION_THROWN
+    controller.tick([sprite], DT)                 # 起飞边沿（闸门关）
+
+    state = controller._states[sprite]
+    assert controller.state_of(sprite) == STATE_THROWN
+    assert executor.batches == [], "库级闸门关闭时落地预热不得提交"
+    assert state.warm_landing_submitted is False, "闸门关闭不得占位去重标记"
+    assert state.landing_pinned == [], "闸门关闭不得打飞行期 pin"
+
+    lib.allowed = True
+    controller._enter_thrown(sprite, state)       # 开闸：本次飞行照旧整批提交
+    assert len(executor.batches) == 1
+    _fn, args, _kwargs = executor.batches[0]
+    assert set(args[0]) == {lib.movie(name) for name in lib.idles}

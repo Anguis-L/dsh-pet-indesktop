@@ -11,6 +11,8 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
 
 保留：
 - 拖拽中的 sprite 视为无限质量（撞得动别人，自己不动；FLAG_DRAGGING 语义）；
+- 隐藏（``visible`` 为假）的 sprite 整只退出成员快照（判据与 overlay 逐像素
+  命中同源），不作隐形障碍物；
 - 静态成员（FLAG_STATIC 语义，为灵动岛预留）无限质量 + STATIC_RESTITUTION
   果冻墙弹性（collision.py 的 solve_collision_impulse 内部按 FLAG_STATIC 分支）；
   静态成员速度经 add_static_member(vx=, vy=) 传入（岛速通道）——求解器只认
@@ -18,6 +20,8 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
 - 高速防穿透：帧间圆链扫掠（swept_circle_chain_collision，TOI 语义）；
 - 纯位置分离（j==0 且 sep>0）按 pair 去抖 0.24s（秒基，= T0 15 tick 的墙钟
   等价；tick 口径在 M-1 降档后会被放大 15~60 倍，见 SEPARATION_DEBOUNCE_SECS）；
+- 位移分离按求解器的 per-sprite **累计**记账一次写回（``combined`` 的
+  total_dx/total_dy），不透支到下一 tick，每只 sprite 只 set_pos 一次；
 - 真撞击阈值：普通对 dv >= 300px/s、撞静态成员放宽到 60px/s、已 thrown
   成员继续吸收冲量的下限 50px/s（对齐 window.py 的 COLLISION_HIT_MIN_DV /
   COLLISION_CONTACT_DV_FLOOR 与旧实现的静态放宽分支）；
@@ -31,9 +35,11 @@ before_sprites_advance 钩子里调用 tick(sprites, dt)，无 IPC、无选举�
 本模块刻意保持零 Qt：交互状态协议字面量（"normal"/"drag"/"thrown"）与
 pet/pet_sprite.py 的 INTERACTION_* 常量保持一致，但不 import pet_sprite
 （它依赖 PySide6）；sprite 按鸭子类型消费（pos/set_pos/velocity/set_velocity/
-rect()/interaction_state/dragging/scale/collision_enabled），纯逻辑可脱离
-QApplication 单测。``collision_enabled`` 缺省 True = 该 sprite 参与宠-宠碰撞
-（per-sprite 资格位，见 G4）；它不参与岛（静态成员）接触的门。
+rect()/interaction_state/dragging/scale/visible/collision_enabled），纯逻辑可
+脱离 QApplication 单测。``collision_enabled`` 缺省 True = 该 sprite 参与宠-宠
+碰撞（per-sprite 资格位，见 G4）；它不参与岛（静态成员）接触的门。
+``visible`` 缺省 True，为假即整只退出碰撞世界（判据与 overlay_window.sprite_at
+的隐藏排除同源：``getattr(sprite, "visible", True)``）。
 """
 
 from __future__ import annotations
@@ -273,6 +279,12 @@ class SpriteCollisionWorld:
         # dynamic_island.collision_enabled（壳侧挂/摘岛桥）单独控制。
         disabled_ids: set = set()
         for sprite in sprites:
+            # M14 隐藏成员整只退出碰撞世界（判据与 overlay_window.sprite_at 的
+            # 逐像素命中同源）：否则隐藏的宠是隐形障碍墙，照样推开/撞飞可见的
+            # 宠、照样触发碰撞反馈。退出快照即自动退出 _prev_circles（帧末按
+            # 成员重建）与连续重叠记账（求解器按当前 pair 重建 history）。
+            if not getattr(sprite, "visible", True):
+                continue
             member = self._member_from_sprite(sprite)
             members.append(member)
             sprite_by_id[member.runtime_id] = sprite
@@ -280,11 +292,12 @@ class SpriteCollisionWorld:
                 disabled_ids.add(member.runtime_id)
         for member_id, rect in self._static_members.items():
             members.append(self._static_member_state(member_id, rect))
+        self._prune_position_only_members({m.runtime_id for m in members})
 
         results: List[collision.ImpulseResult] = []
         if len(members) >= 2:
             swept = self._swept_collisions(members)
-            results, _, self._overlap_history = collision.solve_multi_body_collision(
+            results, combined, self._overlap_history = collision.solve_multi_body_collision(
                 members,
                 tick=self._tick,
                 overlap_history=self._overlap_history,
@@ -295,7 +308,7 @@ class SpriteCollisionWorld:
                 swept_collisions=swept,
                 ignored_pairs=self._ignored_pet_pairs(disabled_ids, sprite_by_id),
             )
-            self._apply_results(results, sprite_by_id)
+            self._apply_results(results, sprite_by_id, combined)
         # 静态成员支撑落定（"落在岛上"= 落地）：不依赖 dt，只看这一 tick 的
         # 贴合与速度（成员集合里已含静态成员；无静态成员时 O(1) 早退）
         self._settle_supported(members, sprite_by_id)
@@ -322,12 +335,15 @@ class SpriteCollisionWorld:
     @classmethod
     def _motion_signature(cls, sprites: Sequence) -> tuple:
         """成员运动签名（静止豁免判据）：成员集合 + 位置 + 速度 + 交互态 +
-        缩放 + 宠-宠碰撞资格——结算读取的全部动态输入；任一变化即重新求解。
+        缩放 + 宠-宠碰撞资格 + 可见性——结算读取的全部动态输入；任一变化即
+        重新求解。
 
         ``collision_enabled`` 必须入签名：开关热切本身不改变位置/速度，若不入
         签名，「全静止时切开关」会被静止豁免当成"结果不变"整 tick 跳过（旧
         多进程层对同一件事是 ``update_policy`` 里置 membership_dirty + 清求解
-        历史，见 collision_ipc._clear_solver_history）。
+        历史，见 collision_ipc._clear_solver_history）。``visible`` 同理：隐藏
+        让成员整只退出快照（成员集合变了），不入签名时"全静止 + 切可见性"会被
+        当成结果不变跳过。
         """
         items = []
         for sprite in sprites:
@@ -341,6 +357,7 @@ class SpriteCollisionWorld:
                 cls._is_dragging(sprite),
                 float(getattr(sprite, "scale", 0.0) or 0.0),
                 bool(getattr(sprite, "collision_enabled", True)),
+                bool(getattr(sprite, "visible", True)),
             ))
         return tuple(items)
 
@@ -523,11 +540,15 @@ class SpriteCollisionWorld:
 
     # ---------------------------------------------------------------- 内部：结果写回
     def _apply_results(self, results: Sequence[collision.ImpulseResult],
-                       sprite_by_id: Dict[str, object]) -> None:
+                       sprite_by_id: Dict[str, object],
+                       combined: Dict[str, tuple[float, float, float, float]]) -> None:
         # sprite 身份 -> [sprite, dvx 累加, dvy 累加]：多 pair 冲量向量合并后
         # 一次性写回并限速（对齐 coordinator 的 combined 语义 + 客户端单点限速）
         dv_acc: Dict[int, list] = {}
         fired: List[collision.ImpulseResult] = []
+        # 本轮被去抖抑制位置写回的 pair 的 per-member 累计位移（member_id ->
+        # [dx, dy]）：这些 pair 的位移不许进合并累计，见下面的位置写回段
+        suppressed_by_member: Dict[str, list[float]] = {}
 
         for res in results:
             sprite_a = sprite_by_id.get(res.a)
@@ -540,6 +561,11 @@ class SpriteCollisionWorld:
                 now = self._clock()
                 last = self._position_only_at.get(res.pair)
                 if last is not None and now - last < self.separation_debounce_secs:
+                    for member_id, dx, dy in ((res.a, res.sep_dx_a, res.sep_dy_a),
+                                              (res.b, res.sep_dx_b, res.sep_dy_b)):
+                        cut = suppressed_by_member.setdefault(member_id, [0.0, 0.0])
+                        cut[0] += dx
+                        cut[1] += dy
                     continue
                 self._position_only_at[res.pair] = now
 
@@ -570,15 +596,25 @@ class SpriteCollisionWorld:
                         # 落地，落地后由它切回 "normal"
                         sprite.interaction_state = INTERACTION_THROWN
 
-            # 位置分离：按 ImpulseResult 的 pair 级位移写回（与现架构客户端
-            # 消费同一份 dx 的口径一致）；拖拽中位置由光标驱动，不动
-            if sprite_a is not None and not self._is_dragging(sprite_a):
-                self._translate(sprite_a, res.dx_a, res.dy_a)
-            if sprite_b is not None and not self._is_dragging(sprite_b):
-                self._translate(sprite_b, res.dx_b, res.dy_b)
-
             if real_hit:
                 fired.append(res)
+
+        # 位置写回：按求解器 per-sprite 的**累计**位移（combined 的 total_dx/
+        # total_dy，覆盖全部迭代轮）一次到位。每只 sprite 只 set_pos 一次：
+        # ① 逐 pair 只能拿到末轮增量，多轮迭代的分离量被整块丢弃、大部分重叠
+        # 留到下一 tick（与连续重叠记账/去抖互相打架）；② 分次 set_pos 会被
+        # body_box 钳制（非线性）逐次截断，累计口径与求解器记账不符。拖拽中
+        # 位置由光标驱动 → 跳过；被去抖抑制的 pair 从累计里扣掉（该 pair 的
+        # 位移不许进写回，逐 pair 时代它整条被跳过，语义保持）。
+        for member_id, (_dvx, _dvy, total_dx, total_dy) in combined.items():
+            sprite = sprite_by_id.get(member_id)
+            if sprite is None or self._is_dragging(sprite):
+                continue
+            cut = suppressed_by_member.get(member_id)
+            if cut is not None:
+                total_dx -= cut[0]
+                total_dy -= cut[1]
+            self._translate(sprite, total_dx, total_dy)
 
         # 速度写回 + 软限速（对齐旧实现：超过 cap 才过软膝曲线）
         for sprite, dvx, dvy in dv_acc.values():
@@ -673,4 +709,19 @@ class SpriteCollisionWorld:
         cutoff = self._clock() - self.separation_debounce_secs * 4
         stale = [p for p, t in self._position_only_at.items() if t < cutoff]
         for pair in stale:
+            del self._position_only_at[pair]
+
+    def _prune_position_only_members(self, present: set) -> None:
+        """去抖表防漏：成员离场（隐藏退出快照/回收）即清掉它名下的条目。
+
+        纯按墙钟清理（``_prune_position_only_ticks``）会让离场成员在窗口内
+        "留着号"：它重新入场后新接触撞上旧条目，第一次分离被当成"贴贴抖动"
+        抑制掉。配对键口径与求解器一致（``{runtime_id}|{runtime_id}``）。
+        表空时 O(1) 早退（稳态零成本）。
+        """
+        if not self._position_only_at:
+            return
+        gone = [p for p in self._position_only_at
+                if not all(part in present for part in p.split("|"))]
+        for pair in gone:
             del self._position_only_at[pair]

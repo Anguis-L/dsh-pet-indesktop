@@ -337,6 +337,150 @@ def test_migrate_legacy_spawns_skips_when_v2_marker_alive(tmp_path):
     assert not (config_dir / "migration-spawns.done").exists()
 
 
+# --------------------------------------------------------------------------
+# 缺陷 18：runtime 标记 / slot 落种的写侧非原子 + 读侧把解析失败一律当陈旧删除
+# --------------------------------------------------------------------------
+def test_runtime_marker_write_goes_through_atomic_replace(tmp_path, monkeypatch):
+    """缺陷 18（写侧）：标记必须 temp + 原子替换，成功路径不留 .tmp。
+
+    直写最终路径会被独立设置进程的 ``read_live_instances`` 读到半截 JSON。
+    """
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    seen: list[tuple[Path, Path]] = []
+    real = sm.atomic_replace_with_retry
+
+    def spy(temp, target, attempts=5):
+        seen.append((Path(temp), Path(target)))
+        real(temp, target, attempts)
+
+    monkeypatch.setattr(sm, "atomic_replace_with_retry", spy)
+    path = sm.write_runtime_marker(config_dir, "", 10, 20, 30, 40, versioned=True)
+
+    assert seen, "标记写入必须经原子替换（不得直写最终路径）"
+    temp, target = seen[0]
+    assert target == path
+    assert temp != path and temp.parent == config_dir
+    assert json.loads(path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    assert not temp.exists(), "成功路径不得残留 .tmp"
+    assert list(config_dir.glob("*.tmp")) == []
+
+
+def test_runtime_marker_write_failure_keeps_old_file_and_no_tmp(tmp_path, monkeypatch):
+    """缺陷 18（写侧）：替换失败不得留下半写内容，且 .tmp 必须清掉。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = sm.runtime_marker_path(config_dir, "", versioned=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "x": 1, "y": 1, "w": 5, "h": 5}),
+                    encoding="utf-8")
+
+    def deny(temp, target, attempts=5):
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(sm, "atomic_replace_with_retry", deny)
+    sm.write_runtime_marker(config_dir, "", 99, 99, 99, 99, versioned=True)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["x"] == 1, \
+        "替换失败时旧内容必须完整保留（不得半写/覆盖）"
+    assert list(config_dir.glob("*.tmp")) == [], "失败路径同样不得残留 .tmp"
+
+
+def test_seed_slot_config_write_goes_through_atomic_replace(tmp_path, monkeypatch):
+    """缺陷 18（写侧）：slot 落种写盘同样走 temp + 原子替换。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.json").write_text(json.dumps({"character": "shenshen"}),
+                                            encoding="utf-8")
+    seen: list[tuple[Path, Path]] = []
+    real = sm.atomic_replace_with_retry
+
+    def spy(temp, target, attempts=5):
+        seen.append((Path(temp), Path(target)))
+        real(temp, target, attempts)
+
+    monkeypatch.setattr(sm, "atomic_replace_with_retry", spy)
+
+    assert sm.seed_slot_config_from_main(config_dir, 1) is True
+    target = sm.get_config_path_for_slot(config_dir, 1)
+    assert seen and seen[0][1] == target, "落种必须经原子替换"
+    assert seen[0][0] != target and seen[0][0].parent == config_dir
+    assert json.loads(target.read_text(encoding="utf-8"))["character"] == "shenshen"
+    assert list(config_dir.glob("*.tmp")) == []
+
+
+def test_seed_slot_config_write_failure_reports_false(tmp_path, monkeypatch):
+    """缺陷 18（写侧）：落种替换失败如实返回 False，且不留目标文件/.tmp。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.json").write_text(json.dumps({"character": "shenshen"}),
+                                            encoding="utf-8")
+
+    def deny(temp, target, attempts=5):
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(sm, "atomic_replace_with_retry", deny)
+
+    assert sm.seed_slot_config_from_main(config_dir, 1) is False
+    assert not sm.get_config_path_for_slot(config_dir, 1).exists()
+    assert list(config_dir.glob("*.tmp")) == []
+
+
+def test_read_live_instances_keeps_truncated_marker(tmp_path):
+    """缺陷 18（读侧）：解析失败的标记只跳过、绝不删。
+
+    读写竞态窗口内那可能是活进程正在写的半截文件；删掉 = 活进程的避让标记
+    凭空消失（其它窗按错误几何避让）。
+    """
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    marker = config_dir / f"pet-runtime-v2-{os.getpid()}-slot-1.json"
+    marker.write_text(f'{{"pid": {os.getpid()}, "x": 10', encoding="utf-8")  # 半写截断
+
+    assert sm.read_live_instances(config_dir) == []
+    assert marker.exists(), "解析失败不得删标记"
+
+
+def test_read_live_instances_keeps_live_marker_with_bad_geometry(tmp_path):
+    """缺陷 18（读侧）：活 pid 但几何字段非法 → 不删（进程还活着，删了就永久失去避让）。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    marker = config_dir / "pet-runtime-v2-4002-slot-2.json"
+    marker.write_text(json.dumps({"pid": 4002, "x": "abc", "y": 0, "w": 3, "h": 4}),
+                      encoding="utf-8")
+
+    assert sm.read_live_instances(config_dir, pid_alive_fn=lambda pid: pid == 4002) == []
+    assert marker.exists(), "活进程的标记不得因几何字段非法被删"
+
+
+def test_read_live_instances_ignores_non_dict_marker_without_deleting(tmp_path):
+    """缺陷 18（读侧）：JSON 合法但非对象（判不出 pid）→ 只跳过不删。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    marker = config_dir / f"pet-runtime-v2-{os.getpid()}-slot-1.json"
+    marker.write_text("[]", encoding="utf-8")
+
+    assert sm.read_live_instances(config_dir) == []
+    assert marker.exists(), "字段非法判不出 pid：只跳过不删"
+
+
+def test_read_live_instances_reclaims_confirmed_dead_pid(tmp_path):
+    """缺陷 18（读侧）回归：pid 已确认死亡的标记仍被回收（死 pid 不虚增避让计数）。"""
+    config_dir = tmp_path / APP_DIR_NAME
+    config_dir.mkdir(parents=True, exist_ok=True)
+    dead = config_dir / "pet-runtime-v2-4001-slot-1.json"
+    dead.write_text(json.dumps({"pid": 4001, "x": 1, "y": 2, "w": 3, "h": 4}),
+                    encoding="utf-8")
+    alive = config_dir / "pet-runtime-v2-4002-slot-2.json"
+    alive.write_text(json.dumps({"pid": 4002, "x": 5, "y": 6, "w": 7, "h": 8}),
+                     encoding="utf-8")
+
+    live = sm.read_live_instances(config_dir, pid_alive_fn=lambda pid: pid == 4002)
+
+    assert live == [(4002, 5, 6, 7, 8)]
+    assert not dead.exists(), "死 pid 的标记必须被回收"
+    assert alive.exists(), "活 pid 的标记必须保留"
+
+
 def test_app_main_validates_slot_arg():
     """测试 app.main 校验 --slot 参数范围（0~127）及非法值。"""
     from pet import app as app_mod

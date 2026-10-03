@@ -2430,6 +2430,11 @@ class AgentLinkManager(QObject):
         "task": "正在派活给子代理", "todowrite": "正在列计划",
     }
     _UNKNOWN_TOOL_LABEL = "正在调用工具"
+    #: 会话级缓存的条目上限（缺陷 23）：``_session_meta_cache`` /
+    #: ``_exploration_names`` 的 key 都是**外部会话 ID**，进程常驻数周时按会话数
+    #: 单调增长（此前没有任何删除路径）。取 256（同项目其它小缓存同量级：
+    #: sound_winmm 池 8、webm_clip 首帧共享表 20000），FIFO 淘汰最老条目。
+    _SESSION_CACHE_MAX = 256
     _ACTIVITY_MIN_INTERVAL = 10.0    # 同 Agent 过程气泡最小间隔
     _ACTIVITY_GLOBAL_MIN = 8.0       # 全局最小间隔（多 Agent 并发防刷屏）
     _ACTIVITY_SAME_LABEL = 60.0      # 同一工具文案 60s 内不重复
@@ -2547,6 +2552,7 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].raw_record.connect(self._on_interaction_lifecycle)
         self._exploration_watchdog.warning.connect(self._on_exploration_warning)
         # 会话元数据缓存：sessionId → { sessionName, projectName, agentName }
+        # 与探索显示名缓存同走有界写入（缺陷 23：key 是外部会话 ID，此前只增不减）
         self._session_meta_cache: dict[str, dict] = {}
         self._exploration_alerts: dict[str, str] = {}
         self._exploration_names: dict[str, str] = {}
@@ -4613,6 +4619,18 @@ class AgentLinkManager(QObject):
     # ------------------------------------------------------------------
     # 会话元数据缓存与显示名称解析
     # ------------------------------------------------------------------
+    @staticmethod
+    def _session_cache_put(cache: dict, key: str, value) -> None:
+        """会话级缓存的有界写入（FIFO 淘汰最老条目；缺陷 23）。
+
+        key 是外部会话 ID：缓存只增不减会随会话数常驻数周。淘汰只影响展示
+        元数据/显示名——被淘汰的会话下次收到 meta 事件会重新写入，读路径
+        （``get_session_display_name`` / ``_session_name_or_empty``）行为不变。
+        """
+        cache[key] = value
+        while len(cache) > AgentLinkManager._SESSION_CACHE_MAX:
+            cache.pop(next(iter(cache)), None)
+
     def _on_session_meta(self, agent_key: str, record: dict) -> None:
         """接收 bridge 发来的 session/meta 事件，写入元数据缓存。"""
         if not isinstance(record, dict):
@@ -4620,11 +4638,11 @@ class AgentLinkManager(QObject):
         session_id = str(record.get("sessionId") or "")
         if not session_id:
             return
-        self._session_meta_cache[session_id] = {
+        self._session_cache_put(self._session_meta_cache, session_id, {
             "sessionName": str(record.get("sessionName") or ""),
             "projectName": str(record.get("projectName") or ""),
             "agentName": str(record.get("agentName") or ""),
-        }
+        })
         log.debug("session_meta cached: %s → %s", session_id[:12], self._session_meta_cache[session_id])
 
     # ------------------------------------------------------------------
@@ -4999,16 +5017,16 @@ class AgentLinkManager(QObject):
                   (payload or {}).get("agent_key") or "").strip()
         if raw and raw in self.AGENT_NAMES:
             name = self.AGENT_NAMES[raw]
-            self._exploration_names[session_key] = name
+            self._session_cache_put(self._exploration_names, session_key, name)
             return name
         # 通过 sessionId 查找元数据缓存
         display = self.get_session_display_name(session_key)
         if display and display != f"DSH · {session_key[:8]}":
-            self._exploration_names[session_key] = display
+            self._session_cache_put(self._exploration_names, session_key, display)
             return display
         # 最终回退：agent 名称或默认 DSH
         name = self.AGENT_NAMES.get(raw.lower(), raw) or "DSH"
-        self._exploration_names[session_key] = name
+        self._session_cache_put(self._exploration_names, session_key, name)
         return name
 
     @staticmethod

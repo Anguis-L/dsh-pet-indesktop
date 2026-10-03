@@ -170,3 +170,111 @@ def test_stop_releases_spawned_libraries_and_inflight_provisions(tmp_path):
     assert child_lib.shutdown_calls == 1, "子宠库必须 shutdown（活线程是库的子对象）"
     assert cancels, "子宠库的在飞供给必须取消"
     assert main_cancels, "主库的在飞供给同样取消"
+
+
+# ---------------------------------------------------------------- 缺陷 13/14：退出收口
+def _raiser(message):
+    """必抛的收口步骤替身（模拟 shutdown_music_lyric 在半销毁环境抛错）。"""
+    def _boom():
+        raise RuntimeError(message)
+    return _boom
+
+
+def _record_mandatory_steps(shell):
+    """把三项必做项换成记录器（三项各自的真实语义已有专门用例覆盖）。"""
+    calls: list = []
+    shell.save_position = lambda: calls.append("save_position")
+    shell.save_spawned_positions = lambda: calls.append("save_spawned_positions")
+    shell._cancel_frameseq_provisions = lambda: calls.append("cancel_provisions")
+    return calls
+
+
+class _RecordingClip:
+    """只记录 stop/close 的 clip 替身（``MovieLibrary.shutdown`` 是 close 优先）。"""
+
+    def __init__(self):
+        self.stops = 0
+        self.closes = 0
+
+    def stop(self):
+        self.stops += 1
+
+    def close(self):
+        self.closes += 1
+
+
+def test_about_to_quit_runs_mandatory_steps_when_earlier_step_raises(tmp_path):
+    """前置步骤抛错不得让位置持久化与在飞供给取消被整体跳过。
+
+    缺陷 13：``_on_about_to_quit`` 原是一条裸调用链——``shutdown_music_lyric``
+    （内部是无守卫的 ``timer.stop()``）/ ``bridge.close()`` / ``overlay.stop()``
+    任一抛错，排在后面的 ``save_position`` / ``save_spawned_positions`` /
+    ``_cancel_frameseq_provisions`` 全部不执行：位置不落盘，在飞帧序列供给线程
+    没人取消（库随壳析构活 QThread = Qt fatal）。
+    """
+    shell, _lib = _make_persistent_shell(tmp_path)
+    calls = _record_mandatory_steps(shell)
+    shell.shutdown_music_lyric = _raiser("歌词收尾失败")
+    try:
+        shell._on_about_to_quit()
+
+        assert calls == ["save_position", "save_spawned_positions", "cancel_provisions"]
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_about_to_quit_shuts_down_main_library(tmp_path):
+    """退出收口必须显式 shutdown 主库（缺陷 14）。
+
+    此前 ``_on_about_to_quit`` 对主库只 ``pause_warm``（``stop()`` 则只遍历子宠
+    库），主宠在播 reader/clip 的终结（``WebMClip.cleanup`` / ``FrameSeqClip.close``）
+    退回 legacy 明确抛弃的"靠 GC + destroyed"收口。
+    """
+    shell, _lib = _make_persistent_shell(tmp_path)
+    main_lib = shell.lib
+    try:
+        shell._on_about_to_quit()
+
+        assert main_lib.shutdown_calls == 1
+    finally:
+        shell._delete_runtime_marker()
+
+
+def test_about_to_quit_shuts_down_real_main_library_and_closes_clips(tmp_path):
+    """真库口径：退出后主库 ``_shutdown`` 为真、已建 clip 已 close。"""
+    from pet.library import MovieLibrary
+
+    shell, _lib = _make_persistent_shell(tmp_path)
+    lib = MovieLibrary(prewarm_enabled=False)     # 真库：走真实 shutdown 收口
+    clip = _RecordingClip()
+    lib._movies.clear()                           # 只留本用例的替身 clip（不动真素材）
+    lib._movies["idle1"] = clip
+    shell.lib = lib
+    shell.sprite.library = lib
+    try:
+        shell._on_about_to_quit()
+
+        assert lib._shutdown is True, "主库必须走显式 shutdown（不再依赖 GC + destroyed）"
+        assert clip.closes == 1, "在播 clip 必须在退出收口里被 close"
+    finally:
+        shell._delete_runtime_marker()
+        lib.shutdown()   # 幂等；防真库遗留预热定时器
+
+
+def test_stop_still_releases_libraries_when_earlier_step_raises(tmp_path):
+    """``stop()`` 同款加固：前置步骤抛错时，供给取消与库收口仍执行到。"""
+    shell, _made = _make_persistent_shell(tmp_path)
+    shell.start()
+    shell.spawn_pet()
+    child_lib = shell._spawned_libs[shell._spawned[0]]
+    calls = _record_mandatory_steps(shell)
+    shell.shutdown_music_lyric = _raiser("歌词收尾失败")
+    try:
+        shell.stop()
+
+        assert calls == ["cancel_provisions"]
+        assert child_lib.shutdown_calls == 1, "子宠库不得因前置异常被跳过"
+        assert shell.lib.shutdown_calls == 1, "主库必须并入同一收口（缺陷 14）"
+    finally:
+        shell.clear_spawned_pets()
+        shell._delete_runtime_marker()

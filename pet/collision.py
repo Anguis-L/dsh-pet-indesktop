@@ -104,10 +104,19 @@ class ImpulseResult:
     dvy_a: float = 0.0
     dvx_b: float = 0.0
     dvy_b: float = 0.0
+    # dx_a..dy_b 是**末轮**迭代分配的位移分离增量（既有语义不变）
     dx_a: float = 0.0
     dy_a: float = 0.0
     dx_b: float = 0.0
     dy_b: float = 0.0
+    # 本 pair 跨全部迭代轮的**累计**位移分离增量：等于该 pair 在
+    # combined_impulses_by_id 里的贡献（求解器自己的记账口径）。世界侧一次
+    # 到位的 per-sprite 写回用它——只写末轮会把前面几轮的分离量整块丢弃；
+    # 按 pair 抑制位移（纯位置分离去抖）时也靠它精确扣掉该 pair 的贡献。
+    sep_dx_a: float = 0.0
+    sep_dy_a: float = 0.0
+    sep_dx_b: float = 0.0
+    sep_dy_b: float = 0.0
 
 
 def calculate_mass(
@@ -561,6 +570,9 @@ def solve_multi_body_collision(
     
     返回: (impulse_list, combined_impulses_by_id, updated_overlap_history)
     - combined_impulses_by_id: {runtime_id: (total_dvx, total_dvy, total_dx, total_dy)}
+      其中 total_dx/total_dy 是该成员**跨全部迭代轮**的累计位移分离量；
+      每个 ImpulseResult 的 sep_dx_a..sep_dy_b 是本 pair 对它的分解（按成员
+      求和 == total_dx/total_dy），dx_a..dy_b 则只是末轮增量。
     - updated_overlap_history: 更新后的连续重叠计数器
     """
     sorted_members = sorted(members, key=lambda m: m.runtime_id)
@@ -642,6 +654,9 @@ def solve_multi_body_collision(
     member_map = {m.runtime_id: m for m in sorted_members}
     total_pos_deltas: Dict[str, list[float]] = {m.runtime_id: [0.0, 0.0] for m in sorted_members}
     pair_sep_results: Dict[str, tuple[float, float, float, float, float]] = {}
+    # pair -> 跨迭代轮累计位移 [dxa, dya, dxb, dyb]（pair_sep_results 只留末轮，
+    # 这里留累计；两者按成员求和都等于 total_pos_deltas）
+    pair_pos_totals: Dict[str, list[float]] = {}
     force_full_pairs: set[str] = set()
 
     # Swept contacts are no longer overlapping at the current snapshot, so
@@ -664,6 +679,7 @@ def solve_multi_body_collision(
         total_pos_deltas[m_b.runtime_id][0] += dxb
         total_pos_deltas[m_b.runtime_id][1] += dyb
         pair_sep_results[p["pair"]] = separation
+        pair_pos_totals[p["pair"]] = [dxa, dya, dxb, dyb]
 
     for _ in range(max_separation_iterations):
         # 重新对各 pair 计算当前重叠深度
@@ -720,6 +736,11 @@ def solve_multi_body_collision(
             total_pos_deltas[id_b][1] += dyb
 
             pair_sep_results[pair_k] = (sep_dist, dxa, dya, dxb, dyb)
+            sep_total = pair_pos_totals.setdefault(pair_k, [0.0, 0.0, 0.0, 0.0])
+            sep_total[0] += dxa
+            sep_total[1] += dya
+            sep_total[2] += dxb
+            sep_total[3] += dyb
 
     # 3. 构造输出 ImpulseResult 与成员累积冲量/位移
     impulse_list: List[ImpulseResult] = []
@@ -734,6 +755,8 @@ def solve_multi_body_collision(
     for p in pairs_data:
         pair_k = p["pair"]
         sep_dist, dxa, dya, dxb, dyb = pair_sep_results.get(pair_k, (0.0, 0.0, 0.0, 0.0, 0.0))
+        sep_dxa, sep_dya, sep_dxb, sep_dyb = pair_pos_totals.get(
+            pair_k, (0.0, 0.0, 0.0, 0.0))
 
         res = ImpulseResult(
             tick=tick,
@@ -758,6 +781,10 @@ def solve_multi_body_collision(
             dy_a=dya,
             dx_b=dxb,
             dy_b=dyb,
+            sep_dx_a=sep_dxa,
+            sep_dy_a=sep_dya,
+            sep_dx_b=sep_dxb,
+            sep_dy_b=sep_dyb,
         )
         impulse_list.append(res)
 

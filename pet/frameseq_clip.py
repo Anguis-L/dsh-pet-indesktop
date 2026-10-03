@@ -189,6 +189,11 @@ class FrameSeqClip(QObject):
     frameChanged = Signal(int)
     finished = Signal()
     errorOccurred = Signal(str)
+    #: 内部：后台预热解出的帧 0 → 显示槽提交（跨线程队列投递，见
+    #: ``warm_first_frame``）。用信号而不是 QMetaObject.invokeMethod：信号
+    #: 的参数类型在类创建时就绑定了，不受模块级 ``QImage`` 被测试替身替换
+    #: 的影响（``Q_ARG(QImage, ...)`` 会在运行期读那个名字）。
+    _warm_frame_ready = Signal(QImage)
 
     #: 帧 0 预热的**重复代价可忽略**：冷解码 ~1.2ms，且 ``start()`` 本就异步
     #: 交付首帧（未到货时继续显示旧帧，不阻塞 GUI）——同角色兄弟库因此不重复
@@ -250,6 +255,12 @@ class FrameSeqClip(QObject):
         # 线程上——不能 deleteLater（没人处理），只能保留引用不跨线程销毁）
         self._retired_workers: list[_PrefetchWorker] = []
         self._worker = _PrefetchWorker(self._frames)
+        #: close() 幂等标志（worker 已被 deleteLater：二次调用会打到已删对象上）
+        self._closed = False
+        # 预热帧的提交走 clip 自身线程（QueuedConnection 队列投递）：后台预热
+        # 线程只解码，不在 GUI 侧状态（_img/_img_frame/_pending）上并发写。
+        self._warm_frame_ready.connect(
+            self._commit_warm_first_frame, Qt.ConnectionType.QueuedConnection)
         self._prefetch_thread = _shared_prefetch_thread()
         self._worker.moveToThread(self._prefetch_thread)
         self._worker.loaded.connect(self._on_loaded,
@@ -381,7 +392,12 @@ class FrameSeqClip(QObject):
         """停止播放并回收预取 worker（MovieLibrary.shutdown/收尾调用）。
 
         线程是进程级共享的（不随 clip 生灭）；worker 挂 deleteLater 由
-        共享线程事件循环回收。"""
+        共享线程事件循环回收。幂等：重复调用（库收口与窗口收尾都可能调）
+        不得二次 deleteLater——对象已被共享线程删掉后再挂一次是
+        RuntimeError（半销毁场景）。"""
+        if self._closed:
+            return
+        self._closed = True
         self.stop()
         self._worker.deleteLater()
 
@@ -448,17 +464,44 @@ class FrameSeqClip(QObject):
         return
 
     def warm_first_frame(self) -> None:
-        """后台预热帧 0（幂等：显示槽已有帧即返回）。
+        """预热帧 0（幂等：显示槽已有帧即返回）。
 
         解出的帧 0 同时寄存 ``_pending[0]``：``start()`` 起播时直接弹出来上屏
         （``frameChanged(0)`` 同步发出），不再让 prefetch worker 又解一遍
         （每段动画每次起播省一次帧解码 + 一次线程往返）。
+
+        本方法跑在**后台预热线程**（library._warm_objects 的 worker），因此
+        只做解码（QImage 加载，IO），提交回显示槽经 ``_warm_frame_ready`` 队列
+        投递到 clip 所属线程（``_commit_warm_first_frame``）：显示槽是播放状态
+        （``_img``/``_img_frame``/``_pending``），GUI 起播/跳帧/池级回收都在
+        并发写它，后台直写会把新提交的帧倒写成帧 0（图与帧号不一致），或把
+        ``release_idle_frames`` 刚清空的槽重新填回。同线程调用（GUI 侧预热）
+        保持原有的同步语义。
         """
-        if self._img is None and self._frames:
-            img = QImage(str(self._frames[0]))
-            if not img.isNull():
-                self._apply(img, 0)
-                self._pending[0] = img
+        if self._img is not None or not self._frames:
+            return
+        img = QImage(str(self._frames[0]))
+        if img.isNull():
+            return
+        try:
+            if self.thread() is QThread.currentThread():
+                self._commit_warm_first_frame(img)
+                return
+            self._warm_frame_ready.emit(img)
+        except RuntimeError:
+            pass  # clip 半销毁（C++ 侧已删）：安静降级，等下一次起播同步解码
+
+    def _commit_warm_first_frame(self, img: QImage) -> None:
+        """把后台预热解出的帧 0 提交进显示槽（只在 clip 所属线程执行）。
+
+        复核与解码之间隔着一次跨线程排队，所以这里必须重新判空：期间前台
+        已经提交过新帧（起播/跳帧）就不动它——预热帧只值一次 ~1.2ms 解码，
+        绝不能倒写显示槽。
+        """
+        if self._img is not None or self._running:
+            return
+        self._apply(img, 0)
+        self._pending[0] = img
 
     def cancel_first_frame_warm(self) -> None:
         return

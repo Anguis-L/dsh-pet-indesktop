@@ -229,3 +229,73 @@ def test_idle_trim_timer_timeout_runs_sweep(tmp_path, monkeypatch):
     lib._on_idle_trim()
 
     assert clip._queue.empty()
+
+
+def test_idle_trim_timer_restarts_on_resume_warm(tmp_path, monkeypatch):
+    """隐藏→恢复（pause_warm/resume_warm）必须把池级回收定时器一并重启。
+
+    改前 resume_warm 只重启低优先级预热定时器，而 _idle_trim_timer 的唯一
+    启动点在 schedule_low_priority_warm——生产中只在建库/角色交接时调。
+    首次隐藏后池级兜底回收终身停摆：3 宠库的残留帧（release_idle_frames
+    的 10s 兜底）单调增长。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    lib = _make_lib(tmp_path, monkeypatch)
+    lib.schedule_low_priority_warm()
+    try:
+        assert lib._idle_trim_timer.isActive()
+
+        # 两轮完整隐藏/恢复：低优先级批次跑完后 incomplete 为假，回收定时器
+        # 照样得活过来（它不该依赖预热是否还有活干）
+        for _ in range(2):
+            lib.pause_warm()
+            assert not lib._idle_trim_timer.isActive(), '隐藏即停（既有语义不变）'
+            lib.resume_warm()
+            assert lib._idle_trim_timer.isActive(), '恢复显示必须重新开表'
+
+        # 幂等：已开表时重复恢复不得重开（周期不被推后）
+        lib.pause_warm()
+        lib.resume_warm()
+        remaining = lib._idle_trim_timer.remainingTime()
+        lib.resume_warm()
+        lib.resume_warm()
+        assert lib._idle_trim_timer.isActive()
+        assert lib._idle_trim_timer.remainingTime() <= remaining, \
+            '重复 resume_warm 不得重开定时器'
+        app.processEvents()
+    finally:
+        lib.shutdown()
+
+
+def test_idle_trim_timer_restarts_on_resume_warm_for_peer_library(
+        tmp_path, monkeypatch):
+    """兄弟库（预热责任不在本库）的池级回收同样随隐藏/恢复重启。
+
+    三宠同角色 = 三份库：预热责任只由首个库持有，兄弟库不排低优先级预热，
+    但**池级回收管的是本库自己的内存**（schedule_low_priority_warm 对兄弟库
+    照旧开表）——所以恢复显示时的重启不能藏在"责任持有者"分支后面。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    lib1 = _make_lib(tmp_path, monkeypatch)
+    try:
+        lib1.schedule_low_priority_warm()
+        lib2 = library_mod.MovieLibrary(
+            asset_dir=tmp_path / 'videos', prewarm_policy='balanced')
+        try:
+            lib2.schedule_low_priority_warm()
+            assert lib2._warm_peer is True, '第二份库必须是兄弟库，否则本用例没意义'
+            assert lib2._idle_trim_timer.isActive()
+
+            lib2.pause_warm()
+            assert not lib2._idle_trim_timer.isActive()
+            lib2.resume_warm()
+            assert lib2._idle_trim_timer.isActive(), '兄弟库的池级回收也必须重启'
+            app.processEvents()
+        finally:
+            lib2.shutdown()
+    finally:
+        lib1.shutdown()

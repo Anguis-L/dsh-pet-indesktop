@@ -503,9 +503,7 @@ class TickDriver(QObject):
         self._suspended = suspended
         if suspended:
             for sprite in self._all_sprites():
-                pause = getattr(sprite, "pause_clip", None)
-                if callable(pause):
-                    pause()
+                self._pause_sprite_clip(sprite, pause=True)
             self._apply_tier(TIER_OCCLUDED, reason="suspended")
             return
         # 恢复只对"真的能看见"的 sprite：窗口仍被藏（托盘隐藏中解锁）或那一只
@@ -513,10 +511,28 @@ class TickDriver(QObject):
         # set_sprite_visible）恢复——锁屏不该把隐藏期的暂停悄悄解除。
         if self._visible_for_tier():
             for sprite in self._all_sprites():
-                resume = getattr(sprite, "resume_clip", None)
-                if callable(resume) and self._sprite_visible(sprite):
-                    resume()
+                if self._sprite_visible(sprite):
+                    self._pause_sprite_clip(sprite, pause=False)
         self.note_kinetic()  # 同帧回全速（并重算档位）
+
+    @staticmethod
+    def _pause_sprite_clip(sprite, *, pause: bool) -> None:
+        """逐只停/续播放节拍；单只抛错只记 debug，绝不中断整轮。
+
+        幂等守卫（``_suspended`` 相等即早退）意味着这一轮是**唯一**机会：任何
+        一只抛错而整轮中断，剩下的 sprite 就带着在跑的定时器过完整个锁屏
+        （挂起期整夜按帧率解码），而再次 ``set_suspended(True)`` 直接早退、永不
+        补做。抛错不是假想场景——``FrameSeqClip.pause()`` 是裸
+        ``timer.stop()``，半销毁（C++ 侧已删）时会抛 RuntimeError。
+        """
+        name = "pause_clip" if pause else "resume_clip"
+        call = getattr(sprite, name, None)
+        if not callable(call):
+            return
+        try:
+            call()
+        except Exception:
+            logger.debug("tick: sprite.%s 失败（继续处理其余 sprite）", name, exc_info=True)
 
     # ---------------------------------------------------------------- 统一 tick
     def on_tick(self, dt: float | None = None) -> None:

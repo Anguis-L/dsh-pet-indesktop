@@ -784,6 +784,16 @@ class MovieLibrary(QObject):
             self.schedule_high_priority_warm()
             self.schedule_low_priority_warm()
 
+    def warm_allowed(self) -> bool:
+        """库级预热闸门（只读判定）：设置页总开关开 **且** 未被隐藏/挂起暂停。
+
+        本库自有的预热路径（``_warm_objects`` / ``warm_predicted`` / 两条
+        ``schedule_*``）各自读这两个标志；行为层的两条**直提**路径（预测预热与
+        起飞落地预热）不经过它们，需要同一个判据才能守住"关闭后停止后台动画
+        预热"的承诺。只读两个 bool，无锁、无副作用（跨线程读安全）。
+        """
+        return bool(self._prewarm_enabled) and not self._warm_paused
+
     def pause_warm(self) -> None:
         """窗口隐藏时暂停预热：停掉延迟定时器与让路重试，在飞线程尽快收尾。"""
         self._warm_paused = True
@@ -822,7 +832,8 @@ class MovieLibrary(QObject):
         对象——库被销毁（窗口关闭、进程退出）时 Qt 会把活线程一起析构，那是 abort
         而不是异常。所以超时路径把线程摘出库（``setParent(None)``，见
         ``_orphan_frameseq_worker``）交给模块级登记处强引用持有，跑完再由
-        ``reap_orphan_provision_workers()`` 摘除。
+        ``reap_orphan_provision_workers()`` 摘除。等待本身抛异常（缺陷 22）时
+        同样如此：异常不是"线程已收口"的证据，线程的状态和超时窗口里一模一样。
         """
         worker, self._frameseq_worker = self._frameseq_worker, None
         if worker is None:
@@ -835,7 +846,12 @@ class MovieLibrary(QObject):
             if worker.wait(int(timeout_ms)):
                 return True
         except Exception:
+            # 缺陷 22：等待失败（QThread 半销毁等）**不是**线程已收口的证据——
+            # 此时线程仍 setParent(self) 挂在库上，库被销毁时会连同活线程一起
+            # 析构（Qt 对此的处理是 abort）。与超时分支同一落脚点：摘出库 +
+            # 交孤儿登记处持有。
             logging.getLogger(__name__).debug('帧序列供给线程等待失败', exc_info=True)
+            self._orphan_frameseq_worker(worker)
             return False
         self._orphan_frameseq_worker(worker)
         logging.getLogger(__name__).warning(
@@ -860,7 +876,7 @@ class MovieLibrary(QObject):
         reap_orphan_provision_workers()   # 顺手清掉此前已跑完的（廉价、幂等）
 
     def shutdown(self) -> None:
-        """关闭素材库并收口所有已创建的 WebM reader。"""
+        """关闭素材库并收口所有已创建的 clip（WebM reader / 帧序列预取 worker）。"""
         if self._shutdown:
             return
         self._shutdown = True
@@ -874,6 +890,14 @@ class MovieLibrary(QObject):
         self.cancel_frameseq_provision()
         for clip in tuple(self._movies.values()):
             try:
+                # close() 优先（FrameSeqClip：stop + worker.deleteLater）——它的
+                # 预取 worker 亲和于共享预取线程，只能由那个线程的 deleteLater
+                # 回收；漏掉这一步就退化成"Python GC 在 GUI 线程析构跨线程
+                # QObject"，与在飞 prefetch 竞态（同文件 :84-92 的 AV 前科）。
+                close = getattr(clip, 'close', None)
+                if callable(close):
+                    close()
+                    continue
                 cleanup = getattr(clip, 'cleanup', None)
                 if callable(cleanup):
                     cleanup()
@@ -927,6 +951,13 @@ class MovieLibrary(QObject):
         if not self._prewarm_enabled:
             return  # Phase 2：动画预热关闭时，隐藏/恢复都不再自动拉起预热
         self._warm_paused = False
+        # 池级残留回收随隐藏/恢复成对（与 schedule_low_priority_warm 同款判断）：
+        # pause_warm 停掉它，恢复显示时这里必须重启——它的唯一启动点在建库/角色
+        # 交接的那次排期，不在这里补上就是"首次隐藏后终身停摆"，已停播 clip 的
+        # 残留解码帧再无人回收。兄弟库照样重启：回收管的是本库自己的内存，
+        # 与预热责任在谁手里无关（故放在 _warm_peer 早退之前）。
+        if not self._idle_trim_timer.isActive():
+            self._idle_trim_timer.start()
         self._warm_peer = not self.claim_shared_warm()
         if self._warm_peer:
             return

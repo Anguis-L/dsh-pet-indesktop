@@ -2141,6 +2141,45 @@ def test_cancel_provision_timeout_hands_worker_to_orphan_registry(tmp_path):
     assert library_mod.orphan_provision_workers() == ()
 
 
+class _RaisingWaitWorker(fp.FrameseqProvisionWorker):
+    """``wait()`` 必抛的供给线程：模拟 QThread 半销毁 / 收尾异常时的等待失败。"""
+
+    def run(self):  # noqa: D401 - QThread 入口
+        return
+
+    def wait(self, *args, **kwargs):
+        raise RuntimeError("QThread 半销毁：等待失败")
+
+
+def test_cancel_provision_wait_failure_orphans_worker(tmp_path):
+    """缺陷 22：``worker.wait()`` 抛异常的收尾分支同样必须孤儿化线程。
+
+    该分支此前直接 ``return False``：线程仍 ``setParent(self)`` 挂在库上，库被
+    销毁（窗口关闭/进程退出）时 Qt 会把活线程一起析构 = abort（不是异常），
+    而这一分支根本没读过"超时/异常都不是线程已安全收口"的前提。
+
+    这里不真的销毁库——修复前那一步是 abort，写进用例只会把红灯变成整进程
+    崩溃，断言反而看不见；断言落在"摘出库 + 进孤儿登记处"这条链上。
+    """
+    videos, _frameseq = _make_pack(tmp_path, {"idle": ["x.webm"]})
+    lib = MovieLibrary(asset_dir=videos, prewarm_enabled=False)
+    worker = _RaisingWaitWorker(videos, tmp_path / "frameseq", parent=lib)
+    lib._frameseq_worker = worker
+    try:
+        assert lib.cancel_frameseq_provision(timeout_ms=100) is False, \
+            "等待异常必须如实返回失败"
+        assert lib._frameseq_worker is None, "库不再持有它"
+        assert worker.parent() is None, "摘出库：库被销毁不会连带析构该线程"
+        assert worker in library_mod.orphan_provision_workers(), \
+            "等待失败的线程同样必须交孤儿登记处持有"
+    finally:
+        # 该线程从未 start（isFinished 恒假），reap 摘不掉：显式摘除，
+        # 不把残留丢给后续用例（同文件另一条用例断言登记处为空）。
+        with library_mod._ORPHAN_PROVISION_LOCK:
+            library_mod._ORPHAN_PROVISION_WORKERS.discard(worker)
+        lib.shutdown()
+
+
 # ---------------------------------------------------------------- tools 薄壳
 def test_tools_shell_delegates_to_core():
     """薄壳只做命令行：转换核心与参数表都直接复用 pet.frameseq_provision。"""

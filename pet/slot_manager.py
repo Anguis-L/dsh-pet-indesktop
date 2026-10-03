@@ -33,7 +33,25 @@ import time
 from pathlib import Path
 
 from . import catalog
-from .config import _bool_or_default
+from .config import _bool_or_default, atomic_replace_with_retry
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """temp + ``os.replace`` 原子写入（缺陷 18）。失败上抛 OSError，由调用方处理。
+
+    本文件的两处写盘（slot 落种 / runtime 标记）此前都是 ``path.write_text``
+    直写：读者（主进程 Config._load、独立设置进程 read_live_instances）会在
+    写盘中途读到半截 JSON。临时名带 PID 且以 ``.tmp`` 结尾（不匹配
+    ``runtime-*.json`` / ``pet-runtime-v2-*.json`` 两个 glob，不会被读侧当成
+    标记）；替换走 config 的退避重试（骑过 Windows 读句柄造成的瞬时共享
+    冲突），任何出口都清掉临时文件。
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        atomic_replace_with_retry(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def slot_to_instance_id(slot_id: int) -> str:
@@ -131,8 +149,7 @@ def seed_slot_config_from_main(config_dir: Path | str, slot_id: int) -> bool:
             seed[key] = value
     seed["user_customized"] = False
     try:
-        slot_path.write_text(json.dumps(seed, ensure_ascii=False, indent=2),
-                             encoding="utf-8")
+        _atomic_write_text(slot_path, json.dumps(seed, ensure_ascii=False, indent=2))
     except OSError:
         return False
     return True
@@ -391,6 +408,9 @@ def write_runtime_marker(config_dir: Path | str, instance_id: str,
     """写入本窗 runtime 标记（旧格式仅主窗用；versioned 多窗用）。
 
     写版本化标记时顺手清掉同 pid 的旧格式标记，避免同进程混用重复计数。
+    写入走 temp + 原子替换（缺陷 18）：设置进程的 read_live_instances 会在
+    任意时刻读这些标记，直写会被它读到半截 JSON（旧行为据此把标记当陈旧删掉，
+    活进程的避让几何凭空消失）。
     """
     path = runtime_marker_path(config_dir, instance_id, versioned=versioned)
     try:
@@ -401,10 +421,10 @@ def write_runtime_marker(config_dir: Path | str, instance_id: str,
                     legacy.unlink()
             except OSError:
                 pass
-        path.write_text(json.dumps({
+        _atomic_write_text(path, json.dumps({
             'pid': os.getpid(),
             'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
-        }), encoding='utf-8')
+        }))
     except OSError:
         pass
     return path
@@ -447,10 +467,14 @@ def read_live_instances(
     """读取目录内 runtime 标记，返回存活实例 (pid, x, y, w, h) 列表。
 
     同时认旧（runtime-<pid>.json）与新（pet-runtime-v2-*）两种命名
-    （避让定位兼容新旧混跑）。死进程 pid、损坏 JSON、字段非法的标记顺手
-    删除（避免越积越多）；exclude_markers（本窗自己的标记路径/文件名）跳过
-    且保留——同 pid 多窗下不能再用 exclude_pid 这种按 pid 过滤的方式
-    （会把同进程所有窗都排除）。pid_alive_fn 可注入（测试用）。
+    （避让定位兼容新旧混跑）。**pid 已确认死亡的**标记顺手删除（避免越积越多）；
+    exclude_markers（本窗自己的标记路径/文件名）跳过且保留——同 pid 多窗下不能
+    再用 exclude_pid 这种按 pid 过滤的方式（会把同进程所有窗都排除）。
+    pid_alive_fn 可注入（测试用）。
+
+    缺陷 18：解析失败（半写文件）或字段非法（判不出 pid）的标记**只跳过、不删**
+    ——写侧此刻可能正写到一半，删掉等于把活进程的避让标记清掉；只有确认 pid
+    已死的标记才回收。
     """
     alive = pid_alive_fn if pid_alive_fn is not None else pid_alive
     try:
@@ -466,18 +490,26 @@ def read_live_instances(
     for f in files:
         try:
             data = json.loads(f.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue  # 半写/损坏：判不出 pid，绝不删（可能是活进程正在写的文件）
+        try:
             pid = int(data.get('pid', 0))
-            if exclude_pid is not None and pid == exclude_pid:
-                continue
-            if f.name in exclude_names:
-                continue
-            if not alive(pid):
-                raise OSError('stale marker')
-            x, y, w, h = (int(data.get(k, 0)) for k in ('x', 'y', 'w', 'h'))
-            instances.append((pid, x, y, w, h))
-        except (OSError, ValueError, TypeError):
+        except (AttributeError, TypeError, ValueError):
+            continue  # 非对象 / pid 类型非法：同样只跳过不删
+        if exclude_pid is not None and pid == exclude_pid:
+            continue
+        if f.name in exclude_names:
+            continue
+        if not alive(pid):
+            # pid 已确认死亡：唯一的删除时机（陈旧标记不再虚增避让计数）。
             try:
                 f.unlink()
             except OSError:
                 pass
+            continue
+        try:
+            x, y, w, h = (int(data.get(k, 0)) for k in ('x', 'y', 'w', 'h'))
+        except (TypeError, ValueError):
+            continue  # 进程还活着但几何非法：跳过并保留（下次写盘自然刷新）
+        instances.append((pid, x, y, w, h))
     return instances

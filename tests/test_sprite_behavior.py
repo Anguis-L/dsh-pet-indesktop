@@ -1052,3 +1052,161 @@ def test_predict_warm_runs_off_gui_thread():
     assert done.wait(5.0), "warm 未被派发执行"
     assert seen["thread"] != threading.main_thread().name
     assert "prewarm" in seen["thread"]
+
+
+# ---------------------------------------------------------------- 播放速率与计划时长
+def _real_clip_sprite(tmp_path, name="idle1", count=12):
+    """真 PetSprite + 真 FrameSeqClip（计划时长必须按 sprite 速率读）。
+
+    计划读取点发生在 **bind 之前**，缓存 clip 里残留的是上一次绑定的速率。
+    假 clip（``FakeClip``）没有 ``playback_speed`` 字段，覆盖不到这条路径，
+    故本段用真帧序列素材（Qt 现场生成 webp，不碰 ffmpeg）。
+    """
+    from pet.frameseq_clip import FrameSeqClip
+    from tests.test_frameseq_clip import _make_frames
+
+    frames_dir = tmp_path / name
+    _make_frames(frames_dir, count=count)
+    clip = FrameSeqClip(frames_dir)
+    lib = _make_library()
+    lib._clips[name] = clip
+    sprite = _make_sprite(lib)
+    return sprite, clip, lib
+
+
+def _assert_plan_duration_follows_sprite_rate(tmp_path, sprite_rate, stale_rate):
+    """读一次计划时长，断言它 = bind 后按 sprite 速率播放的真实时长。"""
+    sprite, clip, _lib = _real_clip_sprite(tmp_path)
+    try:
+        sprite.playback_speed = sprite_rate
+        clip.set_playback_speed(stale_rate)     # 残留速率（上次绑定留下的）
+        stale_duration = clip.duration()        # 库口径 = clip 当前速率下的时长
+        expected = stale_duration * stale_rate / sprite_rate
+        assert abs(expected - stale_duration) > 1e-9, "夹具有效性：两种速率必须给出不同时长"
+
+        c = BehaviorController(BOUNDS, rng=ScriptedRng())
+        c.tick([sprite], 0.016)                 # 进待机：读计划时长 → bind 对齐速率
+
+        st = c._states[sprite]
+        assert abs(st.duration - expected) < 1e-9, (
+            f"计划时长必须按 sprite 速率 {sprite_rate} 读，实测 {st.duration}")
+        assert abs(st.duration - clip.duration()) < 1e-9, (
+            "计划时长必须与 bind 后的真实时长一致（否则状态机按错误时长推进）")
+    finally:
+        clip.close()
+
+
+def test_plan_duration_follows_slow_sprite_rate_despite_faster_clip_residue(tmp_path):
+    """sprite 慢放（0.5）+ clip 残留 2.0：计划绝不能被残留速率提前切走。"""
+    _assert_plan_duration_follows_sprite_rate(tmp_path, sprite_rate=0.5, stale_rate=2.0)
+
+
+def test_plan_duration_follows_fast_sprite_rate_despite_slower_clip_residue(tmp_path):
+    """sprite 快放（2.0）+ clip 残留 0.5：计划绝不能被残留速率拖长（末帧长停）。"""
+    _assert_plan_duration_follows_sprite_rate(tmp_path, sprite_rate=2.0, stale_rate=0.5)
+
+
+def test_plan_duration_zero_sprite_rate_falls_back_without_division_error(tmp_path):
+    """除零守卫：sprite 速率为 0（异常配置/构造期）时按库口径返回，绝不抛。"""
+    sprite, clip, lib = _real_clip_sprite(tmp_path)
+    try:
+        expected = lib.duration("idle1")            # 换算前的库口径（速率 1.0）
+        sprite.playback_speed = 0.0
+        c = BehaviorController(BOUNDS, rng=ScriptedRng())
+        c.tick([sprite], 0.016)
+
+        assert abs(c._states[sprite].duration - expected) < 1e-9
+    finally:
+        clip.close()
+
+
+def test_move_plan_loop_duration_follows_sprite_rate(tmp_path):
+    """移动计划的 loop_duration 同口径：读错 → 位移量化与墙钟失配（脚滑）。"""
+    sprite, clip, lib = _real_clip_sprite(tmp_path, name="walk")
+    try:
+        sprite.playback_speed = 2.0
+        sprite.facing = "right"                 # 与掷出的方向一致：不绕转向
+        clip.set_playback_speed(0.5)            # 残留速率
+        stale_loop = clip.duration()
+        c = BehaviorController(BOUNDS, rng=ScriptedRng(choices=(1,)))
+        c.tick([sprite], 0.016)                 # 先接管进待机（建状态/predictor）
+        st = c._states[sprite]
+
+        assert c._plan_move(sprite, st, c._categories(lib), anim_override="walk") is True
+
+        assert abs(st.loop_duration - clip.duration()) < 1e-9, (
+            f"移动计划的圈时长必须按 sprite 速率读（残留 {stale_loop} ≠ 真值）")
+        assert abs(st.duration - st.loops * st.loop_duration) < 1e-9, (
+            "总时长必须等于整圈量化结果（位移与墙钟同源）")
+    finally:
+        clip.close()
+
+
+# ---------------------------------------------------------------- 预热提交的库级闸门
+class _GatedLibrary:
+    """带库级预热闸门的假库：``warm_allowed()`` 可切，其余面直通 inner。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.allowed = True
+
+    def warm_allowed(self):
+        return self.allowed
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+
+class _RecordingExecutor:
+    """记录型预热执行器（只记批次，不真跑 worker）。"""
+
+    def __init__(self):
+        self.batches: list[tuple] = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.batches.append((fn, args, kwargs))
+        return None
+
+
+def test_predict_warm_respects_library_gate(tmp_path, monkeypatch):
+    """预测预热必须过库级闸门：关闭预热 / 隐藏暂停后零提交，开闸恢复提交。"""
+    import pet.sprite_behavior as sprite_behavior_mod
+
+    executor = _RecordingExecutor()
+    monkeypatch.setattr(sprite_behavior_mod, "_WARM_EXECUTOR", executor)
+    inner = _make_library()
+    inner.clip("idle1").warm_first_frame = lambda: None
+    lib = _GatedLibrary(inner)
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+
+    predictor = c._states[sprite].predictor
+    assert predictor is not None
+
+    lib.allowed = False
+    predictor._warm("idle1")
+    assert executor.batches == [], "库级闸门关闭时预测预热不得提交"
+
+    lib.allowed = True
+    predictor._warm("idle1")
+    assert len(executor.batches) == 1, "开闸后预测预热照旧提交"
+
+
+def test_predict_warm_without_gate_api_still_submits(tmp_path, monkeypatch):
+    """鸭式库没有 ``warm_allowed()``（测试假对象/轻量替身）：按放行。"""
+    import pet.sprite_behavior as sprite_behavior_mod
+
+    executor = _RecordingExecutor()
+    monkeypatch.setattr(sprite_behavior_mod, "_WARM_EXECUTOR", executor)
+    lib = _make_library()
+    lib.clip("idle1").warm_first_frame = lambda: None
+    sprite = _make_sprite(lib)
+    c = BehaviorController(BOUNDS, rng=ScriptedRng(rolls=(0.99,)))
+    c.predict_enabled = False
+    c.tick([sprite], 0.016)
+
+    c._states[sprite].predictor._warm("idle1")
+
+    assert len(executor.batches) == 1

@@ -38,7 +38,7 @@ from ctypes import wintypes
 from typing import Callable, Optional
 
 import shiboken6
-from PySide6.QtCore import QCoreApplication, QObject
+from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, QObject
 
 from . import webm_clip
 
@@ -109,6 +109,24 @@ _MSG_MESSAGE_OFFSET = _WinMsg.message.offset
 _MSG_FIELD_TYPE = ctypes.c_uint  # MSG.message 是 UINT
 
 
+def _message_address(message) -> int:
+    """把原生事件过滤器的 ``message`` 参数归一成 MSG 地址（非指针形态返回 0）。
+
+    PySide6 6.x 传给 ``nativeEventFilter`` 的是 ``shiboken6.VoidPtr``——实测
+    （6.11，``windows_generic_MSG`` 路径）**不是 int**；而测试与部分调用方直接
+    传 ``ctypes.addressof`` 得到的 int。两种形态在这里统一成整型地址：只认 int
+    的实现会把真机上传进来的每一条消息都判成"不是消息"，锁屏/挂起/关机通知
+    收得到也认不出来。其余形态（None / 字符串 / 已失效对象）一律返回 0，调用
+    方据此短路，绝不拿非指针去做解引用。
+    """
+    if isinstance(message, int):
+        return message if message > 0 else 0
+    try:
+        return max(0, int(message))
+    except (TypeError, ValueError):
+        return 0
+
+
 def session_end_reason(message) -> Optional[str]:
     """把原生事件过滤器的 message 参数翻译成会话结束原因（非会话消息返回 None）。
 
@@ -118,14 +136,16 @@ def session_end_reason(message) -> Optional[str]:
     消息（WM_PAINT/WM_MOUSEMOVE…）的这次整结构拷贝纯属浪费；只有确认是关机/
     注销消息时才完整解析 MSG（用于 wParam/lParam 留痕）。
 
-    解析失败（非 Windows / 指针失效 / PySide6 传参形态变化）一律返回 None——
-    本模块只做观测，任何异常都必须吞掉，绝不让 Qt 事件循环因探测器崩掉。
+    ``message`` 的形态差异（PySide6 的 VoidPtr / 测试的 int 地址）统一由
+    :func:`_message_address` 归一。解析失败（非 Windows / 指针失效）一律返回
+    None——本模块只做观测，任何异常都必须吞掉，绝不让 Qt 事件循环因探测器崩掉。
     """
-    if not isinstance(message, int) or message <= 0:
+    address = _message_address(message)
+    if address <= 0:
         return None
     try:
         msg_id = int(_MSG_FIELD_TYPE.from_address(
-            message + _MSG_MESSAGE_OFFSET).value)
+            address + _MSG_MESSAGE_OFFSET).value)
         reason = _SESSION_END_MESSAGES.get(msg_id)
     except Exception:
         return None
@@ -136,7 +156,7 @@ def session_end_reason(message) -> Optional[str]:
     # 诊断少一行，也绝不能漏掉关机信号。
     try:
         win_msg = _WinMsg.from_buffer_copy(
-            ctypes.string_at(message, ctypes.sizeof(_WinMsg)))
+            ctypes.string_at(address, ctypes.sizeof(_WinMsg)))
     except Exception:
         return reason
     logger.debug('原生会话消息 0x%04X wParam=%s lParam=%s',
@@ -152,11 +172,12 @@ def _suspend_state(message) -> Optional[tuple]:
     过滤器每条消息都会被调用）。不认识的 wParam（如 Windows 新增的电源事件、
     ``PBT_APMQUERYSUSPEND`` 查询）一律返回 None：只观测、不改状态。
     """
-    if not isinstance(message, int) or message <= 0:
+    address = _message_address(message)
+    if address <= 0:
         return None
     try:
         msg_id = int(_MSG_FIELD_TYPE.from_address(
-            message + _MSG_MESSAGE_OFFSET).value)
+            address + _MSG_MESSAGE_OFFSET).value)
         states = _SUSPEND_MESSAGES.get(msg_id)
     except Exception:
         return None
@@ -164,7 +185,7 @@ def _suspend_state(message) -> Optional[tuple]:
         return None
     try:
         win_msg = _WinMsg.from_buffer_copy(
-            ctypes.string_at(message, ctypes.sizeof(_WinMsg)))
+            ctypes.string_at(address, ctypes.sizeof(_WinMsg)))
     except Exception:
         return None
     entry = states.get(int(win_msg.wParam))
@@ -201,16 +222,25 @@ def _wts_unregister_session_notification(hwnd: int) -> int:
         _ctypes.c_void_p(int(hwnd))))
 
 
-class SessionWatcher(QObject):
+class SessionWatcher(QObject, QAbstractNativeEventFilter):
     """会话结束探测器：置位 ffmpeg spawn 闸门 + 跑安全网回调（幂等）。
 
     生命周期：由 AppShell 创建并强引用持有，进程存活期间常驻。
+
+    双继承不可省（缺陷 12）：``installNativeEventFilter`` 只接受
+    ``QAbstractNativeEventFilter``——普通 QObject 子类会直接 TypeError，
+    于是 WTS 注册成功也收不到 ``WM_WTSSESSION_CHANGE``。
     """
 
     def __init__(self, app=None, on_session_end: Optional[Callable[[], None]] = None,
                  install_native_filter: bool = True,
                  on_suspend_change: Optional[Callable[[bool, str], None]] = None) -> None:
-        super().__init__(None)
+        # 两个基类必须各自显式初始化：``super().__init__()`` 只走到第一个基类
+        # （QObject），漏掉 ``QAbstractNativeEventFilter.__init__`` 时 C++ 侧的
+        # 过滤器子对象没建起来，Qt 的原生消息派发不会回调到这里——实测表现为
+        # "装上了但一条消息都收不到"（与"根本没装上"一样静默）。
+        QObject.__init__(self, None)
+        QAbstractNativeEventFilter.__init__(self)
         self._app = app if app is not None else QCoreApplication.instance()
         self._on_session_end = on_session_end
         self._on_suspend_change = on_suspend_change
@@ -229,7 +259,13 @@ class SessionWatcher(QObject):
 
     # ------------------------------------------------------------ 安装
     def install(self) -> bool:
-        """安装原生过滤器并接线 Qt 会话信号（幂等；无 QApplication 时为无操作）。"""
+        """安装原生过滤器并接线 Qt 会话信号（幂等；无 QApplication 时为无操作）。
+
+        返回 True 只代表**真装上了**：环境不具备安装条件（无 QApplication /
+        非 Windows / 过滤器被 Qt 拒绝）时返回 False 并记 warning——置一个假的
+        成功位就再没人重试，日志里也看不出锁屏/挂起探测其实没接入（缺陷 12：
+        线上日志从无"触发因=suspended"，与"装失败报成功"互相印证）。
+        """
         if self._installed:
             return True
         if self._app is None or not shiboken6.isValid(self._app):
@@ -239,10 +275,34 @@ class SessionWatcher(QObject):
             try:
                 self._app.installNativeEventFilter(self)
             except AttributeError:
-                pass  # 鸭子类型替身（测试桩）没有该方法：只保留信号兜底路径
+                # 鸭子类型替身（测试桩）没有该方法：只保留信号兜底路径
+                logger.warning('app 无 installNativeEventFilter（替身/异常环境）：'
+                               '关机与锁屏探测降级为 Qt 会话信号兜底')
+                return False
             except Exception:
-                logger.debug('安装会话结束原生事件过滤器失败', exc_info=True)
+                logger.warning('安装会话结束原生事件过滤器失败：'
+                               '关机与锁屏探测降级为 Qt 会话信号兜底', exc_info=True)
+                return False
         self._installed = True
+        return True
+
+    def uninstall(self) -> bool:
+        """摘掉应用级原生过滤器（幂等；退出收口调用）。
+
+        Qt 的过滤器表只存裸指针、不持有对象：探测器被销毁而过滤器还挂着，
+        下一条原生消息就会回调到已释放对象上。故退出收口必须显式摘除。
+        """
+        if not self._installed:
+            return False
+        self._installed = False
+        app_ = self._app
+        if app_ is None or not shiboken6.isValid(app_):
+            return False
+        try:
+            app_.removeNativeEventFilter(self)
+        except Exception:
+            logger.warning('摘除会话结束原生事件过滤器失败', exc_info=True)
+            return False
         return True
 
     def connect_app_signals(self) -> bool:
@@ -268,8 +328,10 @@ class SessionWatcher(QObject):
     def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt API
         """应用级原生事件过滤器：Windows 关机/注销 → 置位闸门；锁屏/挂起 → 降档。
 
-        恒返回 ``(False, 0)``：只观测、不拦截——绝不 veto 关机，也不改变 Qt 的
-        默认处理（Qt 对 WM_QUERYENDSESSION 的应答语义保持原样）。
+        恒返回 ``(False, 0)``（返回值 + ``qintptr *result`` 出参）：只观测、不
+        拦截——绝不 veto 关机，也不改变 Qt 的默认处理（Qt 对 WM_QUERYENDSESSION
+        的应答语义保持原样）。``event_type`` 是 Qt 给的 ``QByteArray``
+        （Windows 上恒为 ``windows_generic_MSG``），本模块不解释它。
 
         两条分支互不影响：会话结束 latch 一旦置位就不再观测（关机窗口里锁屏
         消息没有意义）；锁屏/挂起在任何时候都转发给 ``on_suspend_change``

@@ -419,6 +419,9 @@ def test_warm_first_frame_never_builds_pixmap_off_gui_thread(tmp_path, pixmap_pr
 
     改前它在**非 GUI 线程**里 QPixmap.fromImage——Qt 的 QPixmap 只能在 GUI 线程
     构造。改后预热只解 QImage，pixmap 留给 GUI 线程按需构建。
+
+    提交（显示槽写入）经 queued 信号投递到 clip 所属线程，因此等到事件队列
+    排空才算"预热产物到货"——期间后台线程同样不得构建 QPixmap。
     """
     d = tmp_path / "clip"
     _make_frames(d, count=3)
@@ -428,8 +431,9 @@ def test_warm_first_frame_never_builds_pixmap_off_gui_thread(tmp_path, pixmap_pr
         t.start()
         t.join(5.0)
         assert not t.is_alive()
-        assert clip.currentImage() is not None      # 预热产物仍在（QImage 跨线程安全）
         assert pixmap_probe.calls == [], "预热线程构建 QPixmap = 跨线程用 QPixmap"
+        _pump_until(lambda: clip.currentImage() is not None)  # 提交队列排空
+        assert clip.currentImage() is not None      # 预热产物仍在（QImage 跨线程安全）
         pm = clip.currentPixmap()
         assert pm is not None and pixmap_probe.calls == [threading.get_ident()]
     finally:
@@ -761,3 +765,188 @@ def test_play_path_never_lists_frames_when_meta_is_authoritative(
         assert _live_path_count() - before < 20, "帧表不得常驻 Path 对象"
     finally:
         clip.close()
+
+
+# ---------------------------------------- 收口：worker 回收（O2，2026-10-03）
+def _wait_worker_destroyed(worker, timeout_s=5.0):
+    """等 worker 的延迟销毁真正落地（事件泵 + 宽预算，不赌固定 sleep）。
+
+    worker 的线程亲和性在进程级共享预取线程上：``deleteLater`` 投递的
+    DeferredDelete 由那个线程的事件循环处理，因此这里只能轮询对象有效性。
+    """
+    import shiboken6
+
+    deadline = time.monotonic() + timeout_s
+    while shiboken6.isValid(worker) and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    return not shiboken6.isValid(worker)
+
+
+def test_library_shutdown_closes_frameseq_clip_and_recycles_worker(tmp_path):
+    """库收口必须走 clip.close()：FrameSeqClip 的 worker 由 deleteLater 回收。
+
+    改前 library.shutdown 的收口循环只试 cleanup（仅 WebMClip 有）否则 stop()，
+    FrameSeqClip 永远走 stop 分支、close() 零调用 → worker 从不 deleteLater，
+    只能靠 Python GC 在 GUI 线程析构一个亲和于共享预取线程的 QObject，与在飞
+    prefetch 竞态（该文件 :84-92 的同类 AV 前科）。
+    """
+    import shiboken6
+
+    videos = _make_pack(tmp_path)
+    lib = MovieLibrary(character_id="shenshen", asset_dir=videos,
+                       prewarm_enabled=False)
+    try:
+        clip = lib.movie("x")
+        assert isinstance(clip, FrameSeqClip)
+        worker = clip._worker
+        assert shiboken6.isValid(worker) and clip._prefetch_thread.isRunning()
+
+        lib.shutdown()
+
+        assert _wait_worker_destroyed(worker), \
+            "库收口后 worker 必须已 deleteLater 并被共享线程回收"
+    finally:
+        lib.shutdown()
+
+
+def test_frameseq_close_is_idempotent(tmp_path):
+    """close() 幂等：重复调用不得二次 deleteLater（半销毁对象上会抛 RuntimeError）。"""
+    import shiboken6
+
+    d = tmp_path / "clip"
+    _make_frames(d, count=3)
+    clip = FrameSeqClip(d)
+    worker = clip._worker
+    clip.close()
+    assert _wait_worker_destroyed(worker)
+
+    clip.close()  # 已销毁对象的二次 deleteLater：改前实测 RuntimeError
+    clip.close()
+    assert not shiboken6.isValid(worker)
+
+
+# ------------------------------ 后台预热提交（O3：显示槽只由 GUI 线程写）
+class _GatedDecodeProbe:
+    """``frameseq_clip.QImage`` 计数替身：非 GUI 线程的加载在闸门上阻塞。
+
+    复现"后台已检查过显示槽为空、正在解码"的那段窗口：闸门放行前前台可以
+    任意提交新帧。测的是产品代码那一次解码请求（模块名绑定即 seam）。
+    """
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.gui_thread = threading.get_ident()
+        self.calls: list[tuple[int, str]] = []
+
+    def __call__(self, path):
+        self.calls.append((threading.get_ident(), str(path)))
+        if threading.get_ident() != self.gui_thread:
+            self.entered.set()
+            self.release.wait(10.0)
+        return QImage(path)
+
+
+def test_background_warm_never_overwrites_newer_displayed_frame(
+        tmp_path, monkeypatch):
+    """后台预热不得倒写显示槽：提交走 GUI 线程、槽内复核空槽。
+
+    改前 warm_first_frame 在后台线程里"检查 _img is None → 解 QImage（IO）→
+    _apply(img, 0)"三步无原子性：期间 GUI 起播/跳帧提交的新帧会被倒写成帧 0
+    （图与帧号不一致），release_idle_frames 刚清空的槽也会被重新填回。
+    """
+    from pet import frameseq_clip
+
+    d = tmp_path / "clip"
+    _make_frames(d, count=4)
+    probe = _GatedDecodeProbe()
+    monkeypatch.setattr(frameseq_clip, "QImage", probe)
+    clip = FrameSeqClip(d)
+    try:
+        worker = threading.Thread(target=clip.warm_first_frame, daemon=True)
+        worker.start()
+        assert probe.entered.wait(5.0), "后台预热未进入解码"
+        assert clip.currentImage() is None, "后台此刻还没提交（显示槽为空）"
+
+        # 前台（GUI 线程）在后台解码期间提交帧 3
+        assert clip.jumpToFrame(3) is True
+        newer = clip.currentImage()
+        assert clip._img_frame == 3
+
+        probe.release.set()
+        worker.join(5.0)
+        assert not worker.is_alive()
+        # 后台的提交是 queued 到 GUI 线程的：排空事件队列后必须被复核拦下
+        for _ in range(3):
+            QApplication.processEvents()
+
+        assert clip._img_frame == 3, "后台预热把显示槽倒写成帧 0 了"
+        assert clip.currentImage() is newer, "显示槽必须是前台提交的那一帧"
+        assert 0 not in clip._pending, "被拦下的预热帧不得寄存回 _pending"
+    finally:
+        clip.close()
+
+
+def test_background_warm_commits_pending_frame_zero_for_start(
+        tmp_path, decode_probe):
+    """正常路子（生产预热线程）：提交经 GUI 线程照旧落地，起播零解码。
+
+    与 test_warm_then_start_reuses_frame_zero_without_second_decode 同一口径，
+    只是预热跑在后台线程（生产路径）——预热结果寄存 _pending[0]、显示槽是帧 0，
+    start() 直接弹出来上屏、不再让 worker 解第二遍。
+    """
+    d = tmp_path / "clip"
+    _make_frames(d, count=4)
+    f0 = str(d / "f_0001.webp")
+    clip = FrameSeqClip(d)
+    hits = []
+    clip.frameChanged.connect(hits.append)
+    try:
+        worker = threading.Thread(target=clip.warm_first_frame, daemon=True)
+        worker.start()
+        worker.join(5.0)
+        assert not worker.is_alive()
+
+        _pump_until(lambda: clip._img_frame == 0)     # 提交在 GUI 线程落地
+        warm = clip.currentImage()
+        assert warm is not None and clip._pending[0] is warm
+        assert decode_probe.calls.count(f0) == 1
+
+        assert clip.start() is True
+        assert hits == [0], "预热帧在 start() 即上屏（帧 0 通知同步发出）"
+        assert clip.currentImage() is warm
+        assert clip._awaiting == -1                   # 没进"等帧 0"
+        QApplication.processEvents()
+        assert decode_probe.calls.count(f0) == 1, "起播不得再解一遍帧 0"
+    finally:
+        clip.close()
+
+
+def test_background_warm_on_half_destroyed_clip_degrades_quietly(tmp_path):
+    """半销毁（C++ 侧已删）clip 的后台预热：安静降级，绝不把异常抛给预热线程。
+
+    新提交路径要读线程归属、要投递信号，两者在已删对象上都会 RuntimeError；
+    预热是尽力而为的后台动作（library._run_phase 逐 clip 吞异常），这里按既有
+    口径安静返回，等下一次起播同步解码。
+    """
+    import shiboken6
+
+    d = tmp_path / "clip"
+    _make_frames(d, count=2)
+    clip = FrameSeqClip(d)
+    shiboken6.delete(clip)                        # 同步销毁 C++ 侧，包装器留下
+    assert not shiboken6.isValid(clip)
+    errors: list = []
+
+    def _run() -> None:
+        try:
+            clip.warm_first_frame()
+        except BaseException as exc:              # noqa: BLE001 - 断言"什么都没抛"
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(5.0)
+    assert not worker.is_alive()
+    assert errors == [], f"半销毁 clip 的预热不得抛异常：{errors}"
