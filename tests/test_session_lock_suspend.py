@@ -384,6 +384,8 @@ def test_watcher_satisfies_qt_native_filter_contract():
     assert watcher._installed is False, "未安装（app=None）时不得谎报已安装"
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="原生过滤器安装仅在 Windows 启用（install() 的 os.name 门）")
 def test_install_really_hands_the_filter_to_qapplication():
     """install() 必须真把 self 交给 QApplication——不是吞掉异常后的假成功。"""
     from PySide6.QtWidgets import QApplication
@@ -405,6 +407,8 @@ def test_install_really_hands_the_filter_to_qapplication():
         application.removeNativeEventFilter(watcher)
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="原生过滤器安装仅在 Windows 启用（install() 的 os.name 门）")
 def test_uninstall_detaches_filter_and_is_idempotent():
     """收口时必须能摘掉原生过滤器（Qt 只存裸指针，不给它留悬垂对象）。"""
     from PySide6.QtWidgets import QApplication
