@@ -121,3 +121,13 @@
 **验证**：邻域 6 连跑全绿（对照 deleteLater 版 3/17 崩）；`test_frameseq_clip.py` 31 passed；ruff 净；最终全量见 final-fullsuite3.log。
 
 **边界**：早前隔离的 `test_retained_frame_is_not_reused_as_frame_zero` 肇事于本批之前（上周），与本放大器不同源，维持隔离+立项根修不变。
+
+## 第三轮修正（2026-10-03 深夜）：macOS CI 三文件组合段错误的处置
+
+**现象**：推本批后 macOS CI 在主套件 81% 处确定性段错误（3/3 同点：`test_sprite_visibility.py::test_rebind_while_paused_stays_paused` 边界，崩溃线程为无 Python 帧的原生线程）。Windows/ubuntu 同代码全绿（各 2 次）+ 本地 Windows 同组合 8 连跑仅 1 崩。
+
+**定位链**：单文件（visibility）绿 → 双文件三组合全绿 → 三文件（overlay_spawn + overlay_lifecycle_gaps + visibility）同进程必崩 = 跨文件累积态炸弹。Windows 本地复现的 dump 显示两个 `overlay_shell._load`（自言自语配图加载）守护线程跨测试存活，崩在主线程测试体的原生调用里。预热信号与 close() 的 deleteLater 均已分别经对照实验排除（后者是 ubuntu/windows 家族的放大器，已修）。
+
+**处置**（webm 生命周期族先例）：macOS 主套件摘除这三文件，三文件各自独立进程照跑（独立进程实测全绿；断言真失败照样红）；win/ubuntu 保留主套件内全覆盖。同步改动 `build-macos.yml`。
+
+**未结案**：跨测试累积态的原生崩溃根因（疑似测试壳的自言自语配图加载线程 × 事件泵 × Qt 对象销毁时序）归 frameseq/生命周期专项。本轮为 CI 门禁止血，非根修。
