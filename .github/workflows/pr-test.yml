@@ -74,7 +74,7 @@ jobs:
       # 段错误（3/3）。拆小段跑：先跑崩点所在文件本身，看单文件是否复现。
       - name: Pytest (mac subset diag)
         if: matrix.os == 'macos-latest'
-        run: python -m pytest -v tests/test_sprite_visibility.py
+        run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_overlay_shell.py tests/test_sprite_visibility.py
 
       # webm 生命周期族（reader/ffmpeg 进程 teardown 竞态）在 macOS CI 上
       # 偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher）。
