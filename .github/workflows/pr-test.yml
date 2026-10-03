@@ -75,10 +75,10 @@ jobs:
       - name: Pytest (mac subset diag)
         if: matrix.os == 'macos-latest'
         run: |
-        # TEMP-DIAG：三组合各自独立进程，崩溃只打断当组，日志标记定位埋雷文件
-        python -m pytest -v tests/test_overlay_spawn.py tests/test_sprite_visibility.py; echo "DIAG-SUBSET-1-EXIT=$?"
-        python -m pytest -v tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py; echo "DIAG-SUBSET-2-EXIT=$?"
-        python -m pytest -v tests/test_overlay_shell.py tests/test_sprite_visibility.py; echo "DIAG-SUBSET-3-EXIT=$?"
+          # TEMP-DIAG：三组合各自独立进程，崩溃只打断当组，日志标记定位埋雷文件
+          python -m pytest -v tests/test_overlay_spawn.py tests/test_sprite_visibility.py; echo "DIAG-SUBSET-1-EXIT=$?"
+          python -m pytest -v tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py; echo "DIAG-SUBSET-2-EXIT=$?"
+          python -m pytest -v tests/test_overlay_shell.py tests/test_sprite_visibility.py; echo "DIAG-SUBSET-3-EXIT=$?"
 
       # webm 生命周期族（reader/ffmpeg 进程 teardown 竞态）在 macOS CI 上
       # 偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher）。
