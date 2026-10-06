@@ -695,7 +695,8 @@ function writeRecordDedup(extra) {
   writeRecord(extra);
 }
 
-// 写 record 去重前的代理：mux 交互记录（审批/问题）走 writeRecordDedup，其余事件（状态/工具/结果/错误）直接走 writeRecord。
+// 写 record 去重前的代理：需要按 callId 去重的交互记录（问题请求在 assistant/message
+// 与独立 tool/call 两处都会出现）走 writeRecordDedup，其余事件直接走 writeRecord。
 
 export function apply(ctx) {
   // Make the resolved runtime destination observable for packaged builds.
