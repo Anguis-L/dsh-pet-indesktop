@@ -65,6 +65,7 @@ try {
     "messageText", "commandFromArgs", "summarizeArgs", "extractCommand",
     "latestCommandFor", "argsKey", "resultSummary",
     "createUserMessage", "deepFreezeMessage",
+    "session-shape", "rawWorkspace", "rawProject",
   ]) {
     assert.ok(
       !source.includes(banned),

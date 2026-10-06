@@ -2191,18 +2191,6 @@ class AppShell:
             logging.exception("停止自拉起的 dsh 服务失败")
             return []
 
-    # ------------------------------------------------------------ DSH 状态接线
-    def _dsh_link_manager(self):
-        """当前主窗的 Agent 联动管理器（无窗/未创建时为 None）。
-
-        overlay 拓扑经 ``self.win`` 拿到 sprite 壳，返回的是壳持有的**同一个**
-        共享 agent_link（AppShell.start() 注入的那份），DSH 离线收口照常生效。
-        """
-        win = self.win
-        if win is None:
-            return None
-        return getattr(win, "agent_link_manager", None)
-
     def _on_dsh_state_changed(self, from_state: str, to_state: str) -> None:
         """订阅 DSH 统一状态变化（共享 Agent 联动管理器转发；收敛器是纯逻辑，
         读方是 DshMonitor 自身）。AppShell 侧只剩灵动岛的 agent 活跃指示——

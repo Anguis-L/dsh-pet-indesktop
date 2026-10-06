@@ -2913,16 +2913,16 @@ def test_dsh_converged_state_wiring_drives_thinking(tmp_path, monkeypatch):
 
         # thinking 状态也触发（turn/start 路径）；同轮重复由呈现管线去重
         notified.clear()
-        monitor.dsh_state_changed.emit("working", "thinking")
+        monitor.dsh_state_changed.emit("working", "thinking", "turn/start")
         assert notified == ["thinking"]
 
         # offline：收掉失效的常驻审批/问题气泡
-        monitor.dsh_state_changed.emit("thinking", "offline")
+        monitor.dsh_state_changed.emit("thinking", "offline", "")
         assert dismissed == [True]
 
         # 非 thinking/offline/等待态不动作
         notified.clear()
-        monitor.dsh_state_changed.emit("thinking", "working")
+        monitor.dsh_state_changed.emit("thinking", "working", "tool/call")
         assert notified == []
 
         # AppShell 转发口在无岛时必须静默 no-op

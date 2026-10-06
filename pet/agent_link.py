@@ -49,7 +49,7 @@ from .node_runtime import augmented_path as _augmented_path
 from .node_runtime import global_node_modules_roots
 
 from .persona_phrases import PhrasePicker
-from .persona_template import CONDITIONAL_PARAMETERS
+from .persona_template import CONDITIONAL_PARAMETERS, LEGACY_HIDDEN_PARAMETERS
 from .speech_bubble_text import truncate_bubble_text
 
 log = logging.getLogger("dsh-pet-standalone")
@@ -1635,9 +1635,6 @@ class BaseAgentMonitor(QObject):
                 meta_type = str(data.get("type", ""))
                 if meta_type == "session/meta":
                     self._emit(self.session_meta, (self.agent_key, data))
-                # 调试输出：debug/session-shape（仅首次，之后可通过配置关闭）
-                if meta_type == "debug/session-shape":
-                    log.info("[dsh-pet-bridge] session shape: %s", json.dumps(data, ensure_ascii=False)[:500])
                 # 模型访问失败事件：model_access（服务端限流/过载码）→ 信号转发给 Manager 显示提醒
                 if ev == "model_access":
                     self._emit(self.model_access, (self.agent_key, data))
@@ -1658,7 +1655,7 @@ class BaseAgentMonitor(QObject):
                     and normalized is None
                     and not normalize_event_state(ev, "")
                     and ev not in _RAW_BRIDGE_KNOWN_EVENTS
-                    and meta_type not in ("session/meta", "debug/session-shape")
+                    and meta_type != "session/meta"
                 ):
                     self._emit(self.unknown_bridge_event, (self.agent_key, data))
                 normalized = normalize_event_state(ev, st)
@@ -1692,8 +1689,10 @@ class DshMonitor(BaseAgentMonitor):
     PLUGIN_NAME = "@dsh-pet/bridge"
 
     # 收敛器输出（worker 线程 emit，队列投递回主线程）：
-    # dsh_state_changed(from_state, to_state)；from_state 为 "" 表示首个状态
-    dsh_state_changed = Signal(str, str)
+    # dsh_state_changed(from_state, to_state, source_event)；from_state 为 ""
+    # 表示首个状态；source_event 为触发事件的桥接事件名（探活基线为 ""），
+    # 供管理器做同源气泡去重（cordis/approval 有专属常驻气泡，不再弹通用提醒）。
+    dsh_state_changed = Signal(str, str, str)
     # 真人用户消息 → (session_id, text)：对话开始的稳定触发点（sourceKind
     # 过滤在收敛器内完成；减法后桥接不再落明文 text，实参恒为 ""）。
     dsh_user_message = Signal(str, str)
@@ -1758,7 +1757,7 @@ class DshMonitor(BaseAgentMonitor):
     def _emit_converged(self, outputs: list) -> None:
         for item in outputs:
             if item[0] == "state":
-                self._emit(self.dsh_state_changed, (item[1], item[2]))
+                self._emit(self.dsh_state_changed, (item[1], item[2], item[3]))
             elif item[0] == "user_message":
                 self._emit(self.dsh_user_message, (item[1], item[2]))
 
@@ -2942,17 +2941,22 @@ class AgentLinkManager(QObject):
             return
         self._on_agent_state("dsh", state, mon._emit_gen)
 
-    def _on_dsh_converged_state(self, from_state: str, to_state: str) -> None:
+    def _on_dsh_converged_state(self, from_state: str, to_state: str,
+                                source_event: str = "") -> None:
         """订阅 DSH 收敛状态变化（单读方收敛器 → 呈现管线 + AppShell 转发）。
 
         - 转发给 AppShell（灵动岛 set_agent_active / offline 收尾）；
         - thinking：legacy AgentStatus 基线只有 working/idle，thinking 由收敛器
           补进联动管线（思考气泡/动画——对话开始的稳定触发点之一，与真人消息
           双保险，呈现管线自带同态去重）；
-        - waiting_approval / waiting_question：审批/提问的纯提示气泡（减法后
-          不再有气泡内代点按钮）——busy 中也必须提示，所以不走
-          ``_on_agent_state`` 的「busy 后不弹 attention」分支；
-        - offline：DSH 断开/重启，审批/问题等阻塞交互必然失效，收掉常驻气泡。
+        - waiting_approval：审批把 Agent 卡在等用户输入——计入「需要看一眼」
+          （完成后不误报成功），并弹通用 attention 纯提示气泡（busy 中也必须
+          提示，不走 ``_on_agent_state`` 的「busy 后不弹 attention」分支）。
+          例外：cordis/request-run 与 approval/request 各有专属常驻提示气泡
+          （`_on_cordis_request` / `_on_approval_request`），同一条事件的
+          通用 attention 气泡跳过，防止双弹；
+        - waiting_question 只更新状态（岛指示/动画），不弹通用气泡——
+          常驻问题气泡已由 ``_on_question_request`` 呈现（同事件双弹回归）。
         """
         self.dsh_state_changed.emit(from_state, to_state)
         if to_state == "offline":
@@ -2961,9 +2965,10 @@ class AgentLinkManager(QObject):
         if to_state == "thinking":
             self.notify_dsh_state("thinking")
             return
-        if to_state in ("waiting_approval", "waiting_question"):
-            # 审批/提问把 Agent 卡在等用户输入：计入「需要看一眼」，完成后不误报成功
+        if to_state == "waiting_approval":
             self._saw_alert.add("dsh")
+            if source_event in ("cordis/request-run", "approval/request"):
+                return  # 专属常驻气泡已覆盖这条审批，不再弹通用 attention
             self._show_link_bubble(
                 self._dialogue("agent.attention", "主人，Agent 这边需要你看一眼～",
                                agent_key="dsh", name=self.AGENT_NAMES["dsh"]),
@@ -3184,8 +3189,10 @@ class AgentLinkManager(QObject):
         merged = dict(self._dialogue_context)
         merged.update(values)
         # 条件参数（CONDITIONAL_PARAMETERS）：上游未提供/为空/为 null 时渲染端
-        # 自动隐藏对应占位符，不原样露出 {xxx}。
-        autohide = CONDITIONAL_PARAMETERS.get(key, ())
+        # 自动隐藏对应占位符，不原样露出 {xxx}。LEGACY_HIDDEN_PARAMETERS 是
+        # 减法退役字段（command/argsKey/reasons）的全局兜底：旧自定义台词里的
+        # 这些占位符在任何事件下都隐藏。
+        autohide = tuple(CONDITIONAL_PARAMETERS.get(key, ())) + LEGACY_HIDDEN_PARAMETERS
         mode = str(self.cfg.get("dialogue_mode", "legacy") or "legacy")
         if mode == "custom":
             return self._phrase_picker.custom_for_agent(self.cfg.get("dialogue_phrases", {}), agent_key, key,
@@ -3882,7 +3889,7 @@ class AgentLinkManager(QObject):
 
     def _show_link_bubble(self, text: str, *, important: bool, duration_ms: int = 4500,
                           _retried: int = 0) -> None:
-        """联动气泡：提醒消息队列非空时一律让路（审批/问题/失败/卡住优先）。
+        """联动气泡：提醒消息队列非空时一律让路（审批/问题/失败等常驻提醒优先）。
 
         无提醒队列时：普通气泡直接让路丢弃；重要气泡每 2.5s 重试至多 4 次
         （约 10s 窗口），仍被占才放弃——主动识屏长答复可能占位 15-20s。"""
@@ -3890,7 +3897,7 @@ class AgentLinkManager(QObject):
             return
         # 桌宠隐藏时 show_bubble/show_alert 会静默丢弃：改道灵动岛反馈面
         # （AppShell 经 hidden_bubble_redirect 注入；无注入/岛不可用维持丢弃）。
-        # 审批/问题等交互气泡不经本函数，仍需桌宠可见。
+        # 审批/问题等常驻提示气泡不经本函数（走 show_alert 队列），仍需桌宠可见。
         is_visible = getattr(self.win, "isVisible", None)
         if callable(is_visible) and not is_visible():
             from . import window_alerts as _window_alerts
@@ -3982,7 +3989,7 @@ class AgentLinkManager(QObject):
     _MODEL_ACCESS_COOLDOWN_S = 8.0          # 同 session 8 秒内合并为一次
     _MODEL_ACCESS_DURATION_MS = 15000       # 基础展示 15 秒
     _MODEL_ACCESS_MAX_LIFETIME_MS = 30000   # 同一 session 从首次触发起最长保留 30 秒
-    _MODEL_ACCESS_PRIORITY = 1              # 高于普通状态气泡和 Watchdog（3）；审批(0)可抢占
+    _MODEL_ACCESS_PRIORITY = 1              # 高于普通状态气泡；审批/提问（0）可抢占
 
     @staticmethod
     def _model_access_alert_id(session_key: str) -> str:

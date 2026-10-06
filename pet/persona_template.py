@@ -14,14 +14,17 @@ TEMPLATE_VERSION = "persona-phrases/v1"
 # 对齐审计见 docs/PERSONA-TEMPLATE-FIELD-ALIGNMENT-2026-09-05.md。
 VARIABLES = {
     "name": "Agent 展示名称（所有事件都会注入）",
+    "command": "命令文本（减法退役兼容位：上游已不落盘，恒自动隐藏；仅为不戳破旧自定义台词保留声明）",
     "label": "标签（approval.tool/activity.*=工具中文标签；approval.generic、question.*、model_access.*、failure.*=会话标签，上游提供时可用）",
     "body": "问题内容（question.one；含 header 前缀）",
     "count": "数量（question.many=问题数；model_access.many=连续模型访问失败次数）",
+    "reasons": "判断原因（减法退役兼容位：检测器已删，恒自动隐藏）",
     "detail": "桥接安装失败详情（bridge.install.failed）",
     "event": "未知事件名（bridge.unknown；bridge 写出但桌宠当前版本不认识的事件名）",
     "text": "余额查询结果文本（balance.result）",
     "tool": "原始工具名（activity.*）",
     "toolName": "审批原始工具名（approval.*；上游记录提供时可用）",
+    "argsKey": "工具参数摘要键（减法退役兼容位：同 command，恒自动隐藏）",
     "callId": "工具调用 ID（activity.*；上游记录提供时可用）",
     "step": "turn 内步骤序号（activity.*；上游记录提供时可用）",
     "sessionName": "会话名（当前会话自身的标题/名字，来自会话元数据 sessionName；仅解析出真实名称时才注入，独立于 projectName——绝不拼组合串，无元数据时占位符自动隐藏，不会回退成 sessionId）",
@@ -40,7 +43,9 @@ VARIABLES = {
 # writeRecord/writeRecordDedup 实际写出的字段为准（2026-10 减法后核实）：
 #   公共: ts/agent/event 恒有；sessionId 存在时补 projectName/sessionName（session/meta）
 #   Pet 侧注入: agent_key（_remember_dialogue_record）
-#   脱敏口径：消息正文/命令/参数指纹/结果摘要不落盘（不落即不可得）。
+#   脱敏口径：消息正文/命令/参数指纹/结果摘要不落盘（不落即不可得）；
+#   command/argsKey/reasons 保留为 LEGACY_HIDDEN_PARAMETERS 兼容位——模板仍可
+#   宣称（不戳破用户旧台词），运行时恒不注入、渲染端自动隐藏。
 # 审批/提问/模型访问失败/硬失败/工具类文案与记录同轮触发，这些字段可靠；状态机
 # 触发的文案（start/thinking/agent.*/done.* 等）不保证拿到记录，勿依赖。
 BASE_FIELDS = ("ts", "agent", "agent_key", "event", "sessionId", "projectName", "sessionName", "label")
@@ -158,15 +163,15 @@ EVENT_DESCRIPTIONS: dict[str, str] = {
 # 改调用点 kwargs 时必须同步改这里（有 AST 回归测试）。
 PARAMETERS: dict[str, tuple[str, ...]] = {
     "start": ("name",), "thinking": ("name",),
-    "activity.read": ("name", "tool", "label", "callId", "step",
+    "activity.read": ("name", "tool", "label", "command", "argsKey", "callId", "step",
                       "sessionName", "projectName"),
-    "activity.search": ("name", "tool", "label", "callId", "step",
+    "activity.search": ("name", "tool", "label", "command", "argsKey", "callId", "step",
                         "sessionName", "projectName"),
-    "activity.edit": ("name", "tool", "label", "callId", "step",
+    "activity.edit": ("name", "tool", "label", "command", "argsKey", "callId", "step",
                       "sessionName", "projectName"),
-    "activity.run": ("name", "tool", "label", "callId", "step",
+    "activity.run": ("name", "tool", "label", "command", "argsKey", "callId", "step",
                      "sessionName", "projectName"),
-    "activity.default": ("name", "tool", "label", "callId", "step",
+    "activity.default": ("name", "tool", "label", "command", "argsKey", "callId", "step",
                          "sessionName", "projectName"),
     "agent.attention": ("name",), "agent.error": ("name",),
     "agent.missing": ("name",), "bridge.install.pending": ("name",),
@@ -193,10 +198,16 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
     "balance.loading": (), "balance.result": ("text",),
 }
 
-# 条件可用参数：调用点仅在上游记录提供该字段（非空/非 null）时才注入；缺失时
+# 条件可用参数：调用点仅在上游记录提供该字段（非空/为 null）时才注入；缺失时
 # 渲染端自动隐藏对应占位符（不会原样露出 {xxx}）。仍是「上游方法能获取到的
 # 字段」（保留在 entries.parameters 中），但与保证注入的参数不同——设置页提示
 # 与导出文档据此区分表述。
+#
+# 减法退役字段的全局兜底（2026-10）：command/argsKey（tool/call 脱敏摘除）与
+# reasons（卡住/行为模式/循环检测器删除）在任何事件下都不再注入；用户旧自定义
+# 台词里的这些占位符必须在**所有**事件上自动隐藏而非字面露出——它们没有
+# per-key 归属（宿主事件已删），由渲染调用点统一并入 autohide。
+LEGACY_HIDDEN_PARAMETERS: tuple[str, ...] = ("command", "argsKey", "reasons")
 # 注意（2026-09-06 桥接源码核实）：tool/call 记录只含
 # tool/argsKey/command/callId/step/sessionId——target/ok 仅存在于 tool/result
 # 与 watchdog reasoning 记录，活动气泡在 tool/call 同轮触发时拿不到，不得宣称。
@@ -204,11 +215,13 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
 # 不含会话标签）；approval.generic、question.*、model_access.*、failure.*
 # 的 label=会话标签（条件注入）。
 CONDITIONAL_PARAMETERS: dict[str, tuple[str, ...]] = {
-    "activity.read": ("callId", "step", "sessionName", "projectName"),
-    "activity.search": ("callId", "step", "sessionName", "projectName"),
-    "activity.edit": ("callId", "step", "sessionName", "projectName"),
-    "activity.run": ("callId", "step", "sessionName", "projectName"),
-    "activity.default": ("callId", "step", "sessionName", "projectName"),
+    # command/argsKey 为减法脱敏的兼容位：桥接自 2026-10 起不再落盘这两个字段，
+    # 条件注入恒不命中（渲染端自动隐藏），仅为不戳破用户旧自定义台词保留声明。
+    "activity.read": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.search": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.edit": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.run": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.default": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
     "approval.tool": ("toolName", "sessionName", "projectName"),
     "approval.generic": ("toolName", "sessionName", "projectName", "label"),
     "question.empty": ("sessionName", "projectName", "label"),

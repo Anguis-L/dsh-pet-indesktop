@@ -223,8 +223,136 @@ def test_bridge_source_has_no_plaintext_or_retired_machinery():
             f"脱敏红线：index.js 不得再含 {banned}")
     # 退役机制：mux 中继 / 控制队列 / 看门狗转发
     for banned in ("muxConnect", "events.mux", "startControlQueue", "handleControlRequest",
-                   "runBridgeDiagnosis", "watchdog-request-", "WATCHDOG_EVENT_TYPES"):
+                   "runBridgeDiagnosis", "watchdog-request-", "WATCHDOG_EVENT_TYPES",
+                   "session-shape", "rawWorkspace", "rawProject"):  # M1: 临时诊断落盘已删
         assert banned not in src, f"已删机制不得残留: {banned}"
     # user/message 与 assistant/message 记录不得再带 text 字段
     assert 'text: messageText' not in src
     assert "createUserMessage" not in src, "LLM 诊断/steer 已删，envelope 构造器不得残留"
+
+
+# ---------------------------------------------------------------- 4. 审批收敛 gated 口径（H1/中-1）
+class _InteractionWin:
+    """审批/问题链路的窗口桩：普通气泡 + 提醒队列双通道记录。"""
+
+    def __init__(self):
+        self.bubbles: list[str] = []
+        self.alerts: list[dict] = []
+        self.resolved: list[str] = []
+        self._alert_current = None
+        self._alert_queue: list = []
+        self._sticky_bubble_active = False
+        self._bubble_busy_until = 0.0
+
+    def isVisible(self):
+        return True
+
+    def show_bubble(self, text, duration_ms=3200, **_kw):
+        self.bubbles.append(str(text))
+
+    def show_alert(self, text, *, alert_id="", sticky=True, duration_ms=0, **_kw):
+        self.alerts.append({"text": str(text), "alert_id": alert_id, "sticky": sticky})
+
+    def resolve_alert(self, alert_id):
+        self.resolved.append(str(alert_id))
+
+    def hide_bubble(self):
+        pass
+
+
+def _make_live_manager(tmp_path, monkeypatch):
+    """真 manager + 真 DshMonitor（worker 不启动，手动驱动 _poll）。"""
+    _qapp()
+    monkeypatch.setattr(harness_launcher, "is_running", lambda port: True)
+    cfg = Config(base=tmp_path / "cfg")
+    win = _InteractionWin()
+    mgr = AgentLinkManager(win, cfg, min_interval=0.0)
+    mon = mgr.monitors["dsh"]
+    bridge_dir = mon.events_dir
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    mon._tailer._initial_backfill_done = True
+    return mgr, mon, bridge_dir, win
+
+
+def test_bare_approval_asked_never_raises_attention(tmp_path, monkeypatch):
+    """H1：裸 approval/asked（审计信号）不锁存 waiting_approval、不弹任何气泡。
+
+    普通工具调用（pwsh Get-Location）被宿主打上 approval/asked 是常态，
+    它绝不能触发「需要看一眼」。
+    """
+    mgr, mon, bridge_dir, win = _make_live_manager(tmp_path, monkeypatch)
+    converged = []
+    mon.dsh_state_changed.connect(lambda f, t, src: converged.append(t))
+    try:
+        _write(bridge_dir, {"event": "approval/asked", "tool": "pwsh"})
+        mon._poll()
+        assert "waiting_approval" not in converged
+        # 不得出现审批/attention 类弹窗（记录里的 tool 字段走的是过程汇报链，
+        # 与审批语义无关——只钉「审批语义不被触发」）
+        assert win.alerts == []
+        assert not any("确认" in b or "看一眼" in b for b in win.bubbles)
+        assert mgr._pending_interactions == {}
+    finally:
+        mgr.shutdown()
+
+
+def test_cordis_request_run_raises_waiting_approval_once(tmp_path, monkeypatch):
+    """H1：cordis/request-run（requiresApproval 严格 True）才是权威审批信号：
+    锁存 waiting_approval + 专属常驻提示气泡；通用 attention 气泡不重复弹。"""
+    mgr, mon, bridge_dir, win = _make_live_manager(tmp_path, monkeypatch)
+    converged = []
+    mon.dsh_state_changed.connect(lambda f, t, src: converged.append((t, src)))
+    try:
+        _write(bridge_dir, {
+            "event": "cordis/request-run", "requestId": "r-1",
+            "agentId": "sess-1", "sessionId": "sess-1",
+            "payload": {"requiresApproval": True, "name": "构建插件", "purpose": "执行打包"},
+        })
+        mon._poll()
+        assert ("waiting_approval", "cordis/request-run") in converged
+        assert mon._converger.current_state is DshState.WAITING_APPROVAL
+        # 专属常驻气泡（cordis 提示）在，通用 attention 气泡不双弹
+        assert win.alerts, "cordis 审批必须有常驻提示气泡"
+        assert not any("确认" in b or "看一眼" in b for b in win.bubbles),             "通用 attention 气泡不得与专属气泡双弹"
+        # resolved 解锁
+        _write(bridge_dir, {"event": "cordis/request-run-resolved", "requestId": "r-1",
+                            "sessionId": "sess-1"})
+        mon._poll()
+        assert mon._converger.current_state is DshState.WORKING
+    finally:
+        mgr.shutdown()
+
+
+def test_waiting_question_edge_does_not_double_bubble(tmp_path, monkeypatch):
+    """中-1：waiting_question 边沿只更新状态；常驻问题气泡由 question 专用链呈现，
+    通用 attention 气泡不得双弹。"""
+    mgr, mon, bridge_dir, win = _make_live_manager(tmp_path, monkeypatch)
+    converged = []
+    mon.dsh_state_changed.connect(lambda f, t, src: converged.append(t))
+    try:
+        _write(bridge_dir, {
+            "event": "question/requested", "callId": "call-1", "sessionId": "sess-1",
+            "questions": [{"id": "q1", "question": "选哪个？",
+                           "options": [{"label": "A"}, {"label": "B"}]}],
+        })
+        mon._poll()
+        assert "waiting_question" in converged
+        assert mon._converger.current_state is DshState.WAITING_QUESTION
+        assert win.alerts, "问题必须有常驻提示气泡（question 专用链）"
+        assert not any("看一眼" in b for b in win.bubbles), \
+            "waiting_question 边沿不得再弹通用 attention 气泡"
+    finally:
+        mgr.shutdown()
+
+
+def test_agent_status_waiting_approval_shows_generic_attention(tmp_path, monkeypatch):
+    """显式 AgentStatus waiting_approval（无专属气泡路径）仍弹通用 attention 气泡。"""
+    mgr, mon, bridge_dir, win = _make_live_manager(tmp_path, monkeypatch)
+    try:
+        _write(bridge_dir, {"event": "AgentStatus", "state": "waiting_approval"})
+        mon._poll()
+        assert mon._converger.current_state is DshState.WAITING_APPROVAL
+        assert any("确认" in b or "看一眼" in b for b in win.bubbles), \
+            "无专属气泡路径的审批等待必须弹通用 attention 气泡"
+    finally:
+        mgr.shutdown()

@@ -6,7 +6,7 @@
 
 1. **门控太宽**：自动拉起只看 ``enable_chat and harness_autostart``，不看
    ``agent_link.dsh``——DSH 联动没开时那个服务没有任何消费者（桥接插件不装、
-   DshMonitor 不跑、DshStateTracker 停表），纯烧内存；
+   DshMonitor（桥目录唯一读方）不跑），纯烧内存；
 2. **退出无收口**：``_spawn`` 用 CREATE_NO_WINDOW 起进程，父死子不死（实机确认
    桌宠退出后 node 还活着），而 ``_on_about_to_quit`` 里没有任何 harness 调用。
 
@@ -171,8 +171,8 @@ def _gate_shell(tmp_path, *, enable_chat: bool = True, autostart: bool = True,
 def _real_shell(tmp_path, monkeypatch, *, dsh_link: bool, autostart: bool = True,
                 enable_chat: bool = True) -> app_mod.AppShell:
     """真 AppShell（真 Config + 真门方法），收口路径可直接调 ``_on_about_to_quit``。"""
-    # 联动开着时 DshStateTracker 会真起 3s 端口探活：只读探测也不许碰本机真实端口
-    # （用户机器上可能真跑着 dsh web）。
+    # 联动开着时 DshMonitor（单读方）会真起 3s 端口探活：只读探测也不许碰本机
+    # 真实端口（用户机器上可能真跑着 dsh web）。
     monkeypatch.setattr(hl, "is_running", lambda port=None: False)
     cfg = Config(base=tmp_path)
     cfg.set("harness_autostart", autostart)

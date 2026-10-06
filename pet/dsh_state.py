@@ -21,8 +21,9 @@ glob ``dsh*.jsonl``，兼容旧版单文件 ``dsh.jsonl``）。
   approval/decided（question 同理）；锁存超时兜底由 ``tick()`` 完成。
 
 输出以元组列表返回（不直接 emit 信号，Qt 边界全部留在 DshMonitor）：
-``("state", from_state, to_state)`` 与 ``("user_message", session_id, text)``；
-from_state 为 "" 表示首个状态。
+``("state", from_state, to_state, source_event)`` 与
+``("user_message", session_id, text)``；from_state 为 "" 表示首个状态，
+source_event 为触发该状态的桥接事件名（探活驱动的基线切换为 ""）。
 """
 
 from __future__ import annotations
@@ -79,8 +80,16 @@ _EVENT_TO_STATE = {
     "command/done": DshState.WORKING,
     "tool-workflow/run-start": DshState.WORKING,
     "tool-workflow/run-end": DshState.WORKING,
-    # 审批
-    "approval/asked": DshState.WAITING_APPROVAL,
+    # 审批（gated 口径，2026-10 修正）：
+    # - approval/asked 只是 DSH 的会话/审计信号——普通工具调用也会被宿主打上
+    #   这个标记，拿它锁存 waiting_approval 是误报源（桥端注释同款结论），
+    #   因此**不收敛**（不在本表，记录被忽略）；
+    # - 权威来源是 cordis/request-run（桥只在 requiresApproval 严格布尔 True 时
+    #   才写，带 requestId）与旧式 approval/request（旧桥/自定义通道的 UI 级
+    #   审批事件）；
+    # - approval/decided / cordis/request-run-resolved → WORKING（解锁兼容）。
+    "cordis/request-run": DshState.WAITING_APPROVAL,
+    "cordis/request-run-resolved": DshState.WORKING,
     "approval/request": DshState.WAITING_APPROVAL,  # 兼容旧一次性审批事件
     "approval/decided": DshState.WORKING,
     # 用户问题（ask_user_question 阻塞交互，与审批同等待遇）
@@ -105,6 +114,15 @@ def map_event_to_state(record: dict) -> Optional[DshState]:
     event = str(record.get("event") or "")
     if event == "AgentStatus":
         return _AGENT_STATUS_STATE.get(str(record.get("state") or "").strip())
+    if event == "cordis/request-run":
+        # 双保险：桥只在 requiresApproval 严格布尔 True 时写这条记录；对旧桥/
+        # 手写桩/自定义通道的平铺形状再核一次，非审批请求不锁存。
+        nested = record.get("payload")
+        if isinstance(nested, dict) and "requiresApproval" in nested:
+            if nested.get("requiresApproval") is not True:
+                return None
+        elif record.get("requiresApproval") is not True:
+            return None
     return _EVENT_TO_STATE.get(event)
 
 
@@ -156,8 +174,12 @@ class DshStateConverger:
         self._release_question()
 
     # ------------------------------------------------------------ 状态推进
-    def _transition(self, to_state: DshState, out: list) -> None:
-        """edge-trigger 状态切换：同状态去重，真正变化才产出。"""
+    def _transition(self, to_state: DshState, out: list, source: str = "") -> None:
+        """edge-trigger 状态切换：同状态去重，真正变化才产出。
+
+        产出为 ("state", from_state, to_state, source_event) 四元组；
+        source_event 供消费侧做同源去重（cordis/request-run 与 approval/request
+        各有专属常驻气泡，其锁存边沿不再弹通用 attention 气泡）。"""
         if to_state is self.current_state:
             return
         from_state = self.current_state
@@ -166,7 +188,8 @@ class DshStateConverger:
             log.info("[DSH STATE] %s", to_state.value)
         else:
             log.info("[DSH STATE] %s -> %s", from_state.value, to_state.value)
-        out.append(("state", "" if from_state is None else from_state.value, to_state.value))
+        out.append(("state", "" if from_state is None else from_state.value,
+                    to_state.value, source))
 
     def _release_approval(self) -> None:
         self._pending_approval = False
@@ -202,8 +225,9 @@ class DshStateConverger:
                 str(record.get("text") or record.get("content") or record.get("summary") or ""),
             ))
 
-        # approval/decided：解除审批锁存，回到 working（agent 仍在 running）
-        if event == "approval/decided":
+        # approval/decided / cordis/request-run-resolved：解除审批锁存，
+        # 回到 working（agent 仍在 running）
+        if event in ("approval/decided", "cordis/request-run-resolved"):
             was_latched = self._pending_approval
             self._release_approval()
             if was_latched:
@@ -218,18 +242,19 @@ class DshStateConverger:
                 self._transition(DshState.WORKING, out)
             return out
 
-        # approval/asked：进入审批锁存
+        # 审批类权威事件（cordis/request-run、旧式 approval/request、显式
+        # AgentStatus.waiting_approval）：进入审批锁存
         if state is DshState.WAITING_APPROVAL:
             self._pending_approval = True
             self._approval_since = self._clock()
-            self._transition(state, out)
+            self._transition(state, out, source=event)
             return out
 
         # question/requested：进入问题锁存
         if state is DshState.WAITING_QUESTION:
             self._pending_question = True
             self._question_since = self._clock()
-            self._transition(state, out)
+            self._transition(state, out, source=event)
             return out
 
         # 任一锁存中：忽略一切非阻塞事件（防 waiting_approval / waiting_question

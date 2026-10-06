@@ -376,19 +376,6 @@ function writeSessionMeta(agent, session, summary = null, workspace = null) {
     agentName: meta.agentName || "DSH",
   });
 
-  // 临时诊断：仅第一条 session 输出字段结构，用于确认真实 DSH payload
-  if (sessionMetaCache.size <= 1) {
-    writeRecord({
-      type: "debug/session-shape",
-      sessionId: sid,
-      rawLabel: session?.label ?? null,
-      rawTitle: session?.title ?? null,
-      rawName: session?.name ?? null,
-      rawProject: session?.parent?.name ?? session?.project?.name ?? null,
-      rawWorkspace: session?.workspace?.path ?? null,
-      rawAgentName: agent?.name ?? null,
-    });
-  }
 }
 
 function toolResultInfo(data) {

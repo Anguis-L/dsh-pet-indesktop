@@ -22,7 +22,7 @@ OverlayShell + 被点 sprite + 行为控制器，使**两套建造器原样复�
     on_open_modern_settings                                   → OverlayShell.open_settings_for
     on_show_balance / on_check_update / on_open_todo_panel /
     on_voice_chime_* / on_festival_*                          → AppShell（进程级服务）
-    toggle_agent_link / set_agent_link_option                 → agent_link_manager（共享 manager）
+    toggle_agent_link                                         → agent_link_manager（共享 manager）
     toggle_proactive_enabled / set_proactive_option           → proactive_watcher（共享监视器）
     trigger_golden_spin / look_at_screen / rename_character   → 壳的 sprite 等价实现（作用被点 sprite）
     install_music_lyric / _music_lyric                        → 壳的音乐（歌词）宿主

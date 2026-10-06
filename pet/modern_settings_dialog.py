@@ -202,9 +202,11 @@ DIALOGUE_LABELS = {
 
 DIALOGUE_PARAMS = {
     "name": "Agent 名称",
+    "command": "命令文本（已退役：恒隐藏）",
     "label": "标签（工具标签/会话标签随事件而定）",
     "body": "问题内容",
     "count": "数量",
+    "reasons": "判断原因（已退役：恒隐藏）",
     "detail": "错误详情",
     "text": "显示文本",
     "event": "未知事件名（bridge.unknown）",
@@ -212,6 +214,7 @@ DIALOGUE_PARAMS = {
     "callId": "工具调用 ID",
     "step": "步骤序号",
     "toolName": "审批原始工具名",
+    "argsKey": "工具参数摘要键（已退役：恒隐藏）",
     "sessionName": "会话显示名",
     "projectName": "项目名",
     "errorCode": "错误码（llm_error 为上游真实码，如 bad_response_status_code）",

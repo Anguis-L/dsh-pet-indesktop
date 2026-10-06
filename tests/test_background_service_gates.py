@@ -169,7 +169,7 @@ def test_gated_monitor_still_drives_offline_dismiss(tmp_path, monkeypatch):
     dismissed: list[bool] = []
     monkeypatch.setattr(manager, "dismiss_all_interactions",
                         lambda: dismissed.append(True))
-    _dsh_monitor(shell).dsh_state_changed.emit("thinking", "offline")
+    _dsh_monitor(shell).dsh_state_changed.emit("thinking", "offline", "")
     app.processEvents()
     assert dismissed, "DSH 离线必须照常收口常驻气泡"
 

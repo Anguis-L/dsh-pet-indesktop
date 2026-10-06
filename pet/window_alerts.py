@@ -30,8 +30,7 @@ def alert_survives_suppression(alert_type: str, *, sticky: bool, buttons, priori
     kind = str(alert_type or "").strip().lower()
     if kind in {
         "approval", "question", "interaction", "approval/resolved", "question/resolved",
-        "interaction/resolved", "control", "control-result", "bridge/control-result",
-        "watchdog/control-result", "lifecycle", "turn/end", "task_complete",
+        "interaction/resolved", "lifecycle", "turn/end", "task_complete",
         "execution/failed", "agent/request-error", "session/end", "balance",
     }:
         return True

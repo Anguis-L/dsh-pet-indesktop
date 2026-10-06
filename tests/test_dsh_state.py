@@ -4,7 +4,7 @@
 减法后（2026-10）dsh_state 只剩纯逻辑：不建 Qt 对象、不读文件、不探端口——
 直接驱动收敛器的 handle_record / set_online / tick，验证 edge-trigger 去重、
 离线恢复与审批/问题锁存。读方（DshMonitor）与消费侧的接线回归见
-tests/test_agent_link.py 的 TestSingleReader* 族。
+tests/test_agent_link_subtraction.py 的单读方/审批收敛测试族。
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _feed(conv, *records):
 
 
 def _states(outputs):
-    return [to for kind, _f, to in outputs if kind == "state"]
+    return [to for kind, _f, to, *_src in outputs if kind == "state"]
 
 
 def test_offline_when_dsh_down(caplog):
@@ -75,26 +75,75 @@ def test_edge_trigger_dedup():
 
 
 def test_full_pipeline():
-    """完整生命周期：thinking -> working -> waiting_approval -> working -> success -> idle。"""
+    """完整生命周期：thinking -> working -> waiting_approval -> working -> success -> idle。
+
+    审批锁存的权威触发是 cordis/request-run（requiresApproval 严格 True）；
+    解锁用 cordis/request-run-resolved（approval/decided 同款兼容路径另测）。
+    """
     conv = DshStateConverger()
     conv.set_online(True)  # idle
-    out = _feed(conv, *(_records_for("user/message", "tool/call", "approval/asked",
-                                     "approval/decided", "turn/end", "idle")))
+    out = _feed(conv, *(_records_for("user/message", "tool/call")))
+    out += _feed(conv, {"event": "cordis/request-run", "requestId": "r-1",
+                        "payload": {"requiresApproval": True}})
+    out += _feed(conv, {"event": "cordis/request-run-resolved", "requestId": "r-1"})
+    out += _feed(conv, *(_records_for("turn/end", "idle")))
     assert _states(out) == [
         "thinking", "working", "waiting_approval", "working", "success", "idle",
     ]
     assert conv.current_state is DshState.IDLE
 
 
+def test_approval_asked_does_not_latch():
+    """H1 钉住：裸 approval/asked（普通工具调用也会被宿主打标的审计信号）
+    绝不收敛为 waiting_approval——它是误报源，不是权威审批事件。"""
+    conv = DshStateConverger()
+    conv.set_online(True)  # idle
+    out = _feed(conv, {"event": "approval/asked", "tool": "pwsh"})
+    assert _states(out) == []
+    assert conv.current_state is DshState.IDLE
+    assert conv._pending_approval is False
+
+
+def test_cordis_request_run_requires_strict_true():
+    """cordis/request-run 只在 requiresApproval 严格布尔 True 时锁存审批态。"""
+    conv = DshStateConverger()
+    conv.set_online(True)
+    # 平铺 False / 缺失 / 字符串 "true" 都不锁存
+    _feed(conv, {"event": "cordis/request-run", "requestId": "r-a",
+                 "payload": {"requiresApproval": False}})
+    _feed(conv, {"event": "cordis/request-run", "requestId": "r-b"})
+    _feed(conv, {"event": "cordis/request-run", "requestId": "r-c",
+                 "payload": {"requiresApproval": "true"}})
+    assert conv.current_state is DshState.IDLE
+    # 嵌套 True 才锁存
+    out = _feed(conv, {"event": "cordis/request-run", "requestId": "r-d",
+                       "payload": {"requiresApproval": True}})
+    assert _states(out) == ["waiting_approval"]
+    assert conv.current_state is DshState.WAITING_APPROVAL
+
+
+def test_approval_decided_releases_latch_for_compat():
+    """approval/decided 保留为解锁兼容路径（旧桥/自定义通道的 approval 对）。"""
+    conv = DshStateConverger()
+    conv.set_online(True)
+    _feed(conv, {"event": "approval/request", "approvalId": "ap-1"})  # 旧式审批事件
+    assert conv.current_state is DshState.WAITING_APPROVAL
+    out = _feed(conv, {"event": "approval/decided", "approvalId": "ap-1"})
+    assert _states(out) == ["working"]
+    assert conv.current_state is DshState.WORKING
+
+
 def test_approval_latch_ignores_working():
-    """审批锁存期间 working 事件被忽略，直到 approval/decided。"""
+    """审批锁存期间 working 事件被忽略，直到 cordis/request-run-resolved。"""
     conv = DshStateConverger()
     conv.set_online(True)
     # waiting_approval 后，即便又来 working（agent 仍在跑），也不被顶掉
-    _feed(conv, *(_records_for("approval/asked", "tool/call", "working")))
+    _feed(conv, {"event": "cordis/request-run", "requestId": "r-1",
+                 "payload": {"requiresApproval": True}})
+    _feed(conv, *(_records_for("tool/call", "working")))
     assert conv.current_state is DshState.WAITING_APPROVAL
 
-    _feed(conv, *(_records_for("approval/decided")))
+    _feed(conv, {"event": "cordis/request-run-resolved", "requestId": "r-1"})
     assert conv.current_state is DshState.WORKING
 
 
@@ -246,7 +295,9 @@ def test_approval_latch_timeout_releases_to_working():
     clock = [1000.0]
     conv = DshStateConverger(clock=lambda: clock[0])
     conv.set_online(True)
-    _feed(conv, *(_records_for("tool/call", "approval/asked")))
+    _feed(conv, {"event": "tool/call"})
+    _feed(conv, {"event": "cordis/request-run", "requestId": "r-1",
+                 "payload": {"requiresApproval": True}})
     assert conv.current_state is DshState.WAITING_APPROVAL
 
     clock[0] += APPROVAL_LATCH_TIMEOUT_S - 1

@@ -39,8 +39,8 @@ def test_all_advertised_fields_reach_presentation_layer():
     from pathlib import Path
 
     from pet.persona_template import (
-        CONDITIONAL_PARAMETERS, DISPLAY_HINTS, EVENT_SOURCES, PARAMETERS,
-        UPSTREAM_FIELDS, VARIABLES,
+        CONDITIONAL_PARAMETERS, DISPLAY_HINTS, EVENT_SOURCES, LEGACY_HIDDEN_PARAMETERS,
+        PARAMETERS, UPSTREAM_FIELDS, VARIABLES,
     )
 
     root = Path(__file__).resolve().parent.parent
@@ -91,8 +91,8 @@ def test_all_advertised_fields_reach_presentation_layer():
 
     # variables/upstream 结构 sanity：cordis 等死字段不得回流
     assert set(VARIABLES) == {
-        "name", "label", "body", "count", "detail", "text",
-        "tool", "toolName", "callId", "step",
+        "name", "command", "label", "body", "count", "reasons", "detail", "text",
+        "tool", "toolName", "argsKey", "callId", "step",
         "sessionName", "projectName", "event",
         "errorCode", "errorMessage", "errorKind", "consecutiveRetryCount", "retry",
         "retries", "retryExhausted", "failureType",
@@ -133,17 +133,24 @@ def test_all_advertised_fields_reach_presentation_layer():
             assert actual - conditional <= expected_guaranteed, (
                 key + ": 注入了未宣称的字段 " + str(sorted(actual - conditional - expected_guaranteed)))
         else:
-            assert set(PARAMETERS[key]) == actual, (
+            # 条件参数上游可能恒不提供（减法退役位）：宣称 ⊇ 注入 ⊇ 保证。
+            assert expected_guaranteed <= actual <= set(PARAMETERS[key]), (
                 key + ": 模板宣称 " + str(sorted(PARAMETERS[key]))
-                + " != 运行时注入 " + str(sorted(actual)))
+                + " / 运行时注入 " + str(sorted(actual))
+                + "（保证参数必须注入，注入不得超过宣称表）")
 
     # activity 不得残留从未传入的死字段；宣称的字段必须全部真的注入
     advertised_activity = {"name", "tool", "label", "callId",
                            "step", "sessionName", "projectName"}
     assert advertised_activity <= set(entries["activity.read"]["parameters"])
-    for dead in ("toolName", "riskScore", "pluginId", "sessionLabel", "target", "ok",
-                 "command", "argsKey"):
+    for dead in ("toolName", "riskScore", "pluginId", "sessionLabel", "target", "ok"):
         assert dead not in entries["activity.read"]["parameters"]
+    # command/argsKey 是减法退役兼容位：仍在宣称表（不戳破旧台词），但必须落在
+    # 条件注入集（恒不注入、渲染端自动隐藏），不得是保证参数
+    assert {"command", "argsKey"} <= set(entries["activity.read"]["parameters"])
+    assert {"command", "argsKey"} <= set(CONDITIONAL_PARAMETERS["activity.read"])
+    assert {"command", "argsKey"} <= set(LEGACY_HIDDEN_PARAMETERS)
+    assert "reasons" in LEGACY_HIDDEN_PARAMETERS
 
     # 条件参数声明非空校验：所有带 **conditional 展开的 key 必须声明条件参数
     for key in expansion_keys:
