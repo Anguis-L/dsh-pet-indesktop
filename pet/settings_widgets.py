@@ -769,6 +769,9 @@ class ModernSelect(QAbstractButton):
         self._index = -1
         self._hovered = False
         self._popup: QMenu | None = None
+        # 置灰项（能力暂不可用，如非 Windows 的「桌面端界面」）：只影响弹窗里
+        # 该项能否被点中。自绘文本区永远是当前值，调用方保证当前值不是置灰项。
+        self._disabled: set[int] = set()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedHeight(BROWSER_CONTROL_SPEC["field_height"])
@@ -785,9 +788,22 @@ class ModernSelect(QAbstractButton):
 
     def clear(self) -> None:
         self._items.clear()
+        self._disabled.clear()
         self._index = -1
         self.setText("")
         self.update()
+
+    def setItemDisabled(self, index: int, disabled: bool = True) -> None:  # noqa: N802
+        """置灰单项：弹窗里点不动（平台能力暂不可用，见 docs/SETTINGS-CHANGE-GATES.md §4）。"""
+        if not 0 <= index < len(self._items):
+            return
+        if disabled:
+            self._disabled.add(index)
+        else:
+            self._disabled.discard(index)
+
+    def isItemDisabled(self, index: int) -> bool:  # noqa: N802
+        return index in self._disabled
 
     def itemData(self, index: int):  # noqa: N802
         return self._items[index][1] if 0 <= index < len(self._items) else None
@@ -849,6 +865,7 @@ class ModernSelect(QAbstractButton):
             action = popup.addAction(text)
             action.setCheckable(True)
             action.setChecked(index == self._index)
+            action.setEnabled(index not in self._disabled)
             action.triggered.connect(
                 lambda _checked=False, index=index: self.setCurrentIndex(index)
             )

@@ -786,7 +786,11 @@ class Config:
             "golden_spin_direct": False,  # 点击触发黄金回旋时跳过点击动画，直接回旋并逐圈加速
             "edge_probe_enabled": False,  # 拖到屏幕左右边缘后自动进入探头姿态
             "autostart_wanted": False,  # 用户曾开启过开机自启（用于启动自检：被安全软件清理时提醒）
-            "harness_autostart": False,  # 随桌宠启动自动拉起 dsh web 服务（只起服务，不开浏览器）
+            "harness_autostart": False,  # 随桌宠启动自动拉起（web 目标=只起服务不开浏览器；桌面端目标=打开界面）
+            # 自启目标：auto=检测到桌面端安装则桌面端、否则 web；web/desktop 显式指定。
+            # **只作用于「随桌宠启动」**：右键菜单/托盘的启动入口是显式选择，不受它影响；
+            # 「重启/停止服务」始终只作用于 dsh web 服务进程。
+            "harness_launch_target": "auto",
             # 手动指定 pnpm 入口（文件 / 目录 / 包装脚本都行，语义同 DSH_PNPM_BIN）。
             # 默认空 = 走内置的自动发现（PATH/注册表/各版本管理器/多布局）；
             # 面向"环境特殊又不想改环境变量"的用户，属于开发者向高级键，不进设置页。
@@ -1030,6 +1034,7 @@ class Config:
             "balance_refresh_minutes",
             "autostart_wanted",
             "harness_autostart",
+            "harness_launch_target",
             "stream_capture_mode",
             "pnpm_bin",
             "music_sing_enabled",
@@ -1263,6 +1268,8 @@ class Config:
                     stack.append(value)
 
     def _normalize_pet_settings(self):
+        target = str(self.data.get("harness_launch_target") or "auto").strip().lower()
+        self.data["harness_launch_target"] = target if target in ("auto", "web", "desktop") else "auto"
         dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
         self.data["dialogue_mode"] = dialogue_mode if dialogue_mode in {"legacy", "whale_maid", "custom"} else "legacy"
         raw_phrases = self.data.get("dialogue_phrases")

@@ -1743,6 +1743,10 @@ class DshMonitor(BaseAgentMonitor):
         在本线程阻塞无碍——这正是双读方合并省掉旧探测线程的原因）。"""
         try:
             online = any(harness_launcher.is_running(p) for p in _dsh_state_candidate_ports())
+            if not online:
+                # 桌面端旁路：desktop host 端口随版本硬编码（本机实测 19387，已在
+                # 候选里），不赌死——端口全 miss 时以「桌面端进程在跑」兜底 online
+                online = harness_launcher.desktop_process_running()
         except Exception:
             log.exception("DSH 在线探测异常")
             online = False

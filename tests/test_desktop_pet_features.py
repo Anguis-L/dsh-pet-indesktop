@@ -950,7 +950,8 @@ def test_pure_pet_context_menu_keeps_web_but_hides_harness():
     labels = labels_in(menu)
     # Harness 入口现为子菜单（标题 "DeepSeek Harness"），纯桌宠版整块不显示
     assert "DeepSeek Harness" not in labels
-    assert "启动并打开页面" not in labels
+    assert "启动 dsh web 界面" not in labels
+    assert "启动桌面端界面" not in labels
     assert "停止服务" not in labels
     assert "打开网页版 DeepSeek" in labels
     menu.close()

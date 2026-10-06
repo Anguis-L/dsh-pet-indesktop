@@ -41,6 +41,10 @@ def _make_dsh_monitor(tmp_path, monkeypatch, online=True):
     bridge_dir = tmp_path / "dsh-pet-bridge"
     bridge_dir.mkdir(parents=True)
     monkeypatch.setattr(harness_launcher, "is_running", lambda port: online)
+    # 「桌面端进程在跑」是 online 的旁路判定（机器相关 OS 边界）：本文件用端口
+    # 探测表达在线/离线，必须钉死旁路——否则本机装了并在跑桌面端时，
+    # online=False 形同虚设，离线分支根本进不去。
+    monkeypatch.setattr(harness_launcher, "desktop_process_running", lambda: False)
     mon = DshMonitor("dsh", config_dir)
     assert mon.events_dir == bridge_dir
     mon._tailer._initial_backfill_done = True  # 跳过 backfill 防护，立即读已写入内容

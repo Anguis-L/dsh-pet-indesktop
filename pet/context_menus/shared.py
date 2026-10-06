@@ -555,15 +555,21 @@ def add_harness(menu: QMenu, pet, *, icons: bool = True):
     start_icon = "harness" if icons else None
     submenu = add_submenu(menu, "DeepSeek Harness", start_icon)
 
-    def _launch(action: str = "start") -> None:
+    def _launch(action: str = "start", target: str = "auto") -> None:
         # 父窗口在**点击时**解析：宿主（facade）可能在菜单关闭后被回收，
         # 这里只读它自报的 dialog_parent 面，不缓存对象。
-        launch_harness_gui(_dialog_parent(pet), action=action)
+        launch_harness_gui(_dialog_parent(pet), action=action, target=target)
 
-    # 三个动作都 close_on_trigger：菜单先关闭、回调延迟到菜单关闭后执行——
+    # 所有动作都 close_on_trigger：菜单先关闭、回调延迟到菜单关闭后执行——
     # 重启/停止的确认框是模态框，macOS 原生菜单跟踪会话中弹模态框会被
     # AppKit 抑制（与设置对话框首次点击无反应同源）。
-    add_action(submenu, "启动并打开页面", start_icon, _launch,
+    # 启动分双目标（2026-10）：web 界面 / 桌面端界面；重启/停止只作用于
+    # web 服务进程（桌面端是用户的主力应用，桌宠绝不终止它）。
+    add_action(submenu, "启动 dsh web 界面", start_icon,
+               lambda: _launch("start", "web"),
+               close_on_trigger=True)
+    add_action(submenu, "启动桌面端界面", start_icon,
+               lambda: _launch("start", "desktop"),
                close_on_trigger=True)
     add_action(
         submenu, "重启服务", "play" if icons else None,

@@ -2088,15 +2088,21 @@ class AppShell:
             self.instance._create_ui(character_id)
 
     def _maybe_autostart_harness(self) -> None:
-        """「随桌宠启动 dsh 服务」：主窗就绪后拉起 dsh web（只起服务，全程静默）。
+        """「随桌宠启动 dsh 服务」：主窗就绪后按 ``harness_launch_target`` 拉起。
 
-        机器级语义：仅主窗就绪时调度一次（进程内新窗不重复触发）；本机已有
-        实例（含官方默认 3080）则跳过。静默 = CREATE_NO_WINDOW 隐藏控制台 +
-        launch_harness(open_browser=False) 不开浏览器，无任何弹窗。
+        目标是 dsh web 时全程静默（CREATE_NO_WINDOW 隐藏控制台 +
+        open_browser=False，不开浏览器、无弹窗）；目标是桌面端界面时直接打开
+        桌面端应用（用户的主力应用，桌宠退出**不会**关它）。
+
+        「本机已有实例」的判定交给 ``launch_harness`` 自己做：它同时会看 web
+        端口候选与桌面端单实例；在这里按 web 端口提前 return，会把用户选的
+        桌面端/auto 目标一起挡掉（桌面端根本不上那个端口）。
+
+        机器级语义：仅主窗就绪时调度一次（进程内新窗不重复触发）。
 
         门控见 ``_harness_autostart_wanted``（本批收紧：DSH 联动没开不拉）。
-        注：``launch_harness`` 本身不带门——菜单「启动并打开页面」是用户明示
-        动作，必须照常可用。
+        注：``launch_harness`` 本身不带门——菜单「启动 dsh web 界面 / 启动桌面端
+        界面」是用户明示动作，必须照常可用。
         """
         if not self._harness_autostart_wanted():
             return
@@ -2111,15 +2117,16 @@ class AppShell:
                     return
                 if not self._harness_autostart_wanted():
                     return
-                if any(harness_mod.is_running(p) for p in harness_mod._candidate_ports()):
-                    return
-                if not self._harness_autostart_wanted() or getattr(self, "_quitting", False):
-                    return
                 harness_mod.launch_harness(
                     open_browser=False,
+                    target=str(self.config.get("harness_launch_target", "auto")),
+                    # 探测期间一切「用户已经不想要了」的状态都要能中止拉起：
+                    # 退出/会话结束之外，还要算上开关或联动被关——desktop 目标下
+                    # 这一步的代价是弹出一个用户刚说不想要的 GUI 窗口。
                     cancel_check=lambda: (
                         getattr(self, "_quitting", False)
                         or getattr(self, "_session_end_done", False)
+                        or not self._harness_autostart_wanted()
                     ),
                 )
                 if getattr(self, "_session_end_done", False):
@@ -3548,7 +3555,8 @@ class AppShell:
         menu.addSeparator()
         if self.enable_chat:
             menu.addAction('DeepSeek 余额', lambda: self.show_balance(win))
-            menu.addAction('启动 DeepSeek Harness', lambda: launch_harness_gui(win))
+            menu.addAction('启动 dsh web 界面', lambda: launch_harness_gui(win, target="web"))
+            menu.addAction('启动桌面端界面', lambda: launch_harness_gui(win, target="desktop"))
         else:
             # 纯桌宠版本不提供本地 DSH 启动入口，只保留网页版入口
             menu.addAction('打开网页版 DeepSeek', open_deepseek_web)

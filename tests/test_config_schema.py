@@ -78,6 +78,7 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset(
         "golden_spin_direct",
         "golden_spin_on_click",
         "harness_autostart",
+        "harness_launch_target",
         "idle_low_fps_enabled",
         "idle_low_fps_threshold",
         "lock_position",
