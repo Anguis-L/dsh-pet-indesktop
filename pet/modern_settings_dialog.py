@@ -645,7 +645,7 @@ class ModernSettingsDialog(QDialog):
                     SettingRow("music_sing", "音乐自动唱歌", "检测到后台播放音乐时，自动播放唱歌动画。", self.music_sing_check),
                     SettingRow("music_lyric", "显示歌词", "在气泡里显示当前播放歌曲的歌词。仅 Windows 可用；需要播放器支持系统媒体控制（SMTC），酷狗等需在播放器设置里手动开启。网易云音乐不上报播放进度，歌词按开始时间估算——快进或从中途开始播放后，用右键菜单「音乐 → 歌词对齐」校正。", self.music_lyric_check),
                     SettingRow("music_lyric_lead", "歌词提前量", "歌词相对音频的时间偏移。正值让歌词抢先显示，负值让它延后；唱得比音乐早一点通常更自然。", self.music_lyric_lead_spin),
-                ],
+                ] + settings_music.browser_media_rows(self),
                 behavior_content,
             )
         )
@@ -1189,7 +1189,17 @@ class ModernSettingsDialog(QDialog):
     def _on_pro_clear_memory(self) -> None:
         from .proactive import ProactiveMemory
 
-        ProactiveMemory(self.config.dir / "proactive_screen_memory.json").clear()
+        # clear() 返回本次是否真的清空：设置页是独立进程，主进程可能正在写同一
+        # 份记忆文件（拿不到跨进程锁 = 这次没清）。失败必须如实提示，不能无条件
+        # 报"已清空"——那正是用户看到的"清了还在"。
+        cleared = ProactiveMemory(self.config.dir / "proactive_screen_memory.json").clear()
+        if cleared is False:
+            QMessageBox.warning(
+                self,
+                "陪伴记忆清空失败",
+                "未能清空陪伴记忆：可能主程序正在写入它，或文件被安全软件占用。\n请稍后重试。",
+            )
+            return
         QMessageBox.information(self, "陪伴记忆", "已清空主动识屏的短期陪伴记忆。")
 
     def _proactive_page_content(self) -> QWidget:
@@ -1745,7 +1755,7 @@ class ModernSettingsDialog(QDialog):
             [
                 ("显示", claim("scale", "bubble_text_scale", "pet_opacity")),
                 ("动画与移动", claim("playback_speed", "animation_gap", "idle_low_fps", "no_move")),
-                ("音乐关联", claim("music_sing", "music_lyric", "music_lyric_lead")
+                ("音乐关联", claim("music_sing", "music_lyric", "music_lyric_lead", "music_browser_media")
                  + settings_music.build_music_player_rows(self)),
                 ("拖拽与弹射", claim("drag_physics", "throw_strength", "slingshot_enabled", "lock_position", "shift_drag")),
                 ("边缘探头", claim("edge_probe")),
@@ -2166,6 +2176,10 @@ class ModernSettingsDialog(QDialog):
         if getattr(self, "music_lyric_lead_spin", None) is not None:
             self.config.set(
                 "music_lyric_lead_seconds", float(self.music_lyric_lead_spin.value())
+            )
+        if getattr(self, "music_browser_media_check", None) is not None:
+            self.config.set(
+                "music_browser_media_enabled", self.music_browser_media_check.isChecked()
             )
         self.config.set("golden_spin_on_click", self.golden_spin_click_check.isChecked())
         self.config.set("golden_spin_direct", self.golden_spin_direct_check.isChecked())
