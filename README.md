@@ -527,9 +527,7 @@ pythonw -m pet
 ### Agent 联动（默认关闭）
 
 - 内置 DSH 桥接插件（`integrations/dsh-pet-bridge`）与 Claude hooks 安装器：感知 AI Agent 状态并切换动作，支持开始干活、过程汇报、任务完成三种气泡反馈，右键 Agent 联动子菜单可独立开关。
-- **DSH 富事件状态**：thinking（思考）/ working（干活，带工具名）/ attention（需确认）/ error / idle 多态呈现，多会话按 attention > error > working > thinking > idle 聚合，子代理不抢状态；审批与提问气泡支持多问题项（气泡内多选提交），同一 Agent 的并发审批/提问按 `interaction_id` 互不覆盖。
-- **事件汇报概率门（PR #97）**：联动气泡控制从布尔开关升级为**概率门**（0.00–1.00），8 个事件聚合类别各一个滑块（默认 `activity=0.6`、其余 `1.0`）；旧开关/百分比自动迁移，右键菜单保留 0/1 两端快捷入口。概率门只管气泡这一步，检测器与原始记录链不采样。
-- **探索循环 Watchdog 控制（PR #91）**：风险分达阈值时发常驻气泡，带「自动优化（replan）/ 终止（interrupt）/ 忽略」；控制请求最长阻塞 30s，按钮回调只收气泡 + 起后台线程、结果经 Qt 信号回主线程（GUI 不阻塞），回执按相位区分文案，会话结束自动收起控制气泡。
+- **DSH 富事件状态**：thinking（思考）/ working（干活，带工具名）/ attention（需确认）/ error / idle 多态呈现，多会话按 attention > error > working > thinking > idle 聚合，子代理不抢状态；审批与提问为**纯提示常驻气泡**（引导回 DSH 界面处理），同一 Agent 的并发审批/提问按 `interaction_id` 互不覆盖。
 - **开机即按配置装配（PR #100 / #102）**：重启后已开启的 Agent 联动与主动识屏直接生效，不再需要手动展开一次菜单或开关一次设置对话框。
 - **自定义联动 Agent**：在 `config.json` 的 `agent_link.custom_agents` 里声明任意 Agent（key / 显示名 / 事件文件路径），桌宠即对其 JSONL 事件文件做只读监听，联动行为与内置 Agent 一致——不改代码即可接入任何能写本地文件的 Agent，协议详见 `docs/AGENT_LINK_PROTOCOL.md`。
 - **一键启动 DSH**：本机已在跑 dsh web（含官方 3080）时直接复用，不再拉起第二个实例；Windows 上 node/pnpm 解析覆盖 nvm-windows/nvm/fnm/Volta/scoop 等布局（PR #97 修掉「已装 pnpm 仍装不上插件」，issue #95），也可用 `pnpm_bin` 配置键手动指定 pnpm 入口。
