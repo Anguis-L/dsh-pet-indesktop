@@ -141,7 +141,6 @@ from .settings_widgets import (
     BrowserSpinBox,
     BrowserDoubleSpinBox,
     CollapsibleGroup,
-    ProbabilitySlider,
     SettingRow,
     ResponsiveActionRow,
     ResponsiveToggleActionRow,
@@ -166,7 +165,6 @@ from . import settings_file_interpret
 from . import settings_interaction
 from . import settings_music
 from . import settings_pet_controls
-from .report_gates import REPORT_GATE_KEYS, REPORT_GATE_LABELS, gate_for_event
 
 
 # 语言配置页只展示用户能理解的事件名称；内部 key 仍用于保存和渲染。
@@ -185,14 +183,11 @@ DIALOGUE_LABELS = {
     "bridge.install.success": "桥接安装成功",
     "bridge.install.failed": "桥接安装失败",
     "bridge.uninstall.failed": "桥接卸载失败",
-    "dsh.writeback.failed": "agent 写回失败",
-    "approval.command": "审批命令",
     "approval.tool": "审批工具",
     "approval.generic": "审批提示",
     "question.empty": "等待选择",
     "question.one": "单个用户问题",
     "question.many": "多个用户问题",
-    "watchdog.warning": "循环检测警告",
     "model_access.one": "模型访问失败（单次）",
     "model_access.many": "模型访问失败（连续）",
     "llm_error.api": "AI 服务错误",
@@ -201,20 +196,15 @@ DIALOGUE_LABELS = {
     "failure.retry": "重试后失败",
     "failure.tool": "工具执行失败",
     "failure.generic": "执行失败",
-    "stuck.reminder": "卡住提醒",
-    "pattern.warning": "行为重复警告",
-    "pattern.control": "行为重复干预",
     "balance.loading": "查询余额中",
     "balance.result": "余额结果",
 }
 
 DIALOGUE_PARAMS = {
     "name": "Agent 名称",
-    "command": "命令文本",
     "label": "标签（工具标签/会话标签随事件而定）",
     "body": "问题内容",
     "count": "数量",
-    "reasons": "判断原因",
     "detail": "错误详情",
     "text": "显示文本",
     "event": "未知事件名（bridge.unknown）",
@@ -222,7 +212,6 @@ DIALOGUE_PARAMS = {
     "callId": "工具调用 ID",
     "step": "步骤序号",
     "toolName": "审批原始工具名",
-    "argsKey": "工具参数摘要键",
     "sessionName": "会话显示名",
     "projectName": "项目名",
     "errorCode": "错误码（llm_error 为上游真实码，如 bad_response_status_code）",
@@ -687,29 +676,6 @@ class ModernSettingsDialog(QDialog):
             SettingRow("agent_sound_cooldown", "冷却时间", "防止短时间内频繁触发音效；0 表示无时间冷却（仍单次去重）。", self.agent_sound_cooldown_spin),
         ]
         behavior_layout.addWidget(SettingsSection("Agent 联动 · 提示音效", agent_sound_rows, behavior_content))
-        # 事件气泡触发概率：每个事件聚合类别一个 0.00–1.00 滑块（没有开关），
-        # 与该类的气泡文案行同组；域导航重建时整体收进「事件气泡触发概率」
-        # 下的可折叠框，让设置位置与真正控制的位置绑定。
-        self.report_gate_rows = {}
-        report_gate_rows = []
-        for gate in REPORT_GATE_KEYS:
-            gate_label = REPORT_GATE_LABELS[gate]
-            row = SettingRow(
-                f"report_gate_{gate}",
-                "汇报概率",
-                f"{gate_label}：这一类气泡的通过概率。0.00 = 该类完全不汇报（静音），"
-                "1.00 = 每次都汇报，中间值按概率抽稀。概率只作用于「出气泡」这一步，"
-                "卡住 / 行为重复 / 循环等检测本身不受影响；右键菜单只提供 0/1 两端快捷入口。",
-                self.report_gate_sliders[gate],
-                stacked=True,
-            )
-            # 行内可见标题统一是「汇报概率」，无障碍名必须带上类别才不歧义。
-            row.control.setAccessibleName(f"{gate_label}：汇报概率")
-            self.report_gate_rows[gate] = row
-            report_gate_rows.append(row)
-        # 暂存宿主：这些行由域导航重建时认领并移入「事件气泡触发概率」可折叠框，
-        # 认领后本卡片为空（不残留空标题小节）。与气泡文案行同一处理方式。
-        behavior_layout.addWidget(SettingsCard(report_gate_rows, behavior_content))
         labels = DIALOGUE_LABELS
         behavior_layout.addWidget(
             SettingsSection(
@@ -926,12 +892,6 @@ class ModernSettingsDialog(QDialog):
         # _rebuild_domain_navigation. Do not temporarily hand the controller
         # widget to a QScrollArea: that creates a second Qt ownership path when
         # its rows are reparented into the shared card system.
-
-        # Agent Exploration Loop Watchdog 独立设置页
-        from .exploration_watchdog_settings import WatchdogSettingsPage
-
-        agent_link_cfg = self.config.get("agent_link", {})
-        self.watchdog_page = WatchdogSettingsPage(self.config, agent_link_cfg, self)
 
         # 语音报时设置页（行在 _rebuild_domain_navigation 中拾入「语音」总域）
         from .voice_chime_settings import VoiceChimeSettingsPage
@@ -1840,52 +1800,30 @@ class ModernSettingsDialog(QDialog):
 
         proactive_rows = list(old_pages.get("主动识屏", QWidget()).findChildren(SettingRow))
         claimed.update(proactive_rows)
-        watchdog_rows = list(self.watchdog_page.findChildren(SettingRow))
-        claimed.update(watchdog_rows)
         voice_chime_rows = list(self.voice_chime_page.findChildren(SettingRow))
         claimed.update(voice_chime_rows)
         festival_rows = list(self.festival_page.findChildren(SettingRow))
         claimed.update(festival_rows)
-        # WatchdogSettingsPage 现同时承载「循环检测」（watchdog/long_think）、
-        # 「卡住检测」（stuck_*）与「行为重复检测」（pattern_*）三组行，
-        # 按 objectName 前缀分组显示。
-        stuck_rows = [r for r in watchdog_rows if r.objectName().startswith("settingRow_stuck_")]
-        pattern_rows = [r for r in watchdog_rows if r.objectName().startswith("settingRow_pattern_")]
-        loop_rows = [r for r in watchdog_rows if not r.objectName().startswith(("settingRow_stuck_", "settingRow_pattern_"))]
         dialogue_rows = claim_prefix("dialogue_")
-        gate_rows = claim_prefix("report_gate_")
         automation = page_content(
             [
                 ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
                 ("主动感知", proactive_rows),
-                ("循环检测", loop_rows),
-                ("卡住检测", stuck_rows),
-                ("行为重复检测", pattern_rows),
             ]
         )
-        # 「事件气泡触发概率」＝一个可折叠框：按**事件聚合类别**分组，每组只放
-        # 该类触发概率滑块（紧凑、常用，默认展开）。
-        # 逐事件自定义文案行单独收进第二个折叠框并**默认折叠**（不用自定义台词的用户
-        # 不该翻过整页文案框；搜索命中时两个框都会自动展开，见 _search_settings）。
-        gates_box = CollapsibleGroup("事件气泡触发概率", automation)
+        # 「自定义台词」＝一个可折叠框（默认折叠）：逐事件文案行全部收进去，
+        # 不用自定义台词的用户不该翻过整页文案框；搜索命中时会自动展开
+        # （见 _search_settings）。全局风格控件（表达风格/专属文案对象/模板 JSON）
+        # 不是事件文案，单独放「文案风格与模板」小节。
         phrases_box = CollapsibleGroup("自定义台词（逐事件文案）", automation)
-        gate_row_by_id = {row.objectName(): row for row in gate_rows}
-        phrase_rows_by_gate: dict[str, list] = {}
-        for row in dialogue_rows:
-            event_key = row.objectName()[len("settingRow_dialogue_") :]
-            phrase_rows_by_gate.setdefault(gate_for_event(event_key) or "", []).append(row)
-        for gate in REPORT_GATE_KEYS:
-            gate_row = gate_row_by_id.get(f"settingRow_report_gate_{gate}")
-            if gate_row is not None:
-                gates_box.add_group(REPORT_GATE_LABELS[gate], [gate_row])
-            phrase_rows = phrase_rows_by_gate.get(gate, [])
-            if phrase_rows:
-                phrases_box.add_group(REPORT_GATE_LABELS[gate], phrase_rows)
-        # 默认展开：这些文案行改造前就在该页可见，折叠框只提供"可以收起来"，
-        # 不把原有入口藏起来；搜索命中时也会自动展开（见 _search_settings）。
-        gates_box.set_expanded(True)
+        phrase_edit_keys = set(self.dialogue_phrase_edits)
+        phrase_rows = [row for row in dialogue_rows
+                       if row.objectName()[len("settingRow_dialogue_"):] in phrase_edit_keys]
+        ungated_dialogue_rows = [row for row in dialogue_rows
+                                 if row.objectName()[len("settingRow_dialogue_"):] not in phrase_edit_keys]
+        if phrase_rows:
+            phrases_box.add_group("事件气泡文案", phrase_rows)
         phrases_box.set_expanded(False)
-        self.report_gates_box = gates_box
         self.dialogue_phrases_box = phrases_box
         automation_layout = automation.layout()
         # 「Agent 联动」＝两级结构：折叠框下按用途分子组（消费统计 / 提示音效）。
@@ -1903,26 +1841,19 @@ class ModernSettingsDialog(QDialog):
         # 这些行已被上面的折叠框认领，必须登记，否则会再落进「待分类」。
         claimed.update(agent_cost_rows)
         claimed.update(claim_prefix("agent_sound_"))
-        # dialogue_* 里有一类行**不属于任何事件门**（表达风格、专属文案对象、弹窗文案
-        # 模板 JSON）：它们不是某个事件的气泡文案，而是文案风格的全局控件，因此
-        # gate_for_event 返回 None、只会落到上面那个空串桶里。这些行已被
-        # claim_prefix("dialogue_") 认领（不再进 leftovers），若不显式放回本域就会
-        # 从设置页里彻底消失。
-        # 顶层顺序：「文案风格与模板」（全局风格控件）在前，「事件气泡触发概率」
-        # 折叠框**排在其末尾**——概率门按**事件类别**抽稀气泡，与文案风格/模板无关，
-        # 所以让风格控件先出现，概率门收在它后面。
+        # dialogue_* 里的全局风格控件（表达风格、专属文案对象、弹窗文案模板 JSON）
+        # 不是某个事件的气泡文案，已被 claim_prefix("dialogue_") 认领（不再进
+        # leftovers），若不显式放回本域就会从设置页里彻底消失。
+        # 顶层顺序：「文案风格与模板」（全局风格控件）在前，自定义台词折叠框随后。
         insert_at = 0
-        ungated_dialogue_rows = phrase_rows_by_gate.get("", [])
         if ungated_dialogue_rows:
             automation_layout.insertWidget(
                 insert_at,
                 SettingsSection("文案风格与模板", ungated_dialogue_rows, automation),
             )
             insert_at += 1
-        automation_layout.insertWidget(insert_at, gates_box)
-        insert_at += 1
         automation_layout.insertWidget(insert_at, phrases_box)
-        # 顶层顺序：消费统计 → Agent 联动 → 文案风格 → 触发概率 → 自定义台词 → 各类检测。
+        # 顶层顺序：消费统计 → Agent 联动 → 文案风格 → 自定义台词。
         # 「消费统计」独立成一级分组且排最前（直接可见，不藏在折叠框里）。
         # 必须在上面的插入全部做完之后再插，否则会被后来的 insertWidget(0, ...) 挤下去。
         cost_section = SettingsSection("消费统计", agent_cost_rows, automation)
@@ -2233,9 +2164,6 @@ class ModernSettingsDialog(QDialog):
         # 记住上次编辑层：下次打开设置直接回到该 Agent 专属层（未知值回落全局）
         self.config.set("dialogue_last_scope", str(getattr(self, "_dialogue_scope", "") or ""))
         agent_cfg = dict(self.config.get("agent_link", {}))
-        # 循环检测设置页（合并写回，不覆盖 agent_link 其他字段）
-        if self.watchdog_page is not None:
-            agent_cfg = self.watchdog_page.apply_to_config(agent_cfg)
 
         # Agent 联动音效写回
         agent_cfg["sound_enabled"] = self.agent_sound_check.isChecked()
@@ -2247,11 +2175,6 @@ class ModernSettingsDialog(QDialog):
         agent_cfg["sound_error_path"] = self.agent_sound_error_picker.text().strip() or "builtin:agent-error"
         agent_cfg["sound_volume"] = float(self.agent_sound_volume_spin.value()) / 100.0
         agent_cfg["sound_cooldown_seconds"] = float(self.agent_sound_cooldown_spin.value())
-        # 事件汇报概率门：滑块值即通过概率（0.00–1.00，步长 0.05），逐类写回。
-        report_gates = dict(agent_cfg.get("report_gates") or {})
-        for gate, slider in self.report_gate_sliders.items():
-            report_gates[gate] = round(float(slider.value()), 2)
-        agent_cfg["report_gates"] = report_gates
 
         self.config.set("agent_link", agent_cfg)
         self.config.set("todo_reminder_enabled", self.todo_reminder_check.isChecked())

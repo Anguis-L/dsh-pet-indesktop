@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
-    QSlider,
     QSpinBox,
     QStackedWidget,
     QSizePolicy,
@@ -1211,69 +1210,6 @@ class SettingsSection(QWidget):
                 f"{'收起' if expanded else '展开'}{self.toggle.text()}"
             )
             self.toggle.update()
-
-class ProbabilitySlider(QWidget):
-    """事件气泡触发概率滑块：0.00–1.00（步长 0.05），没有开关。
-
-    值即**通过概率**：``0.00`` = 该类事件完全不汇报，``1.00`` = 全部汇报。
-    滑块是唯一控制项（用户口径：设置位置与真正控制的位置绑定）；右键菜单只
-    提供 0/1 两端快捷入口，细粒度一律回到这里调。
-    """
-
-    valueChanged = Signal(float)
-
-    _STEPS = 20          # 20 档 × 0.05
-    _VALUE_WIDTH = 40    # 固定宽度：值文本变化不引起控件抖动
-
-    def __init__(self, parent=None, *, value: float = 1.0):
-        super().__init__(parent)
-        self.setObjectName("probabilitySlider")
-        self._slider = QSlider(Qt.Orientation.Horizontal, self)
-        self._slider.setObjectName("probabilitySliderTrack")
-        self._slider.setRange(0, self._STEPS)
-        self._slider.setSingleStep(1)
-        self._slider.setPageStep(4)
-        self._slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._slider.setMinimumWidth(140)
-        self._slider.setAccessibleName("通过概率")
-        self._value_label = QLabel(self)
-        self._value_label.setObjectName("probabilitySliderValue")
-        self._value_label.setMinimumWidth(self._VALUE_WIDTH)
-        self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        layout.addWidget(self._slider, 1)
-        layout.addWidget(self._value_label, 0)
-        self._slider.valueChanged.connect(self._sync_from_slider)
-        self.setValue(value)
-
-    def value(self) -> float:
-        return self._slider.value() / float(self._STEPS)
-
-    def setValue(self, value: float) -> None:  # noqa: N802 - Qt API
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            number = 1.0
-        number = min(1.0, max(0.0, number))
-        self._slider.setValue(int(round(number * self._STEPS)))
-        self._sync_from_slider(self._slider.value())
-
-    def setAccessibleName(self, name: str) -> None:  # noqa: N802 - Qt API
-        super().setAccessibleName(name)
-        self._slider.setAccessibleName(name or "通过概率")
-
-    def setAccessibleDescription(self, text: str) -> None:  # noqa: N802 - Qt API
-        super().setAccessibleDescription(text)
-        self._slider.setAccessibleDescription(text)
-
-    def _sync_from_slider(self, raw: int) -> None:
-        value = raw / float(self._STEPS)
-        self._value_label.setText(f"{value:.2f}")
-        self.valueChanged.emit(value)
-
-
 class CollapsibleGroup(QWidget):
     """可折叠分组容器：一个折叠头 + 若干「小标题 + 设置卡」子分组。
 

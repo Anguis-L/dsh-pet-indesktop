@@ -18,7 +18,6 @@ from PySide6.QtWidgets import QMenu
 from .. import autostart as autostart_mod
 from .. import catalog
 from ..harness_launcher import launch_harness_gui
-from ..report_gates import REPORT_GATE_DEFAULTS
 from ..updater import QUARK_PAN_URL as QUARK_PAN_URL, REPO_URL as REPO_URL
 from .icons import fitted_pet_pixmap_icon, pet_avatar_menu_icon, vector_menu_icon
 from .menu_styles.common import inherit_menu_style
@@ -404,26 +403,6 @@ def add_agent_link_menu(menu: QMenu, pet) -> None:
             act.setCheckable(True)
             act.setChecked(bool(agent_cfg.get(key, False)))
             act.toggled.connect(lambda on, k=key, a=act: pet.toggle_agent_link(k, on, a))
-    sub.addSeparator()
-    # 事件气泡触发概率：与设置页「事件气泡触发概率」同一份数据（agent_link.report_gates）。
-    # 菜单只做 0/1 两端快捷入口（勾选=1.0 全报，取消=0.0 静音），细粒度概率
-    # 由设置页滑块决定；勾选态按当前概率是否 > 0 呈现，并提示当前值。
-    gate_cfg = agent_cfg.get('report_gates')
-    if not isinstance(gate_cfg, dict):
-        gate_cfg = {}
-    for gate_key, opt_label in (
-        ('state', '开始干活气泡提醒'),
-        ('done', '任务完成气泡提醒'),
-        ('activity', '过程汇报气泡（正在读文件/跑命令…）'),
-    ):
-        probability = float(gate_cfg.get(gate_key, REPORT_GATE_DEFAULTS[gate_key]) or 0.0)
-        act = sub.addAction(opt_label)
-        act.setCheckable(True)
-        act.setChecked(probability > 0.0)
-        act.setToolTip(
-            f"当前通过概率 {probability:.2f}；设置页「事件气泡触发概率」可逐类调 0.00–1.00"
-        )
-        act.toggled.connect(lambda on, k=gate_key: pet.set_agent_link_option(k, on))
 
 
 def build_size_menu(menu: QMenu, pet, *, icons: bool = True) -> QMenu:

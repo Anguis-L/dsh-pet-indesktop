@@ -2881,19 +2881,15 @@ def test_pet_app_binds_about_to_quit_once_to_current_window(tmp_path, monkeypatc
     assert current.saved == 1
     assert old.saved == 0  # 旧窗口不再被保存
 
-    # start() 启动了真实的 DshStateTracker（3s 周期端口探测 QTimer）：
-    # 不停掉会跨测试存活，在后续用例泵事件时继续发起探测，
-    # 是全量套件原生崩溃的帮凶之一。
-    owner._dsh_state_tracker.stop()
 
 
-def test_dsh_state_tracker_wiring_drives_thinking(tmp_path):
-    """AppShell 恢复对 DshStateTracker 的订阅：thinking/真人消息 → 联动管线。
+def test_dsh_converged_state_wiring_drives_thinking(tmp_path, monkeypatch):
+    """单读方合并后：收敛器状态/真人消息仍打通联动管线。
 
-    回归（本次调查结论）：d04fc10 曾接线 state_changed/user_message，post-merge
-    重构时丢失 → DSH 的 THINKING 气泡结构性不触发、对话开始不稳定。本用例钉住
-    两条信号都接了、thinking/真人消息会调 notify_dsh_state、offline 收交互，
-    且无窗/无联动管理器时绝不崩。
+    回归（原 dsh_state tracker 接线用例的继任者）：DshMonitor 是桥目录唯一
+    读方，收敛输出经 ``dsh_state_changed`` / ``dsh_user_message`` 到管理器——
+    thinking/真人消息注入 ``notify_dsh_state``、offline 收交互，AppShell 侧只剩
+    灵动岛活跃指示（无岛时绝不崩）。
     """
     from PySide6.QtWidgets import QApplication
 
@@ -2902,52 +2898,37 @@ def test_dsh_state_tracker_wiring_drives_thinking(tmp_path):
 
     QApplication.instance() or QApplication([])
     owner = AppShell(QApplication.instance(), Config(tmp_path))
-    owner._dsh_state_tracker.stop()  # 断真实轮询，手动驱动信号
+    manager = owner._shared.agent_link
+    monitor = manager.monitors["dsh"]
 
-    class FakeAlm:
-        def __init__(self):
-            self.notified = []
-            self.dismissed = False
-
-        def notify_dsh_state(self, state):
-            self.notified.append(state)
-
-        def dismiss_all_interactions(self):
-            self.dismissed = True
+    notified: list[str] = []
+    dismissed: list[bool] = []
+    monkeypatch.setattr(manager, "notify_dsh_state", lambda state: notified.append(state))
+    monkeypatch.setattr(manager, "dismiss_all_interactions", lambda: dismissed.append(True))
 
     try:
-        # 无窗/无联动管理器：两个处理器都必须静默 no-op
-        owner._on_dsh_user_message("s1", "hi")
-        owner._on_dsh_state_changed("working", "thinking")
-
-        alm = FakeAlm()
-
-        class FakeWin:
-            pass
-
-        win = FakeWin()
-        win.agent_link_manager = alm
-        owner.instance.win = win
-
         # 真人消息 = 对话开始：与状态边沿竞态解耦的稳定触发
-        owner._on_dsh_user_message("s1", "hi")
-        assert alm.notified == ["thinking"]
+        monitor.dsh_user_message.emit("s1", "hi")
+        assert notified == ["thinking"]
 
         # thinking 状态也触发（turn/start 路径）；同轮重复由呈现管线去重
-        alm.notified.clear()
+        notified.clear()
+        monitor.dsh_state_changed.emit("working", "thinking")
+        assert notified == ["thinking"]
+
+        # offline：收掉失效的常驻审批/问题气泡
+        monitor.dsh_state_changed.emit("thinking", "offline")
+        assert dismissed == [True]
+
+        # 非 thinking/offline/等待态不动作
+        notified.clear()
+        monitor.dsh_state_changed.emit("thinking", "working")
+        assert notified == []
+
+        # AppShell 转发口在无岛时必须静默 no-op
         owner._on_dsh_state_changed("working", "thinking")
-        assert alm.notified == ["thinking"]
-
-        # offline：收掉失效的常驻审批/问题气泡（d04fc10 原行为）
-        owner._on_dsh_state_changed("thinking", "offline")
-        assert alm.dismissed is True
-
-        # 非 thinking/offline 状态不动作
-        alm.notified.clear()
-        owner._on_dsh_state_changed("thinking", "working")
-        assert alm.notified == []
     finally:
-        owner._dsh_state_tracker.stop()
+        owner._shared.stop_all()
 
 
 def test_external_character_dirs_uses_variant_then_legacy_fallback(tmp_path, monkeypatch):
