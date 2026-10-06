@@ -416,6 +416,7 @@ def test_target_desktop_launches_exe_when_installed(monkeypatch, tmp_path):
     """② target=desktop 且检测到安装：拉起桌面端 exe（不开浏览器、不等就绪）。"""
     from pet import harness_launcher as hl
 
+    monkeypatch.setattr(hl, "DESKTOP_SUPPORTED", True)  # 非 Windows CI 上也测 desktop 路径逻辑
     exe = tmp_path / "DeepSeek Harness.exe"
     exe.write_bytes(b"MZ")
     monkeypatch.setattr(hl, "desktop_install_path", lambda: exe)
@@ -464,6 +465,7 @@ def test_explicit_desktop_not_installed_is_not_found(monkeypatch):
     """显式 desktop + 未安装 → not-found（静默回落 web 会让菜单选择失真）。"""
     from pet import harness_launcher as hl
 
+    monkeypatch.setattr(hl, "DESKTOP_SUPPORTED", True)
     monkeypatch.setattr(hl, "desktop_install_path", lambda: None)
     monkeypatch.setattr(hl, "desktop_process_running", lambda: False)
     status, info = hl.launch_harness(target="desktop")
@@ -474,6 +476,7 @@ def test_desktop_already_running_short_circuits(monkeypatch):
     """桌面端进程已在跑 → already，绝不重复拉起（Electron 单实例语义）。"""
     from pet import harness_launcher as hl
 
+    monkeypatch.setattr(hl, "DESKTOP_SUPPORTED", True)
     monkeypatch.setattr(hl, "desktop_process_running", lambda: True)
     monkeypatch.setattr(hl, "_spawn_desktop", lambda path: (_ for _ in ()).throw(AssertionError("不得重复拉起")))
     status, info = hl.launch_harness(target="desktop")
