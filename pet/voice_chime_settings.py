@@ -12,7 +12,7 @@
 台词非空时替换内置库参与同样的分批轮换，留空回退内置库。气泡报时文字以阿拉伯
 数字展示（如“现在下午 15:45”），语音口播仍为中文数字。
 
-风格对齐 pet/exploration_watchdog_settings.py：自含 QWidget 页，
+自含 QWidget 页，
 提供 apply_to_config，
 由 modern_settings_dialog.py 注册为侧边栏「语音」总域下的「语音报时」分组并参与
 _write_config 保存。

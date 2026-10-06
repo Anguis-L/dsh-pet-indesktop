@@ -209,7 +209,16 @@ WINDOW_PY_LINE_BUDGET = 4671
 # 实测 2391；按文件约定只随实测校准，不为达标压行（拆分仍是待办）。
 # 2026-09-27 上调到 2393：overlay 文案如实（省电模式 hint 改调 settings_pet_controls、
 # 窗口级键「对所有桌宠生效」标注接线 +2 行）。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2393
+# 2026-10-06 上调到 2403：清空陪伴记忆按 clear() 返回值如实提示（失败弹告警而不是
+# 一律「已清空」）+10 行；实测 2403，按文件约定只随实测校准（拆分仍是待办）。
+# 2026-10-06 上调到 2408：SMTC 工单「视频被当歌曲」新增设置行「浏览器媒体会话
+# 参与歌词」（行构造 1 行 + 保存回写 4 行，控件本体在 settings_pet_controls，
+# 「音乐关联」域 claim 同步登记）。实测 2408；按文件约定只随实测校准，不为达标
+# 压行（拆分仍是待办）。
+# 2026-10-06 回调到 2407：该设置行改为 settings_music.browser_media_rows（受
+# 平台条件约束、并入既有的 `] + settings_music.browser_media_rows(self),` 一行），
+# 本文件净 −1 行（保存回写 4 行仍在）。实测 2407。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2407
 
 
 def _read(name: str) -> str:
