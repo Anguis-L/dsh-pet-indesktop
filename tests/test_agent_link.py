@@ -4507,3 +4507,79 @@ class TestNotifyDshState:
             mgr.shutdown()
         assert bubbles == []
         assert win.switched == []
+
+
+# ============================================================================
+class TestUnifiedEventEnvelopeSchema:
+    """_poll 统一事件路径必须按**信封**的 schema 解析，而不是展平后的嵌套值。
+
+    背景：_poll 为了兼容旧消费者把 `data` 里的嵌套 dict 展平到顶层
+    （`flattened.update(nested)`）。若语义层也吃这份展平结果，嵌套的
+    `data.schema` 就会覆盖信封的 schema 版本号，造成两个方向的错判：
+    - 信封 v1 + data.schema/v2（v2 文档字段）→ 白名单误拒，语义事件丢失；
+    - 信封 v99 + data.schema/v1 → 绕过白名单，未知版本被当 v1 解析。
+    展平口径本身要保留（raw_record 兼容消费者依赖它）。
+    """
+
+    @staticmethod
+    def _monitor(tmp_path, got, raw):
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        cfg = Config(base=tmp_path)
+        mon = BaseAgentMonitor("dsh", cfg.dir)
+        mon.normalized_event.connect(got.append)
+        mon.raw_record.connect(lambda key, rec: raw.append(rec))
+        mon.events_dir.mkdir(parents=True, exist_ok=True)
+        mon.events_file.touch()
+        mon._tailer.read_new_lines()  # backfill：先落到文件末尾
+        return mon
+
+    def _feed(self, mon, record):
+        with mon.events_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        mon._poll()
+
+    @pytest.mark.parametrize("nested_schema", ["agent-event/v2", "agent-event/v99"])
+    def test_v1_envelope_with_foreign_nested_schema_not_rejected(self, tmp_path, nested_schema):
+        """信封 agent-event/v1 + 任意 data.schema 都不得被误拒。
+
+        嵌套 data 是**载荷内容**（例如 v2 文档自带 schema 字段），它的值再陌生
+        也不代表这条消息的版本——版本由信封决定。
+        """
+        got, raw = [], []
+        mon = self._monitor(tmp_path, got, raw)
+        self._feed(mon, {
+            "schema": "agent-event/v1",
+            "ts": 1, "agent": "dsh", "sessionId": "s1",
+            "event": "llm/retry", "failure": {"code": "429"},
+            "data": {"schema": nested_schema, "document": "payload"},
+        })
+
+        assert got, f"信封版本合法，语义事件不得因嵌套 data.schema={nested_schema} 丢失"
+        assert type(got[0]).__name__ == "RetryEvent", got[0]
+
+    def test_v99_envelope_with_v1_nested_not_bypassed(self, tmp_path):
+        """信封 agent-event/v99 + data.schema=agent-event/v1 不得绕过白名单。"""
+        got, raw = [], []
+        mon = self._monitor(tmp_path, got, raw)
+        self._feed(mon, {
+            "schema": "agent-event/v99",
+            "ts": 1, "agent": "dsh", "sessionId": "s1",
+            "event": "llm/retry", "failure": {"code": "429"},
+            "data": {"schema": "agent-event/v1"},
+        })
+
+        assert got == [], f"未知信封版本必须被语义层拒收，实得 {got}"
+        assert raw, "拒收只影响语义层：原始记录仍须转发给兼容消费者"
+        # legacy 展平口径逐位不变：信封字段可见，且嵌套 data.schema 在
+        # **这一路**仍然覆盖（只给旧消费者的兼容视图，语义层不再受它影响）
+        assert raw[-1]["failure"]["code"] == "429"
+        assert raw[-1]["schema"] == "agent-event/v1"
+
+    def test_legacy_flat_record_unaffected(self, tmp_path):
+        """无嵌套 data 的常规记录（含无 schema 的老记录）语义路径逐位不变。"""
+        got, raw = [], []
+        mon = self._monitor(tmp_path, got, raw)
+        self._feed(mon, {"ts": 1, "agent": "dsh", "sessionId": "s1",
+                         "event": "llm/retry", "failure": {"code": "429"}})
+
+        assert got and got[0].code == "429"

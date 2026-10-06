@@ -1577,6 +1577,10 @@ class BaseAgentMonitor(QObject):
                 data = json.loads(line)
                 if not isinstance(data, dict):
                     continue
+                # 信封自己的 schema 版本：展平嵌套 data 只是给旧消费者的兼容
+                # 口径，不能让它覆盖版本号（否则 data.schema/v2 误拒 v1 信封、
+                # data.schema/v1 又放过 v99 信封）。
+                envelope_schema = data.get("schema")
                 nested = data.get("data")
                 if isinstance(nested, dict):
                     flattened = dict(data)
@@ -1587,7 +1591,14 @@ class BaseAgentMonitor(QObject):
                 tool = str(data.get("tool", "") or "").strip()
                 # Unified event path is additive and intentionally guarded.
                 try:
-                    normalized = normalize_event(parse_agent_event(data, source_hint=self.agent_key, agent_name_hint=self.agent_key))
+                    # 语义层按信封版本解析：嵌套 data.schema 是载荷内容，
+                    # 该键从展平结果里剔除后由信封版本接管。
+                    semantic_record = dict(data)
+                    if envelope_schema is None:
+                        semantic_record.pop("schema", None)
+                    else:
+                        semantic_record["schema"] = envelope_schema
+                    normalized = normalize_event(parse_agent_event(semantic_record, source_hint=self.agent_key, agent_name_hint=self.agent_key))
                     if normalized is not None:
                         self.normalized_event.emit(normalized)
                 except Exception:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -3165,4 +3166,142 @@ def test_settings_image_directories_use_preview_but_audio_folders_do_not(tmp_pat
     assert dialog.egg_image_dir_picker.preview_button is not None
     assert dialog.click_sound_picker.folder_picker.preview_button is None
     dialog.reject()
+    app.processEvents()
+
+
+def test_clear_proactive_memory_reports_failure_truthfully(tmp_path, monkeypatch):
+    """清空陪伴记忆失败时不得再报"已清空"（按 clear() 返回值分支）。
+
+    设置页是**独立进程**（`python -m pet --settings`），与主进程后台主动识屏
+    写同一份记忆文件；拿不到跨进程锁就是"这次没清"。之前无条件弹"已清空"，
+    用户看到的是"清了还在"。
+    """
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    import pet.modern_settings_dialog as settings_mod
+    import pet.proactive as proactive_mod
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = settings_mod.ModernSettingsDialog(Config(tmp_path), include_ai=True)
+
+    class _RefusingMemory:
+        """拿不到锁的 ProactiveMemory 替身（真实失败路径，不是异常）。"""
+
+        def __init__(self, path):
+            self.path = path
+
+        def clear(self):
+            return False
+
+    monkeypatch.setattr(proactive_mod, "ProactiveMemory", _RefusingMemory)
+
+    shown: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda _p, title, text: shown.append(("info", title, text))))
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda _p, title, text: shown.append(("warn", title, text))))
+
+    dialog._on_pro_clear_memory()
+
+    assert shown, "清空失败必须有用户可见反馈（不能静默）"
+    assert all(kind != "info" for kind, _, _ in shown), f"失败仍报了成功：{shown}"
+    assert shown[0][0] == "warn", shown
+    assert "失败" in shown[0][1], f"标题必须表明失败：{shown[0]}"
+    dialog.close()
+    app.processEvents()
+
+
+def test_clear_proactive_memory_reports_success_and_removes_file(tmp_path, monkeypatch):
+    """对照组：真清空成功仍报"已清空"，且文件确实被删（返回值不是摆设）。"""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    import pet.modern_settings_dialog as settings_mod
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    config = Config(tmp_path)
+    dialog = settings_mod.ModernSettingsDialog(config, include_ai=True)
+
+    mem_file = config.dir / "proactive_screen_memory.json"
+    mem_file.parent.mkdir(parents=True, exist_ok=True)
+    mem_file.write_text(
+        json.dumps({"entries": [{"ts": 1.0, "process": "A.exe", "activity": "上网"}]},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    shown: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda _p, title, text: shown.append(("info", title, text))))
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda _p, title, text: shown.append(("warn", title, text))))
+
+    dialog._on_pro_clear_memory()
+
+    assert [kind for kind, _, _ in shown] == ["info"], shown
+    assert not mem_file.exists(), "报了已清空就必须真的删掉文件"
+    dialog.close()
+    app.processEvents()
+
+
+def test_clear_proactive_memory_reports_failure_when_probe_fails(tmp_path, monkeypatch):
+    """探测失败（stat 报 EACCES/EIO/WinError）时设置页必须走既有的**失败分支**。
+
+    这条走**真实** `ProactiveMemory`（不是替身）：`clear()` 内部的存在性探测抛错。
+    以前异常从 `_on_pro_clear_memory` 直接穿出去——用户既没看到"已清空"也没看到
+    "清空失败"，只有一个异常；`clear()` 现在返回 False，走 `cleared is False`
+    分支弹警告，记忆文件一个字节都不动。
+    """
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    import pet.modern_settings_dialog as settings_mod
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    config = Config(tmp_path)
+    dialog = settings_mod.ModernSettingsDialog(config, include_ai=True)
+
+    mem_file = config.dir / "proactive_screen_memory.json"
+    mem_file.parent.mkdir(parents=True, exist_ok=True)
+    mem_file.write_text(
+        json.dumps({"entries": [{"ts": 1.0, "process": "A.exe", "activity": "上网"}]},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    before = mem_file.read_bytes()
+
+    real_stat = Path.stat
+    targets = {mem_file, mem_file.resolve()}
+
+    def denied_probe(self, *args, **kwargs):
+        # 只让记忆文件的探测失败（EACCES/WinError 5 这类 is_file 会原样上抛的错误）
+        if Path(self) in targets:
+            raise OSError(5, "Access is denied", None, 5)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_probe)
+
+    shown: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda _p, title, text: shown.append(("info", title, text))))
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda _p, title, text: shown.append(("warn", title, text))))
+
+    dialog._on_pro_clear_memory()
+
+    assert shown, "清空失败必须有用户可见反馈（探测失败也不许静默）"
+    assert all(kind != "info" for kind, _, _ in shown), f"失败仍报了成功：{shown}"
+    assert shown[0][0] == "warn" and "失败" in shown[0][1], shown
+    assert mem_file.read_bytes() == before, "报失败时记忆文件不得被动过"
+    dialog.close()
     app.processEvents()

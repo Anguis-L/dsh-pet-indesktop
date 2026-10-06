@@ -812,6 +812,11 @@ class Config:
             "music_lyric_enabled": False,  # 在气泡里显示当前播放歌曲的歌词（Windows SMTC）
             "music_lyric_lead_seconds": 1.0,  # 歌词提前量（秒）：正值=歌词抢先于音频
             "music_lyric_cache_limit": 2000,  # 歌词缓存条数上限，超出按最旧淘汰
+            # 浏览器媒体会话参与歌词/唱歌：默认关——浏览器把网页视频也上报成
+            # 音乐类型（2026-10 实测 Edge/Chromium 播 B 站视频恒为 MUSIC），
+            # 不否决就会对着视频显示「我在唱《视频标题》」。网页版音乐平台
+            # 需要用户显式打开。
+            "music_browser_media_enabled": False,
             # 手动指定播放器路径 {netease|qqmusic: exe 路径}：自动搜索找不到时的
             # 逃生口，只能手改 config.json（暂无设置页控件），空 = 走自动搜索。
             "music_player_paths": {},
@@ -1071,6 +1076,7 @@ class Config:
             "music_lyric_enabled",
             "music_lyric_cache_limit",
             "music_lyric_lead_seconds",
+            "music_browser_media_enabled",
             "music_player_paths",
             "agent_cost_enabled",
             "golden_spin_on_click",
@@ -1407,6 +1413,11 @@ class Config:
         # 唱歌动画检测开关：同族漏网的第六个键（交付前审查 P2-b）——字符串
         # "false" 被 bool() 判真，用户明确关掉的开关会自己打开，与上面两键同规。
         self.data["music_sing_enabled"] = _bool_or_default(self.data.get("music_sing_enabled"), False)
+        # 浏览器媒体会话开关：同族第七个键，同样走 _bool_or_default——
+        # 字符串 "false" 被 bool() 判真会让用户明确关掉的否决自己失效。
+        self.data["music_browser_media_enabled"] = _bool_or_default(
+            self.data.get("music_browser_media_enabled"), False
+        )
         # 持续静音判定时长：下限 1s（低于它就退回"瞬时静音即退出"的老问题），
         # 上限必须有——否则手改 1e9 会让唱歌状态永不退出。
         self.data["music_sing_grace_seconds"] = _float_or_default(
@@ -1571,6 +1582,7 @@ class Config:
             "music_lyric_enabled",
             "music_lyric_lead_seconds",
             "music_lyric_cache_limit",
+            "music_browser_media_enabled",
             "agent_cost_enabled",
             "music_player_paths",
             "character_profiles",
