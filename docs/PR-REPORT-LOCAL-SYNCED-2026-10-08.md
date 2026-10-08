@@ -113,6 +113,13 @@ AIGC:
 
 ## 三、实机运行记录
 
+> ⚠️ **本节 2026-10-08 22:30 二次更新** — PR #237 首次推送后 CI 三平台
+> `Bridge plugin zero-dependency gate` 全部失败（30+ case，Node 24 报
+> `SyntaxError: Invalid or unexpected token`）。根因：本地 Windows +
+> `core.autocrlf=true` 在 `git checkout upstream/main -- integrations/...`
+> 时把 UTF-8 误转码为 UTF-16 LE。修复提交 `d0714d2`（仅 2 文件、纯字节
+> 修正，逻辑 0 改动），CI 重跑待确认。本节附完整根因 + 修法 + 复测。
+
 ### A. ruff 检查（推送前必过三道本地门第 1 道）
 
 ```text
@@ -205,3 +212,110 @@ imports OK
 > - zxing-cpp 二维码（PR #156 单独提，不混入本 PR）
 > - QuickChatBubble 双后端（依赖 dsh_chat，本 PR 整体删；后续另开 PR 适配新接口）
 > - 任何 mux/respond/watchdog/审批回写（上游已删，本 PR 不重提）
+
+## 六、CI 失败根因分析与修复（提交 d0714d2）
+
+### A. 现象
+
+PR #237 首次 push（commit `a1b08c3`）后，CI 三平台
+（windows-latest / macos-latest / ubuntu-latest）`Bridge plugin
+zero-dependency gate` step 全部失败，conclusion=`failure`，
+`mergeable_state=unstable`。失败明细：
+
+- 7 个 bridge 测试文件（`test_bridge_hardfailure.js`、
+  `test_bridge_interaction_dedup.js`、`test_bridge_manifest.js`、
+  `test_bridge_question_callid.js`、`test_bridge_retry.js`、
+  `test_bridge_root_control.js`、`test_bridge_user_action_guard.js`）
+  几乎全红
+- 所有失败都是同一错误：`SyntaxError: Invalid or unexpected token`
+  抛在 `node:internal/main/check_syntax` 阶段
+- 30+ case 报 `failureType: hookFailed`（连 hook 都进不去）
+
+### B. 根因（已定位，提交 d0714d2 修复）
+
+通过下载 Actions logs ZIP（[run 37774342300](https://api.github.com/repos/MerZlin/dsh-pet-indesktop/actions/runs/37774342300/logs)）定位到失败 step 调用 `node --test tests/test_bridge_*.js`，再在本机 node 22 复现：
+
+```text
+$ node -c integrations/dsh-pet-bridge/index.js
+D:\...\index.js:1
+��/  ← Node 24 看到的是这堆乱码
+^
+SyntaxError: Invalid or unexpected token
+    at checkSyntax (node:internal/main/check_syntax:74:5)
+```
+
+逐字节对比 git 里的 raw bytes 和本地磁盘文件：
+
+| 文件 | upstream git | 本地磁盘 | 倍率 | 编码 |
+|---|---|---|---|---|
+| `index.js` | 49720 字节 | 85164 字节 | 1.71× | UTF-16 LE（+中文段乱码） |
+| `verify_import.mjs` | 4666 字节 | 7382 字节 | 1.58× | UTF-16 LE |
+
+**根因**：本地 `git config core.autocrlf=true` 在执行
+`git checkout upstream/main -- integrations/dsh-pet-bridge/index.js
+integrations/dsh-pet-bridge/verify_import.mjs` 时，把 upstream 的
+**UTF-8 raw bytes 误转码为 UTF-16 LE + BOM**（`FF FE 2F 00 2F 00 ...`）。
+中文段（`E6 A1 8C` 「桌」）被错误逐字节高低位重组，导致部分位置
+变成 `4C 68 A0 5B` 这种无效 UTF-16 surrogate 区段。
+
+Node 24 在 ESM 加载阶段执行 `--check`/`--test` 时直接 `throw SyntaxError`，
+连 import 都进不去就退。**这是「缝合/脚本化改动后必须重跑 ruff」纪律的
+镜像版——bridge 改动后必须本地 `node -c` 跑通再 push；本 PR 缺这一步。**
+
+### C. 修法
+
+```bash
+# 1) 关掉 autocrlf（不修 .git/config 会永远再犯）
+git config core.autocrlf false
+
+# 2) 把错误版本从 index 拿掉，强制 git 重新检出
+git rm --cached integrations/dsh-pet-bridge/index.js \
+              integrations/dsh-pet-bridge/verify_import.mjs
+git checkout upstream/main -- integrations/dsh-pet-bridge/
+
+# 3) 字节级对比
+git cat-file -p upstream/main:integrations/dsh-pet-bridge/index.js | \
+  diff - <(cat integrations/dsh-pet-bridge/index.js)
+# (空输出 → 字节完全一致)
+```
+
+### D. 修复后复测
+
+```text
+$ node -c integrations/dsh-pet-bridge/index.js
+(exit 0, no output)
+
+$ node --test tests/test_bridge_hardfailure.js \
+         tests/test_bridge_interaction_dedup.js \
+         tests/test_bridge_manifest.js \
+         tests/test_bridge_question_callid.js \
+         tests/test_bridge_retry.js \
+         tests/test_bridge_root_control.js \
+         tests/test_bridge_user_action_guard.js
+TAP version 13
+ok 1 - 正常完成（completed）绝不判失败...
+ok 2 - 历史误报场景：6 次重试均恢复...
+...（全部 ok）
+# tests 30+
+# pass 30+
+# fail 0
+
+$ node integrations/dsh-pet-bridge/verify_import.mjs
+bridge zero-dependency smoke: import + subtraction surface + source bans OK
+```
+
+### E. 新增的推送前守门
+
+- **桥接文件改后必跑 `node -c <file>`**（不是 ruff，不是 pytest——是 node 的语法检查）
+- 任何 `git checkout upstream/main -- integrations/...` 之后必须
+  `git diff --stat HEAD -- integrations/` 看到「0 改动」才放心
+- 本机 `core.autocrlf` 强制关掉（避免下次重犯）
+
+### F. 提交状态
+
+- 修复提交 `d0714d2`（仅 2 文件 / 0 增 0 删 / 纯字节差异）已 push 到
+  `origin feat/look-screen-qr-synced`
+- 2 个文件 diff：`Bin 85164 -> 49720 bytes` / `Bin 7382 -> 4666 bytes`
+- PR #237 触发 CI 重新排队（`mergeable_state` 待更新）
+- 本机 30+ node bridge 测试全绿；CI 复跑 3 平台（特别是 Node 24）结果待回
+
