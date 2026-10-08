@@ -319,3 +319,55 @@ bridge zero-dependency smoke: import + subtraction surface + source bans OK
 - PR #237 触发 CI 重新排队（`mergeable_state` 待更新）
 - 本机 30+ node bridge 测试全绿；CI 复跑 3 平台（特别是 Node 24）结果待回
 
+## 七、Pytest main suite 间歇性 CI flake（待 maintainer 处置，2026-10-08 23:40）
+
+> 本节作为 delivery evidence discipline 第 3 条「实机运行记录」的诚实登记：
+> 当前 PR Test Gate 在 ubuntu-latest 的 `Pytest (main suite)` 步骤出现
+> 间歇性的 2 F + 1 SIGABRT（exit 134），本机无法稳定复现，按 AGENTS.md
+> 「CI 红先读日志再动手」纪律已重推 1 次等 CI 重判；连红 2 轮即停手
+> 走 webm 生命周期族先例的隔离路径。
+
+### A. 现象（commit `2e6141b` → 1st CI run）
+
+- 23% 进度（tests #989 / #994）：`test_dynamic_island_revamp.py::test_expanded_mode_freezes_squish` / `test_default_icon_is_auto` 报 F
+- 37% 进度（位于 `test_island_chat.py` 范围内）：SIGABRT (134) + core dump，杀掉整个 pytest 进程
+- 失败 run URL：<https://github.com/MerZlin/dsh-pet-indesktop/actions/runs/37798030637>
+
+### B. 本机复现（全部绿，无法稳定复现）
+
+| 范围 | 本机结果 | 用时 |
+|---|---|---|
+| 148 个关键测试（`test_double_click_chat` 10 / `test_island_chat` 19 / `test_architecture` 9 / `test_config_schema` 12 / `test_settings_interaction_tabs` 7 / 5 settings 域 87） | 148/148 通过 | 80.16s |
+| 23% 区间 20 个测试（重放 985-1000 位置） | 20/20 通过 | 6.11s |
+| `test_dynamic_island_revamp.py` 全部 29 个 | 29/29 通过 | 4.62s |
+| `test_island_chat.py` 全部 19 个 | 19/19 通过 | 2.65s |
+| `test_island_bridge.py` 全部 33 个 | 33/33 通过 | 3.26s |
+
+### C. 与上游历史对比
+
+- 上次 main push 成功 CI 是 2026-10-06（commit `ee699c7`）
+- 之后 5 次 main push 全部 `success`（无任何 F/SIGABRT）
+- 本 PR 与最近成功 CI 的差异仅 5 个文件（`pet/double_click_chat.py` / `tests/test_double_click_chat.py` / `tests/test_settings_interaction_tabs.py` 修改 / `pet/island_chat.py::present_reply` / `pet/settings_interaction.py` 的 `double_click_chat` row / 团子角色包 8 GIF + manifest）
+- **未动** `pet/frameseq_clip.py` / `pet/overlay_shell.py`（上游 2026-10-04 已根治同族崩溃家族，参见 `PR-REPORT-QT-LIFECYCLE-CRASH-FAMILY-2026-10-04.md`）
+
+### D. 假设与下一步
+
+**假设 A（间歇性 CI flake）**：PySide6 6.12 + ubuntu 24.04 + ffmpeg + offscreen 四者组合的原生崩溃窗口被某次时序抖动撞上；重推可消除。
+- 操作：`2a0bb54`（空 commit，CI 重推）+ 在 PR 评论里登记现象、本机复现、上游历史。
+- 判定：等新一轮 CI 跑完看 ubuntu 是否转绿。
+- 若 ubuntu 转绿 / windows & macOS 仍全绿：合并无阻塞（CI 门禁由 maintainer 按 PR Test Gate 现状判断）。
+
+**假设 B（真回归）**：本 PR 的某些改动（即使 ruff + 148 测试全过）在 ubuntu runner 上触发了一个新崩溃形态。
+- 操作：按 `PR-REPORT-QT-LIFECYCLE-CRASH-FAMILY-2026-10-04.md` §六 的隔离先例，在 `pr-test.yml` 的 `Pytest (main suite)` 步骤追加 `--deselect` 临时隔离崩溃点 + 单开一个 follow-up PR 定位根因。
+- 判定：连红 2 轮（按 AGENTS.md CI cost discipline）才走这条路；本 PR 不动 `pr-test.yml`。
+
+### E. 当前最优处置（已执行）
+
+1. ✅ Bridge encoding 修在 `d0714d2`，3 平台 Bridge gate 全绿
+2. ✅ PR body 改用反引号（不再 `\main\` 字面反斜杠）
+3. ✅ PR 报告追加第 6 节（编码修复）+ 第 7 节（CI flake 登记）作为 delivery evidence
+4. ✅ PR 评论（comment 6063678893）告知 maintainer 当前 CI 状态、本机复现、上游历史
+5. ✅ `2a0bb54` 重推等新一轮 CI
+6. ⏸ 不修改 `pr-test.yml`（连红 2 轮再动）
+7. ⏸ 不动 `pet/frameseq_clip.py` / `pet/overlay_shell.py`（上游已根治）
+
